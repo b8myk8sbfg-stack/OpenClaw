@@ -1,0 +1,8 @@
+match_text,media_type,correct_intent,channel,notes
+purchase order,,purchase_order,whatsapp,PO messages
+technical support,,technical_support,whatsapp,Support requests
+pls quote,,rfq_inquiry,whatsapp,Quote requests
+unsubscribe,,junk_ad,email,Marketing unsubscribe footer
+newsletter,,newsletter,email,Newsletter subject/body
+special offer,,junk_ad,email,Promotional email
+E3Z-T61,,rfq_inquiry,whatsapp,WhatsApp feedback 2026-07-01T14:50:11

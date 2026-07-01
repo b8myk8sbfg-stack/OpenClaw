@@ -1,0 +1,1225 @@
+import os
+import re
+import time
+import csv
+import datetime
+import random
+import string
+
+import sys
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.chrome.options import Options
+
+from openclaw_inquiry_engine import process_inquiry_text, build_plain_quotation_reply
+from channel_router import send_supplier_rfq
+from non_standard_inquiry_handler import handle_non_standard_items
+
+VERSION = "v3.06-INCOMING-MESSAGE-SCRAPE-FIX"
+
+CHROME_BINARY_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Users/evon/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+]
+
+OPENCLAW_CHROME_PROFILE = "/Users/evon/OpenClaw/chrome_whatsapp_profile"
+WHATSAPP_INQUIRY_LOG = "/Users/evon/OpenClaw/whatsapp_inquiries.csv"
+SUPPLIER_PENDING_CSV = "/Users/evon/OpenClaw/whatsapp_supplier_pending.csv"
+MARK_UNREAD_FLAG = "/Users/evon/OpenClaw/whatsapp_mark_unread.flag"
+
+MAX_UNREAD_CHATS_PER_RUN = 10
+CHECK_INTERVAL_SECONDS = 60
+MARKUP_DIVISOR = 0.8
+
+
+def now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def gen_unique_id():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+
+
+def normalize_phone(value):
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def parse_money(value):
+    raw = str(value or "").upper()
+    raw = raw.replace("RM", "")
+    raw = raw.replace(",", "")
+    raw = raw.strip()
+
+    match = re.search(r"\d+(?:\.\d+)?", raw)
+
+    if not match:
+        return None
+
+    return float(match.group(0))
+
+
+def format_money(value):
+    return f"{float(value):,.2f}"
+
+
+def find_chrome_binary():
+    for path in CHROME_BINARY_PATHS:
+        if os.path.exists(path):
+            print(f"✅ Chrome binary found: {path}")
+            return path
+
+    raise FileNotFoundError("Google Chrome binary not found.")
+
+
+def init_driver():
+    chrome_binary = find_chrome_binary()
+
+    os.makedirs(OPENCLAW_CHROME_PROFILE, exist_ok=True)
+
+    options = Options()
+    options.binary_location = chrome_binary
+    options.add_argument(f"--user-data-dir={OPENCLAW_CHROME_PROFILE}")
+    options.add_argument("--profile-directory=Default")
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+
+    return webdriver.Chrome(options=options)
+
+
+def ensure_log():
+    fields = [
+        "timestamp",
+        "contact_name",
+        "message",
+        "detected_items",
+        "supplier_brands",
+        "status"
+    ]
+
+    if not os.path.exists(WHATSAPP_INQUIRY_LOG):
+        with open(WHATSAPP_INQUIRY_LOG, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+
+    return fields
+
+
+def append_log(contact_name, message, items, supplier_brands, status):
+    fields = ensure_log()
+
+    with open(WHATSAPP_INQUIRY_LOG, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writerow({
+            "timestamp": now_iso(),
+            "contact_name": contact_name or "",
+            "message": message or "",
+            "detected_items": str(items),
+            "supplier_brands": str(supplier_brands),
+            "status": status
+        })
+
+
+def wait_for_whatsapp_ready(driver, timeout=90):
+    print("🟢 Waiting for WhatsApp Web session...")
+
+    end = time.time() + timeout
+
+    while time.time() < end:
+        selectors = [
+            '//div[@id="side"]',
+            '//div[@aria-label="Chat list"]',
+            '//div[@role="grid"]',
+            '//header',
+        ]
+
+        for selector in selectors:
+            try:
+                found = driver.find_elements(By.XPATH, selector)
+                if found:
+                    print("✅ WhatsApp Web ready.")
+                    return True
+            except Exception:
+                pass
+
+        print("   ⏳ Waiting for WhatsApp login/session...")
+        time.sleep(3)
+
+    print("❌ WhatsApp Web not ready.")
+    return False
+
+
+def find_unread_chat_rows(driver):
+    print("🔎 Scanning visible chat list for unread chats...")
+
+    unread_rows = []
+
+    candidate_rows = driver.find_elements(
+        By.XPATH,
+        '//div[@role="listitem"] | //div[contains(@aria-label, "Chat list")]//div[@role="row"]'
+    )
+
+    print(f"📋 Visible chat row candidates: {len(candidate_rows)}")
+
+    for row in candidate_rows:
+        try:
+            text = row.text.strip()
+
+            if not text:
+                continue
+
+            unread_markers = row.find_elements(
+                By.XPATH,
+                './/*[contains(@aria-label, "unread") or contains(@aria-label, "Unread")]'
+            )
+
+            has_unread = bool(unread_markers)
+
+            lines = [x.strip() for x in text.splitlines() if x.strip()]
+            if not has_unread and lines:
+                last_line = lines[-1]
+                if re.fullmatch(r"\d{1,2}", last_line):
+                    has_unread = True
+
+            if has_unread:
+                unread_rows.append(row)
+                preview = text.replace("\n", " | ")
+                print(f"   ✅ Unread chat candidate: {preview[:160]}")
+
+        except Exception:
+            continue
+
+    print(f"📬 Unread chats detected: {len(unread_rows)}")
+    return unread_rows[:MAX_UNREAD_CHATS_PER_RUN]
+
+
+def contact_hint_variants(contact_hint):
+    raw = str(contact_hint or "").strip()
+    digits = normalize_phone(raw)
+    variants = [raw]
+
+    if raw.startswith("+"):
+        variants.append(raw[1:])
+
+    if digits:
+        variants.append(digits)
+        if len(digits) > 9:
+            variants.append(digits[-9:])
+            variants.append(digits[-10:])
+
+    if " " in raw:
+        variants.append(raw.replace(" ", ""))
+        variants.append(raw.replace(" ", "-"))
+
+    deduped = []
+    seen = set()
+
+    for variant in variants:
+        key = variant.lower()
+        if variant and key not in seen:
+            seen.add(key)
+            deduped.append(variant)
+
+    return deduped
+
+
+def find_chat_list_row(driver, contact_hint):
+    hints = contact_hint_variants(contact_hint)
+
+    rows = driver.find_elements(
+        By.XPATH,
+        '//div[@role="listitem"] | //div[contains(@aria-label, "Chat list")]//div[@role="row"]'
+    )
+
+    for row in rows:
+        try:
+            row_text = (row.text or "").lower()
+
+            for hint in hints:
+                if hint.lower() in row_text:
+                    return row
+
+            for title_el in row.find_elements(By.XPATH, './/span[@title]'):
+                title = (title_el.get_attribute("title") or "").lower()
+
+                for hint in hints:
+                    if hint.lower() in title:
+                        return row
+
+        except Exception:
+            continue
+
+    return None
+
+
+def click_mark_unread_menu_item(driver):
+    menu_selectors = [
+        '//div[@role="button" and contains(., "Mark as unread")]',
+        '//span[contains(text(), "Mark as unread")]',
+        '//*[@aria-label="Mark as unread"]',
+        '//li[contains(., "Mark as unread")]',
+    ]
+
+    for selector in menu_selectors:
+        try:
+            items = driver.find_elements(By.XPATH, selector)
+
+            for item in items:
+                if item.is_displayed():
+                    driver.execute_script("arguments[0].click();", item)
+                    return True
+
+        except Exception:
+            continue
+
+    return False
+
+
+def open_chat_via_search(driver, contact_hint):
+    hints = contact_hint_variants(contact_hint)
+    search_selectors = [
+        '//div[@contenteditable="true"][@data-tab="3"]',
+        '//div[@contenteditable="true"][@title="Search input textbox"]',
+        '//div[@role="textbox"][@contenteditable="true"]',
+    ]
+
+    search_box = None
+
+    for selector in search_selectors:
+        try:
+            elements = driver.find_elements(By.XPATH, selector)
+
+            for el in elements:
+                if el.is_displayed():
+                    search_box = el
+                    break
+
+            if search_box:
+                break
+
+        except Exception:
+            continue
+
+    if not search_box:
+        print("❌ WhatsApp search box not found.")
+        return False
+
+    search_box.click()
+    time.sleep(0.5)
+
+    for key_combo in [Keys.COMMAND, Keys.CONTROL]:
+        search_box.send_keys(key_combo, "a")
+        search_box.send_keys(Keys.BACKSPACE)
+
+    search_box.send_keys(hints[0])
+    time.sleep(2)
+
+    title_selectors = [
+        f'//span[@title="{hint}"]' for hint in hints
+    ] + [
+        '//span[@title]'
+    ]
+
+    for selector in title_selectors:
+        try:
+            results = driver.find_elements(By.XPATH, selector)
+
+            for result in results:
+                title = (result.get_attribute("title") or "").lower()
+
+                if any(hint.lower() in title for hint in hints):
+                    driver.execute_script("arguments[0].click();", result)
+                    time.sleep(2)
+                    print(f"✅ Opened chat via search: {result.get_attribute('title')}")
+                    return True
+
+        except Exception:
+            continue
+
+    print(f"❌ Could not find chat via search for: {contact_hint}")
+    return False
+
+
+def mark_current_chat_unread_via_header(driver):
+    header_menu_selectors = [
+        '//header//span[@data-icon="menu"]',
+        '//header//*[@data-icon="menu"]',
+        '//header//button[@aria-label="Menu"]',
+        '//header//*[@aria-label="Menu"]',
+    ]
+
+    for selector in header_menu_selectors:
+        try:
+            buttons = driver.find_elements(By.XPATH, selector)
+
+            for button in buttons:
+                if button.is_displayed():
+                    driver.execute_script("arguments[0].click();", button)
+                    time.sleep(1)
+
+                    if click_mark_unread_menu_item(driver):
+                        print("✅ Chat marked as unread via header menu.")
+                        return True
+
+        except Exception:
+            continue
+
+    return False
+
+
+def mark_chat_as_unread(driver, contact_hint="+60 16-722 2208"):
+    print(f"📌 Marking WhatsApp chat as unread: {contact_hint}")
+
+    driver.get("https://web.whatsapp.com")
+
+    if not wait_for_whatsapp_ready(driver, timeout=60):
+        return False
+
+    time.sleep(2)
+
+    row = find_chat_list_row(driver, contact_hint)
+
+    if row:
+        try:
+            ActionChains(driver).move_to_element(row).perform()
+            time.sleep(1)
+
+            row_menu_selectors = [
+                './/*[@data-icon="down"]',
+                './/*[@aria-label="Open the chat context menu"]',
+                './/button[contains(@aria-label, "Menu")]',
+            ]
+
+            for selector in row_menu_selectors:
+                buttons = row.find_elements(By.XPATH, selector)
+
+                for button in buttons:
+                    try:
+                        if button.is_displayed():
+                            driver.execute_script("arguments[0].click();", button)
+                            time.sleep(1)
+
+                            if click_mark_unread_menu_item(driver):
+                                print("✅ Chat marked as unread via chat list menu.")
+                                return True
+
+                    except Exception:
+                        continue
+
+            ActionChains(driver).context_click(row).perform()
+            time.sleep(1)
+
+            if click_mark_unread_menu_item(driver):
+                print("✅ Chat marked as unread via right-click.")
+                return True
+
+        except Exception as e:
+            print(f"⚠️ Chat row menu failed: {e}")
+
+    if open_chat_via_search(driver, contact_hint):
+        if mark_current_chat_unread_via_header(driver):
+            return True
+
+        try:
+            header = driver.find_elements(By.XPATH, '//header')[-1]
+            ActionChains(driver).context_click(header).perform()
+            time.sleep(1)
+
+            if click_mark_unread_menu_item(driver):
+                print("✅ Chat marked as unread via header right-click.")
+                return True
+
+        except Exception as e:
+            print(f"⚠️ Header right-click failed: {e}")
+
+    print(f"❌ Failed to mark chat as unread: {contact_hint}")
+    return False
+
+
+def get_contact_name_from_open_chat(driver):
+    try:
+        headers = driver.find_elements(By.XPATH, '//header')
+        if headers:
+            header_text = headers[-1].text.strip()
+            lines = [x.strip() for x in header_text.splitlines() if x.strip()]
+            if lines:
+                return lines[0]
+    except Exception:
+        pass
+
+    return "WhatsApp Customer"
+
+
+def open_unread_chat(row):
+    try:
+        row.click()
+        time.sleep(5)
+        return True
+    except Exception as e:
+        print(f"❌ Could not open unread chat: {e}")
+        return False
+
+
+def wait_for_chat_messages(driver, timeout=12):
+    end = time.time() + timeout
+
+    while time.time() < end:
+        selectors = [
+            'div[data-pre-plain-text]',
+            'div[data-testid="msg-container"]',
+            'div.message-in',
+        ]
+
+        for selector in selectors:
+            try:
+                if driver.find_elements(By.CSS_SELECTOR, selector):
+                    return True
+            except Exception:
+                continue
+
+        time.sleep(1)
+
+    return False
+
+
+def is_outgoing_pre_plain(pre_plain_text):
+    ppt = str(pre_plain_text or "").strip()
+    return bool(re.search(r"\]\s*You:\s*$", ppt, re.I))
+
+
+def clean_bubble_text(text):
+    lines = [x.strip() for x in str(text or "").splitlines() if x.strip()]
+    cleaned_lines = []
+
+    for line in lines:
+        if re.fullmatch(r"\d{1,2}:\d{2}\s*(AM|PM)?", line, re.I):
+            continue
+
+        if re.match(r"\[\d{1,2}:\d{2}\s*(?:AM|PM)?,\s*\d{1,2}/\d{1,2}/\d{4}\]", line, re.I):
+            continue
+
+        if line in ["✓", "✓✓", "✓ ✓"]:
+            continue
+
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def pick_latest_message_block(messages):
+    if not messages:
+        return ""
+
+    trailing_qty_lines = []
+
+    for txt in reversed(messages):
+        if re.search(r"\bQTY\s*:\s*\d+\b", txt, re.I):
+            trailing_qty_lines.append(txt)
+        else:
+            if trailing_qty_lines:
+                break
+
+    if trailing_qty_lines:
+        return "\n".join(reversed(trailing_qty_lines)).strip()
+
+    return messages[-1]
+
+
+def extract_text_from_copyable_div(div):
+    text_parts = []
+
+    span_selectors = [
+        'span[data-testid="selectable-text"]',
+        'span.copyable-text',
+        'span.selectable-text',
+        'span[dir="ltr"]',
+    ]
+
+    for selector in span_selectors:
+        try:
+            spans = div.find_elements(By.CSS_SELECTOR, selector)
+
+            for span in spans:
+                txt = span.text.strip()
+                if txt and txt not in text_parts:
+                    text_parts.append(txt)
+
+        except Exception:
+            continue
+
+    if text_parts:
+        return clean_bubble_text("\n".join(text_parts))
+
+    return clean_bubble_text(div.text)
+
+
+def get_latest_incoming_message_from_pre_plain(driver):
+    incoming_messages = []
+
+    try:
+        copyable_divs = driver.find_elements(By.CSS_SELECTOR, 'div[data-pre-plain-text]')
+    except Exception:
+        copyable_divs = []
+
+    for div in copyable_divs:
+        try:
+            pre_plain = div.get_attribute("data-pre-plain-text") or ""
+
+            if is_outgoing_pre_plain(pre_plain):
+                continue
+
+            text = extract_text_from_copyable_div(div)
+
+            if text:
+                incoming_messages.append(text)
+
+        except Exception:
+            continue
+
+    return pick_latest_message_block(incoming_messages)
+
+
+def get_latest_incoming_message_from_legacy_selectors(driver):
+    bubble_selectors = [
+        '(//div[contains(@class, "message-in")])[last()]',
+        '(//div[contains(@data-testid, "msg-container") and contains(@class, "message-in")])[last()]',
+        '(//div[@data-testid="msg-container" and not(contains(@class, "message-out"))])[last()]',
+    ]
+
+    for bubble_selector in bubble_selectors:
+        try:
+            bubbles = driver.find_elements(By.XPATH, bubble_selector)
+
+            if not bubbles:
+                continue
+
+            message = clean_bubble_text(bubbles[-1].text)
+
+            if message:
+                return message
+
+        except Exception:
+            continue
+
+    incoming_texts = []
+
+    selectors = [
+        '//div[contains(@class, "message-in")]//span[contains(@class, "selectable-text")]',
+        '//div[contains(@class, "message-in")]//span[@data-testid="selectable-text"]',
+        '//div[contains(@class, "message-in")]//span[@dir="ltr"]',
+        '//div[contains(@class, "message-in")]//span[contains(@class, "copyable-text")]',
+    ]
+
+    for selector in selectors:
+        try:
+            elements = driver.find_elements(By.XPATH, selector)
+
+            for el in elements:
+                txt = el.text.strip()
+                if txt and txt not in incoming_texts:
+                    incoming_texts.append(txt)
+
+        except Exception:
+            continue
+
+    return pick_latest_message_block(incoming_texts)
+
+
+def get_latest_incoming_message(driver):
+    if not wait_for_chat_messages(driver, timeout=10):
+        print("⚠️ Chat message panel not ready yet.")
+
+    try:
+        driver.execute_script(
+            "const panel = document.querySelector('[data-testid=\"conversation-panel-messages\"]');"
+            "if (panel) { panel.scrollTop = panel.scrollHeight; }"
+        )
+        time.sleep(1)
+    except Exception:
+        pass
+
+    message = get_latest_incoming_message_from_pre_plain(driver)
+
+    if message:
+        return message
+
+    message = get_latest_incoming_message_from_legacy_selectors(driver)
+
+    if message:
+        return message
+
+    print("⚠️ Could not scrape incoming message text from WhatsApp Web DOM.")
+    return ""
+
+
+def find_message_box(driver):
+    textbox_selectors = [
+        '//footer//div[@contenteditable="true"][@role="textbox"]',
+        '//footer//div[@contenteditable="true"]',
+        '//div[@contenteditable="true"][@role="textbox"]',
+        '(//div[@contenteditable="true"])[last()]',
+    ]
+
+    for selector in textbox_selectors:
+        try:
+            elements = driver.find_elements(By.XPATH, selector)
+
+            for el in elements:
+                if el.is_displayed():
+                    return el
+
+        except Exception:
+            continue
+
+    return None
+
+
+def click_send_button(driver, timeout=15):
+    end = time.time() + timeout
+
+    send_selectors = [
+        '//footer//button[@aria-label="Send"]',
+        '//footer//button[@aria-label="Send message"]',
+        '//button[@aria-label="Send"]',
+        '//button[@aria-label="Send message"]',
+        '//footer//*[@data-icon="send"]/ancestor::button',
+        '//footer//*[@data-icon="send"]/ancestor::div[@role="button"]',
+        '//*[@data-icon="send"]/ancestor::button',
+        '//*[@data-icon="send"]/ancestor::div[@role="button"]',
+        '//*[@data-icon="send"]',
+    ]
+
+    while time.time() < end:
+        for selector in send_selectors:
+            try:
+                elements = driver.find_elements(By.XPATH, selector)
+
+                for el in elements:
+                    if el.is_displayed():
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'});",
+                            el
+                        )
+                        time.sleep(0.3)
+                        driver.execute_script("arguments[0].click();", el)
+                        print("✅ WhatsApp message sent by clicking Send.")
+                        return True
+
+            except Exception:
+                continue
+
+        time.sleep(1)
+
+    return False
+
+
+def send_reply_in_current_chat(driver, message):
+    print("📲 Sending WhatsApp reply using current chat...")
+
+    try:
+        box = find_message_box(driver)
+
+        if not box:
+            print("❌ Message box not found.")
+            return False
+
+        box.click()
+        time.sleep(1)
+
+        lines = message.split("\n")
+
+        for idx, line in enumerate(lines):
+            box.send_keys(line)
+
+            if idx != len(lines) - 1:
+                box.send_keys(Keys.SHIFT, Keys.ENTER)
+
+        time.sleep(2)
+
+        if click_send_button(driver, timeout=15):
+            return True
+
+        print("⚠️ Send button not found. Trying ENTER method...")
+
+        box = find_message_box(driver)
+
+        if box:
+            box.click()
+            time.sleep(0.5)
+            box.send_keys(Keys.ENTER)
+            print("✅ WhatsApp message sent by ENTER.")
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"❌ Failed to send reply: {e}")
+        return False
+
+
+def open_whatsapp_chat_by_phone(driver, phone):
+    phone = normalize_phone(phone)
+
+    if not phone:
+        print("❌ Customer phone missing. Cannot open WhatsApp chat.")
+        return False
+
+    print(f"🌐 Opening customer WhatsApp chat: {phone}")
+
+    driver.get(f"https://web.whatsapp.com/send?phone={phone}")
+
+    end = time.time() + 90
+
+    while time.time() < end:
+        try:
+            box = driver.find_elements(By.XPATH, '//footer//div[@contenteditable="true"]')
+            if box:
+                print("✅ Customer WhatsApp chat opened.")
+                return True
+        except Exception:
+            pass
+
+        time.sleep(3)
+
+    print("❌ Customer WhatsApp chat did not open.")
+    return False
+
+
+def load_supplier_pending():
+    if not os.path.exists(SUPPLIER_PENDING_CSV):
+        return [], []
+
+    with open(SUPPLIER_PENDING_CSV, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader), reader.fieldnames or []
+
+
+def save_supplier_pending(rows, fieldnames):
+    if not fieldnames:
+        return
+
+    with open(SUPPLIER_PENDING_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def extract_supplier_sections(message):
+    ref_matches = list(re.finditer(r"WA-\d{8}-[A-Z0-9]+-[A-Z0-9]+", message, re.I))
+
+    sections = []
+
+    for idx, match in enumerate(ref_matches):
+        ref = match.group(0).upper()
+        start = match.start()
+        end = ref_matches[idx + 1].start() if idx + 1 < len(ref_matches) else len(message)
+        section = message[start:end].strip()
+
+        sections.append({
+            "ref": ref,
+            "section": section
+        })
+
+    return sections
+
+
+def parse_supplier_reply_items(section):
+    items = []
+
+    block_pattern = re.compile(
+        r"(\d+)\)\s*(.*?)\n"
+        r"\s*Qty\s*:\s*(\d+)\s*\n"
+        r"\s*Price\s*:\s*([^\n]*)\n"
+        r"\s*Lead\s*Time\s*:\s*([^\n]*)",
+        re.I | re.S
+    )
+
+    for idx, desc, qty, supplier_price_raw, lead_time in block_pattern.findall(section):
+        desc = re.sub(r"\s+", " ", desc).strip()
+        qty = int(qty)
+        supplier_price_raw = supplier_price_raw.strip()
+        lead_time = lead_time.strip()
+
+        if not supplier_price_raw or not lead_time:
+            continue
+
+        if "SAMPLE ITEM" in desc.upper():
+            continue
+
+        supplier_cost = parse_money(supplier_price_raw)
+
+        if supplier_cost is None:
+            continue
+
+        customer_unit_price = supplier_cost / MARKUP_DIVISOR
+        customer_subtotal = customer_unit_price * qty
+
+        items.append({
+            "idx": int(idx),
+            "desc": desc,
+            "qty": qty,
+            "supplier_cost_raw": supplier_price_raw,
+            "supplier_cost": supplier_cost,
+            "customer_unit_price": customer_unit_price,
+            "customer_subtotal": customer_subtotal,
+            "lead_time": lead_time
+        })
+
+    return items
+
+
+def build_customer_update_from_supplier(ref, brand, parsed_items):
+    msg = f"Hi, we have received supplier update for your inquiry.\n\nRef: {ref}\nBrand: {brand}\n\n"
+
+    total = 0.0
+
+    for item in parsed_items:
+        total += item["customer_subtotal"]
+
+        msg += f"{item['idx']}) {item['desc']}\n"
+        msg += f"Qty: {item['qty']}\n"
+        msg += f"Unit Price: RM {format_money(item['customer_unit_price'])}\n"
+        msg += f"Lead Time: {item['lead_time']}\n"
+        msg += f"Subtotal: RM {format_money(item['customer_subtotal'])}\n\n"
+
+    msg += f"Total: RM {format_money(total)}\n\n"
+    msg += "Thank you."
+
+    return msg
+
+
+def process_supplier_reply(driver, contact_name, latest_message):
+    print("📬 Detected WhatsApp supplier reply / RFQ reference message.")
+
+    sections = extract_supplier_sections(latest_message)
+
+    if not sections:
+        print("⚠️ No WA ref section found.")
+        return True
+
+    rows, fieldnames = load_supplier_pending()
+
+    if not rows:
+        print("⚠️ Supplier pending CSV is empty or missing.")
+        append_log(contact_name, latest_message, [], [], "SUPPLIER_REF_BUT_PENDING_CSV_EMPTY")
+        return True
+
+    pending_by_ref = {row.get("ref", "").upper(): row for row in rows}
+
+    for sec in sections:
+        ref = sec["ref"]
+        section = sec["section"]
+
+        print("")
+        print("-" * 90)
+        print(f"🔎 Processing supplier ref section: {ref}")
+
+        pending = pending_by_ref.get(ref)
+
+        if not pending:
+            print("⚠️ Ref not found in pending CSV.")
+            print("   IMPORTANT: This will NOT be treated as a new customer inquiry.")
+            append_log(contact_name, section, [], [], f"SUPPLIER_REF_NOT_FOUND_{ref}")
+            continue
+
+        parsed_items = parse_supplier_reply_items(section)
+
+        if not parsed_items:
+            print("⚠️ Ref found, but Price / Lead Time not filled.")
+            print("   Treating as supplier RFQ copy or incomplete reply only.")
+            append_log(contact_name, section, [], [pending.get("brand")], f"SUPPLIER_REF_NO_PRICE_LT_{ref}")
+            continue
+
+        customer_phone = pending.get("customer_phone")
+        brand = pending.get("brand")
+
+        print("✅ Supplier filled reply parsed with markup:")
+        for item in parsed_items:
+            print(
+                f"   {item['idx']}) {item['desc']} | Qty: {item['qty']} | "
+                f"Supplier Cost: RM {format_money(item['supplier_cost'])} | "
+                f"Customer Price: RM {format_money(item['customer_unit_price'])} | "
+                f"LT: {item['lead_time']}"
+            )
+
+        if not open_whatsapp_chat_by_phone(driver, customer_phone):
+            append_log(contact_name, section, parsed_items, [brand], f"SUPPLIER_PARSED_CUSTOMER_CHAT_FAILED_{ref}")
+            continue
+
+        customer_msg = build_customer_update_from_supplier(ref, brand, parsed_items)
+        sent = send_reply_in_current_chat(driver, customer_msg)
+
+        for row in rows:
+            if row.get("ref", "").upper() == ref:
+                row["status"] = "CUSTOMER_UPDATED" if sent else "SUPPLIER_REPLIED_CUSTOMER_SEND_FAILED"
+                row["supplier_replied_at"] = now_iso()
+                row["customer_updated_at"] = now_iso() if sent else ""
+                break
+
+        save_supplier_pending(rows, fieldnames)
+
+        append_log(
+            contact_name,
+            section,
+            parsed_items,
+            [brand],
+            f"SUPPLIER_REPLY_CUSTOMER_UPDATED_{ref}" if sent else f"SUPPLIER_REPLY_CUSTOMER_SEND_FAILED_{ref}"
+        )
+
+        time.sleep(3)
+
+    return True
+
+
+def process_customer_inquiry(driver, contact_name, latest_message):
+    result = process_inquiry_text(latest_message)
+
+    formatted_rows = result["formatted_rows"]
+    tbc_by_brand = result["tbc_by_brand"]
+    skipped = result.get("skipped", [])
+
+    if skipped:
+        try:
+            handle_non_standard_items(
+                customer_name=contact_name,
+                customer_contact=contact_name,
+                channel="WHATSAPP",
+                items=skipped,
+                source_message=latest_message
+            )
+        except Exception as e:
+            print(f"❌ Non-standard handler error: {e}")
+
+    if not formatted_rows:
+        reply = (
+            "Hi, I received your WhatsApp message, but I could not detect item details.\n\n"
+            "Please send in this format:\n"
+            "E3Z-T61 Qty:1\n"
+            "178902 Qty:2"
+        )
+
+        sent = send_reply_in_current_chat(driver, reply)
+        append_log(
+            contact_name,
+            latest_message,
+            [],
+            [],
+            "NO_ITEMS_REPLIED" if sent else "NO_ITEMS_REPLY_FAILED"
+        )
+        return
+
+    print("✅ OpenClaw engine formatted rows:")
+    for row in formatted_rows:
+        print(
+            f"   - {row.get('desc')} | Qty: {row.get('qty')} | "
+            f"Price: {row.get('price')} | LT: {row.get('lt')} | Brand: {row.get('brand')}"
+        )
+
+    customer_reply = build_plain_quotation_reply(formatted_rows)
+    sent = send_reply_in_current_chat(driver, customer_reply)
+
+    if tbc_by_brand:
+        print("📡 Supplier RFQ required by brand:")
+
+    for brand, items in tbc_by_brand.items():
+        ref = f"WA-{datetime.datetime.now().strftime('%Y%m%d')}-{brand}-{gen_unique_id()}"
+
+        print(f"   Brand: {brand} | Items: {len(items)} | Ref: {ref}")
+
+        send_supplier_rfq(
+            driver=driver,
+            brand=brand,
+            items=items,
+            ref=ref,
+            customer_contact=contact_name
+        )
+
+        time.sleep(3)
+
+    append_log(
+        contact_name,
+        latest_message,
+        formatted_rows,
+        list(tbc_by_brand.keys()),
+        "CUSTOMER_REPLIED_SUPPLIER_ROUTED" if sent else "CUSTOMER_REPLY_FAILED_SUPPLIER_ROUTED"
+    )
+
+def process_open_chat(driver):
+    contact_name = get_contact_name_from_open_chat(driver)
+    latest_message = ""
+
+    for attempt in range(1, 4):
+        latest_message = get_latest_incoming_message(driver)
+
+        if latest_message:
+            break
+
+        print(f"⚠️ Message scrape attempt {attempt}/3 returned empty. Retrying...")
+        time.sleep(3)
+
+    print("")
+    print("=" * 90)
+    print("📲 UNREAD WHATSAPP CHAT OPENED")
+    print(f"   Contact: {contact_name}")
+    print("   Latest Incoming Message:")
+    print(latest_message)
+    print("=" * 90)
+
+    if not latest_message:
+        print("⚠️ No latest incoming message detected after retries.")
+
+        fallback_reply = (
+            "Hi, I received your WhatsApp message but could not read the text.\n\n"
+            "Please resend as plain text in this format:\n"
+            "E3Z-T61 Qty:1\n"
+            "178902 Qty:2"
+        )
+        sent = send_reply_in_current_chat(driver, fallback_reply)
+        append_log(
+            contact_name,
+            "",
+            [],
+            [],
+            "NO_INCOMING_MESSAGE_FALLBACK_SENT" if sent else "NO_INCOMING_MESSAGE"
+        )
+        return
+
+    if re.search(r"WA-\d{8}-[A-Z0-9]+-[A-Z0-9]+", latest_message, re.I):
+        process_supplier_reply(driver, contact_name, latest_message)
+        return
+
+    process_customer_inquiry(driver, contact_name, latest_message)
+
+
+def process_mark_unread_request(driver):
+    if not os.path.exists(MARK_UNREAD_FLAG):
+        return False
+
+    contact = "+60 16-722 2208"
+
+    try:
+        with open(MARK_UNREAD_FLAG, "r", encoding="utf-8") as f:
+            contact = f.read().strip() or contact
+    except Exception as e:
+        print(f"⚠️ Could not read mark-unread flag file: {e}")
+
+    try:
+        os.remove(MARK_UNREAD_FLAG)
+    except Exception as e:
+        print(f"⚠️ Could not remove mark-unread flag file: {e}")
+
+    print("")
+    print("=" * 90)
+    print("📌 MARK UNREAD REQUEST RECEIVED")
+    print(f"   Contact: {contact}")
+    print("=" * 90)
+
+    mark_chat_as_unread(driver, contact)
+    return True
+
+
+def watch_unread_with_existing_driver(driver):
+    print("🌐 Opening WhatsApp Web...")
+    driver.get("https://web.whatsapp.com")
+
+    if not wait_for_whatsapp_ready(driver):
+        return
+
+    if process_mark_unread_request(driver):
+        print("↩️ Returning to WhatsApp chat list after mark-unread...")
+        driver.get("https://web.whatsapp.com")
+        wait_for_whatsapp_ready(driver, timeout=30)
+        time.sleep(2)
+
+    unread_rows = find_unread_chat_rows(driver)
+
+    if not unread_rows:
+        print("✅ No unread WhatsApp chats found.")
+        return
+
+    for idx, row in enumerate(unread_rows, start=1):
+        print("")
+        print("-" * 90)
+        print(f"📬 Processing unread chat {idx}/{len(unread_rows)}")
+
+        if not open_unread_chat(row):
+            continue
+
+        process_open_chat(driver)
+
+        time.sleep(3)
+
+        print("↩️ Returning to WhatsApp chat list...")
+        driver.get("https://web.whatsapp.com")
+        wait_for_whatsapp_ready(driver, timeout=30)
+        time.sleep(2)
+
+
+def run_persistent_watcher():
+    print(f"🚀 WhatsApp Watcher Persistent Mode ({VERSION})")
+    print(f"⏱️ Check interval: {CHECK_INTERVAL_SECONDS} seconds")
+    print(f"📁 Chrome Profile: {OPENCLAW_CHROME_PROFILE}")
+
+    driver = None
+
+    try:
+        driver = init_driver()
+
+        while True:
+            try:
+                print("")
+                print("=" * 90)
+                print(f"🔁 New WhatsApp scan cycle @ {now_iso()}")
+
+                watch_unread_with_existing_driver(driver)
+
+            except Exception as e:
+                print(f"⚠️ WhatsApp scan cycle error: {e}")
+
+                try:
+                    print("🔄 Recovering WhatsApp Web page...")
+                    driver.get("https://web.whatsapp.com")
+                    wait_for_whatsapp_ready(driver, timeout=60)
+                except Exception as recover_error:
+                    print(f"❌ Recovery failed: {recover_error}")
+                    print("🔁 Restarting Chrome driver...")
+
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+
+                    driver = init_driver()
+
+            print(f"⏳ Sleeping {CHECK_INTERVAL_SECONDS} seconds...")
+            time.sleep(CHECK_INTERVAL_SECONDS)
+
+    except KeyboardInterrupt:
+        print("🛑 WhatsApp watcher stopped by user.")
+
+    finally:
+        if driver:
+            print("🧹 Closing Chrome driver...")
+            driver.quit()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "mark-unread":
+        contact = sys.argv[2] if len(sys.argv) > 2 else "+60 16-722 2208"
+        driver = None
+
+        try:
+            driver = init_driver()
+            success = mark_chat_as_unread(driver, contact)
+            sys.exit(0 if success else 1)
+        finally:
+            if driver:
+                driver.quit()
+    else:
+        run_persistent_watcher()

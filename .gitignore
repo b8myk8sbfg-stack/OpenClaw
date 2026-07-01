@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime logs
+logs/
+
+# Secrets and credentials
+.env
+o365_token.txt
+
+# macOS
+.DS_Store
+
+# Browser session profiles (WhatsApp Web)
+chrome_whatsapp_profile/
+chrome_whatsapp_profile_backup_*/
+wa_profile_019/
+
+# Nested git metadata (Windows-Copilot-API tracked as plain files)
+Windows-Copilot-API/.git/
+
+pending_inquiries.csv
+quotation_creation_log.csv
+whatsapp_inquiries.csv
+whatsapp_supplier_pending.csv
+non_standard_inquiries.csv
+message_classification_learning.json
+whatsapp_classification_learning.json
+whatsapp_last_classification_context.json
+email_message_classifications.csv
+whatsapp_message_classifications.csv

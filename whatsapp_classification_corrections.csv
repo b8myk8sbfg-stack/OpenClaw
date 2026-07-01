@@ -1,0 +1,4 @@
+match_text,media_type,correct_intent,notes
+purchase order,,purchase_order,Example: messages containing this phrase should be treated as PO
+technical support,,technical_support,Example: override for support requests
+pls quote,,rfq_inquiry,Example: quote requests
