@@ -9,7 +9,7 @@ import signal
 
 from openai import OpenAI
 
-VERSION = "v1.00-UNIFIED-RUNNER"
+VERSION = "v1.01-UNIFIED-RUNNER"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -34,17 +34,22 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
     )
     system_instruction = (
         "You are an industrial automation data extraction assistant. "
-        "Visually inspect the provided industrial product photo, label, nameplate, screenshot, "
-        "and/or customer text. Extract the exact manufacturer Part Number and matching Quantity. "
-        "Read printed model/order codes and electrical ratings carefully. For relays, solenoids, "
-        "coils, and power products, voltage and AC/DC are mandatory parts of the configuration: "
+        "Visually inspect the provided industrial product photo, label, nameplate, barcode sticker, "
+        "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
+        "Read printed model/order codes exactly as shown, including suffixes like #1 or #2 "
+        "(example: P36203010#1). Read SMC, OMRON, and other brand logos on labels. "
+        "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
+        "For relays, solenoids, coils, and power products, voltage and AC/DC are mandatory: "
         "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC'). "
-        "Never substitute another voltage variant. Prefer the complete code on the product label. "
+        "Never substitute another voltage variant. "
+        "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
+        "a single visible part with '2 pcs' means qty 2. "
         "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', and 'brand'. "
         "Quantity must be a positive integer. Do not guess missing part numbers. "
-        "If quantity is not visible, use 1. If brand is not visible, use 'UNKNOWN'. "
+        "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
         "Do not include markdown, backticks, or conversational text. "
-        'Example: [{"part_no": "MY2N-GS-R 24VDC", "qty": 10, "brand": "OMRON"}]'
+        'Example: [{"part_no": "P36203010#1", "qty": 1, "brand": "SMC"}, '
+        '{"part_no": "P36203009#1", "qty": 1, "brand": "SMC"}]'
     )
 
     try:

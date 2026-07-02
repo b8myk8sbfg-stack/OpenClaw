@@ -34,7 +34,7 @@ LEGACY_LEARNING = os.path.join(BASE_DIR, "whatsapp_classification_learning.json"
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
 
-VERSION = "v1.01-JUNK-AD-LEARNING"
+VERSION = "v1.02-VOICE-NOT-AVATAR"
 
 MEDIA_TYPES = (
     "text",
@@ -146,6 +146,25 @@ def _guess_media_from_filename(filename: str) -> str:
     return "document"
 
 
+def _is_profile_or_ui_image_src(src: str) -> bool:
+    """WhatsApp contact avatars and UI chrome — not customer photo attachments."""
+    lowered = str(src or "").lower()
+    if not lowered:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "emoji",
+            "avatar",
+            "gif",
+            "sticker",
+            "pps.whatsapp",
+            "profile",
+            "contact-photo",
+        )
+    )
+
+
 def _extract_filename_from_bubble(bubble) -> str:
     if bubble is None:
         return ""
@@ -185,9 +204,28 @@ def _extract_filename_from_bubble(bubble) -> str:
 
 def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
     """Inspect a WhatsApp bubble DOM node and infer media type."""
+    from selenium.webdriver.common.by import By as _By  # noqa: avoid circular at import
+
+    bubble_for_scan = bubble
+    if bubble is not None:
+        try:
+            testid = bubble.get_attribute("data-testid") or ""
+            if testid != "msg-container" and "message-in" not in (bubble.get_attribute("class") or ""):
+                node = bubble
+                for _ in range(10):
+                    node = node.find_element(_By.XPATH, "..")
+                    if (node.get_attribute("data-testid") or "") == "msg-container":
+                        bubble_for_scan = node
+                        break
+                    if "message-in" in (node.get_attribute("class") or ""):
+                        bubble_for_scan = node
+                        break
+        except Exception:
+            bubble_for_scan = bubble
+
     info = MediaInfo(caption=caption_text or "")
 
-    if bubble is None:
+    if bubble_for_scan is None:
         if caption_text.strip():
             info.media_type = "text"
         else:
@@ -197,17 +235,24 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
     voice_selectors = [
         '[data-testid="audio-play"]',
         '[data-testid="ptt-play-button"]',
+        '[data-testid="ptt"]',
+        '[data-testid="audio"]',
         '[data-icon="ptt"]',
         '[data-icon="audio-play"]',
+        '[data-icon="audio-download"]',
         'audio',
+        'canvas',
     ]
     doc_selectors = [
         '[data-testid="document-thumb"]',
+        '[data-testid="document"]',
+        '[data-testid="document-message"]',
         '[data-icon="document"]',
         '[data-icon="document-pdf"]',
         '[data-icon="document-xls"]',
         '[data-icon="document-ppt"]',
         '[data-icon="document-doc"]',
+        'span[data-icon="document-pdf"]',
     ]
     image_selectors = [
         'img[src]',
@@ -218,16 +263,39 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
 
     for selector in voice_selectors:
         try:
-            if bubble.find_elements(By.CSS_SELECTOR, selector):
+            if bubble_for_scan.find_elements(By.CSS_SELECTOR, selector):
+                if selector == "canvas" and bubble_for_scan.find_elements(By.CSS_SELECTOR, '[data-testid="video-thumb"]'):
+                    continue
                 info.has_voice = True
                 info.raw_indicators.append(f"voice:{selector}")
                 break
         except Exception:
             continue
 
+    if not info.has_voice:
+        try:
+            bubble_text = bubble_for_scan.text or ""
+            if re.search(r"\b\d{1,2}:\d{2}\b", bubble_text):
+                has_thumb = bubble_for_scan.find_elements(
+                    By.CSS_SELECTOR,
+                    '[data-testid="image-thumb"], [data-testid="media-url-provider"]',
+                )
+                has_video = bubble_for_scan.find_elements(
+                    By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
+                )
+                has_play = bubble_for_scan.find_elements(
+                    By.CSS_SELECTOR,
+                    '[role="button"], span[data-icon="audio-play"], span[data-icon="ptt"]',
+                )
+                if not has_thumb and not has_video and has_play:
+                    info.has_voice = True
+                    info.raw_indicators.append("voice:duration-play-heuristic")
+        except Exception:
+            pass
+
     for selector in doc_selectors:
         try:
-            if bubble.find_elements(By.CSS_SELECTOR, selector):
+            if bubble_for_scan.find_elements(By.CSS_SELECTOR, selector):
                 info.has_document = True
                 info.raw_indicators.append(f"document:{selector}")
                 break
@@ -236,7 +304,7 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
 
     for selector in video_selectors:
         try:
-            elements = bubble.find_elements(By.CSS_SELECTOR, selector)
+            elements = bubble_for_scan.find_elements(By.CSS_SELECTOR, selector)
             if elements:
                 info.has_video = True
                 info.raw_indicators.append(f"video:{selector}")
@@ -246,9 +314,9 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
 
     for selector in image_selectors:
         try:
-            for element in bubble.find_elements(By.CSS_SELECTOR, selector):
-                src = (element.get_attribute("src") or "").lower()
-                if any(token in src for token in ("emoji", "avatar", "gif", "sticker")):
+            for element in bubble_for_scan.find_elements(By.CSS_SELECTOR, selector):
+                src = element.get_attribute("src") or ""
+                if _is_profile_or_ui_image_src(src):
                     continue
                 size = element.size or {}
                 area = int(size.get("width") or 0) * int(size.get("height") or 0)
@@ -261,10 +329,47 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
         except Exception:
             continue
 
-    info.filename = _extract_filename_from_bubble(bubble)
+    if not info.has_image and not info.has_voice:
+        try:
+            if (
+                bubble_for_scan.find_elements(By.CSS_SELECTOR, '[data-testid="media-caption"]')
+                and bubble_for_scan.find_elements(
+                    By.CSS_SELECTOR,
+                    '[data-testid="image-thumb"], [data-testid="media-url-provider"]',
+                )
+            ):
+                info.has_image = True
+                info.raw_indicators.append("image:media-caption-with-thumb")
+        except Exception:
+            pass
+
+    info.filename = _extract_filename_from_bubble(bubble_for_scan)
+
+    # WhatsApp PDFs render a page preview image — filename/document must win over image.
+    filename_lower = (info.filename or "").lower()
+    bubble_text_lower = ""
+    try:
+        bubble_text_lower = (bubble_for_scan.text or "").lower()
+    except Exception:
+        pass
+
+    if filename_lower.endswith(".pdf") or re.search(r"\.pdf\b", bubble_text_lower):
+        info.has_document = True
+        info.media_type = "pdf"
+        if not info.filename and re.search(r"[\w\s\-()]+\.pdf", bubble_text_lower, re.I):
+            pdf_match = re.search(r"([^\n\r]+\.pdf)", bubble_text_lower, re.I)
+            if pdf_match:
+                info.filename = pdf_match.group(1).strip()
+        return info
+
+    if filename_lower.endswith((".xlsx", ".xls", ".xlsm", ".doc", ".docx", ".ppt", ".pptx")):
+        info.has_document = True
+        info.media_type = _guess_media_from_filename(info.filename)
+        return info
 
     if info.has_voice:
         info.media_type = "voice"
+        info.has_image = False
     elif info.has_document:
         info.media_type = _guess_media_from_filename(info.filename)
     elif info.has_video:
@@ -335,6 +440,16 @@ def _heuristic_intent(message_text: str, media_info: MediaInfo) -> Optional[Clas
             intent="purchase_order",
             confidence=0.88,
             reasoning="Message mentions purchase order keywords.",
+            media_filename=media_info.filename,
+            handler="purchase_order",
+        )
+
+    if media_info.media_type == "pdf" or (media_info.filename or "").lower().endswith(".pdf"):
+        return ClassificationResult(
+            media_type="pdf",
+            intent="purchase_order",
+            confidence=0.92,
+            reasoning="PDF attachment — treated as purchase order document.",
             media_filename=media_info.filename,
             handler="purchase_order",
         )
@@ -668,6 +783,13 @@ def log_classification(
     )
 
 
+def _digits_only_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) < 8 or len(digits) > 15:
+        return ""
+    return digits
+
+
 def build_classification_monitor_message(
     contact_name: str,
     customer_contact: str,
@@ -675,10 +797,13 @@ def build_classification_monitor_message(
     result: ClassificationResult,
 ) -> str:
     filename_line = f"\nAttachment: {result.media_filename}" if result.media_filename else ""
+    phone_display = _digits_only_phone(customer_contact)
+    phone_line = f"Customer Contact: {phone_display}\n" if phone_display else ""
+
     return (
         "[OpenClaw Message Classification]\n"
         f"Contact: {contact_name or '-'}\n"
-        f"Customer: {customer_contact or contact_name or '-'}\n"
+        f"{phone_line}"
         f"Media: {result.media_type}{filename_line}\n"
         f"Intent: {result.intent} ({result.confidence:.0%})\n"
         f"Handler: {result.handler}\n"

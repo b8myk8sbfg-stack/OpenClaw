@@ -1,0 +1,4 @@
+# Checked every scan cycle even when the chat is already read.
+# Use 1:1 contact names — not group names (PSHI consignment is a group, not Stephen).
+Robomatics Stephen
+Stephen

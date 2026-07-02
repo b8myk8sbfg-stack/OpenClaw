@@ -19,7 +19,7 @@ from openclaw_main import extract_rfq_with_copilot
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
-VERSION = "v1.13-EMAIL-CLASSIFIER-JUNK-FILTER"
+VERSION = "v1.14-EMAIL-FIFO-ONE"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -698,7 +698,10 @@ def process_supplier_replies(mailbox):
 
         messages = list(mailbox.get_messages(limit=20, query='isRead eq false'))
 
+        handled_one = False
         for msg in messages:
+            if handled_one:
+                break
             content = msg.body if msg.body else ""
             combined = f"{msg.subject} {content}"
             ref_code = find_ref_code(combined)
@@ -854,10 +857,14 @@ def process_supplier_replies(mailbox):
                 print(f"   Subject: Update: Quotation for Inquiry {ref_code}")
                 print(f"   Items Sent: {len(formatted_rows)}")
                 log_line()
+                handled_one = True
+                break
             else:
                 print("   ⚠️ No formatted rows generated. Marking supplier reply as read to avoid duplicate RFQ.")
                 msg.mark_as_read()
                 log_line()
+                handled_one = True
+                break
 
     except Exception as e:
         print(f"❌ Supplier Reply Parser Error: {e}")
@@ -968,9 +975,9 @@ def process_latest_inquiry():
     alert_manager_for_overdue_pending(mailbox)
 
     try:
-        print("📥 Checking unread customer inquiry emails...")
+        print("📥 Checking unread customer inquiry emails (FIFO — one email per cycle)...")
 
-        messages = list(mailbox.get_messages(limit=3, query='isRead eq false'))
+        messages = list(mailbox.get_messages(limit=5, query='isRead eq false'))
 
         for msg in messages:
             sender_email = msg.sender.address.lower()
@@ -1575,6 +1582,8 @@ def process_latest_inquiry():
                         print(f"      - {i['desc']} | Qty: {i['qty']}")
 
                 log_line()
+                print("✅ Customer inquiry fully processed — FIFO pause before next email check")
+                break
 
     except Exception as e:
         print(f"❌ Core Error: {e}")

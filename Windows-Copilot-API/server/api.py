@@ -1,14 +1,16 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import sys
 import threading
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
+from .audio import transcribe_audio_bytes
 from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
 from .openai_format import (
     completion_response,
@@ -154,6 +156,61 @@ def chat_completions(req: ChatCompletionRequest):
     return completion_response(reply.text, model, reply.conversation_id)
 
 
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(default="whisper-1"),
+    language: str = Form(default=""),
+):
+    """OpenAI-compatible speech-to-text (local Whisper on this server)."""
+    limited = _rate_limited_response()
+    if limited is not None:
+        return limited
+
+    data = await file.read()
+    if not data:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "empty audio file", "type": "invalid_request_error"}},
+        )
+
+    suffix = ".ogg"
+    if file.filename and "." in file.filename:
+        suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
+
+    print(
+        f"[copilot] transcribing voice: bytes={len(data)} model={model} file={file.filename or 'audio'}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    try:
+        with _upstream_lock:
+            text = transcribe_audio_bytes(data, suffix=suffix, model=model or None)
+    except RuntimeError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": str(exc), "type": "transcription_error"}},
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": str(exc), "type": "upstream_error"}},
+        )
+
+    if not text:
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": "transcription returned empty text", "type": "upstream_error"}},
+        )
+
+    print(f"[copilot] voice transcript: {text[:200]}", file=sys.stderr, flush=True)
+    return {"text": text}
+
+
 @app.get("/")
 def root():
-    return {"service": "Copilot OpenAI-compatible API", "endpoints": ["/v1/models", "/v1/chat/completions"]}
+    return {
+        "service": "Copilot OpenAI-compatible API",
+        "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/audio/transcriptions"],
+    }

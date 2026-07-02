@@ -366,6 +366,24 @@ def extract_structured_rfq_items(body_text):
     for part_no, qty in line_qty_pattern.findall(body_upper):
         add_item("UNKNOWN", part_no, qty, "LINE_QTY_FORMAT")
 
+    # Voice/WhatsApp spoken order: "2 pcs 178902" / "2 ke 178902"
+    qty_before_part_pattern = re.compile(
+        r"\b(\d{1,4})\s*(?:PCS|PC|PCE|PIECES|PIECE|UNIT|UNITS|EA|EACH|KE|BUAH)\b[\s,.\-]*"
+        r"([A-Z0-9][A-Z0-9\-_/]{2,30})\b",
+        re.I,
+    )
+    for qty, part_no in qty_before_part_pattern.findall(body_upper):
+        add_item("UNKNOWN", part_no, qty, "QTY_BEFORE_PART")
+
+    # Spoken order: "178902 2 pcs"
+    part_before_qty_pattern = re.compile(
+        r"\b([A-Z0-9][A-Z0-9\-_/]{2,30})\b[\s,.\-]*"
+        r"(\d{1,4})\s*(?:PCS|PC|PCE|PIECES|PIECE|UNIT|UNITS|EA|EACH|KE|BUAH)\b",
+        re.I,
+    )
+    for part_no, qty in part_before_qty_pattern.findall(body_upper):
+        add_item("UNKNOWN", part_no, qty, "PART_BEFORE_QTY")
+
 
     # WhatsApp simple single-part inquiry with no Qty:
     # Example: G3NA-210B DC5-24
