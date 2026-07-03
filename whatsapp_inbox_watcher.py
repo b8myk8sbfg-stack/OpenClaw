@@ -3679,9 +3679,10 @@ def process_customer_inquiry(
         elif image_analysis:
             reply = (
                 "Hi, I analyzed your photo but could not match the parts in our system.\n\n"
-                "Please send a clearer label/nameplate photo, or type:\n"
-                "E3Z-T61 Qty:1\n"
-                "178902 Qty:2"
+                "Please send a clearer label/nameplate photo (photograph the physical label, "
+                "not a screen), or type the part number:\n"
+                "BRAND : BURKERT PART NO. : 126094 QUANTITY : 1\n"
+                "E3Z-T61 Qty:1"
             )
         elif voice_enrichment and (
             voice_enrichment.get("transcript")

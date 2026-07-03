@@ -113,12 +113,42 @@ def load_warehouse_map():
 load_warehouse_map()
 
 
+def lookup_norm_keys(part_no):
+    """Normalized warehouse lookup keys, including Burkert ID-No zero-padding variants."""
+    part_no = str(part_no or "").upper().strip()
+    keys = []
+    seen = set()
+
+    def add_key(raw):
+        norm = normalize_part(raw)
+        if norm and norm not in seen:
+            seen.add(norm)
+            keys.append(norm)
+
+    add_key(part_no)
+
+    digits_only = re.sub(r"[^0-9]", "", part_no)
+    if digits_only and len(digits_only) >= 4:
+        add_key(digits_only)
+        stripped = digits_only.lstrip("0") or "0"
+        if stripped != digits_only:
+            add_key(stripped)
+
+    return keys
+
+
 def part_aliases(part_no):
     part_no = str(part_no or "").upper().strip()
     aliases = [part_no]
 
     if part_no.endswith("-C") and len(normalize_part(part_no)) >= 5:
         aliases.append(part_no[:-2])
+
+    digits_only = re.sub(r"[^0-9]", "", part_no)
+    if digits_only and len(digits_only) >= 4:
+        stripped = digits_only.lstrip("0") or "0"
+        if stripped not in aliases:
+            aliases.append(stripped)
 
     cleaned = []
     seen = set()
@@ -128,6 +158,14 @@ def part_aliases(part_no):
             seen.add(alias)
             cleaned.append(alias)
     return cleaned
+
+
+def find_exact_warehouse_match(part_no):
+    for norm in lookup_norm_keys(part_no):
+        exact = EXACT_LOOKUP.get(norm)
+        if exact:
+            return exact, norm
+    return None, None
 
 
 def startswith_part_boundary(stock_name, part_no):
@@ -184,26 +222,132 @@ def extract_voltage_signature(text):
         ("DC", r"(\d+(?:/\d+)*)VDC"),
         ("AC", r"AC(\d+(?:/\d+)*)"),
         ("AC", r"(\d+(?:/\d+)*)VAC"),
+        ("AC", r"(\d+(?:/\d+)*)V50HZ"),
+        ("AC", r"(\d+)V(?=50HZ)"),
     )
     for current_type, pattern in patterns:
         match = re.search(pattern, value)
         if match:
             return current_type, tuple(int(part) for part in match.group(1).split("/"))
+
+    slash_hz = re.search(r"(?:^|[^0-9])(\d{2,3})/(\d{2})(?:[^0-9]|$)", value)
+    if slash_hz and int(slash_hz.group(2)) in (50, 60):
+        return "AC", (int(slash_hz.group(1)),)
+
     return None
+
+
+def _burkert_series_token(part_no):
+    match = re.search(r"\b(6013[A-Z0-9]*)\b", str(part_no or "").upper())
+    if match:
+        return match.group(1)
+    return None
+
+
+def _burkert_label_hints(part_u):
+    hints = []
+    orifice = re.search(r"\bA\s*(\d+)\s*[,.]\s*(\d+)\b", part_u)
+    if orifice:
+        hints.extend([
+            f"A{orifice.group(1)},{orifice.group(2)}",
+            f"A{orifice.group(1)}{orifice.group(2)}",
+            f"A{orifice.group(1).zfill(2)},{orifice.group(2)}",
+        ])
+    if "FKM" in part_u:
+        hints.extend(["FKM", "FFM", "FFMS"])
+    if re.search(r"\bMS\b", part_u):
+        hints.extend(["MS", "GM"])
+    return hints
+
+
+def find_burkert_label_match(part_no, qty=1):
+    """
+    Match Burkert nameplate text (e.g. '6013 A 3,0 FKM MS 230V') to warehouse rows.
+    Used when the printed ID-No was not extracted but series + voltage are visible.
+    """
+    part_u = str(part_no or "").upper().strip()
+    series = _burkert_series_token(part_u)
+    if not series:
+        return None
+
+    requested_voltage = extract_voltage_signature(part_u)
+    if not requested_voltage:
+        return None
+
+    label_hints = _burkert_label_hints(part_u)
+    best = None
+    series_norm = normalize_part(series)
+
+    for row in WAREHOUSE_ROWS:
+        if str(row.get("brand") or "").upper() != "BURKERT":
+            continue
+
+        stock_text = (
+            f"{row.get('api_id', '')} {row.get('stock_name', '')} "
+            f"{row.get('model_no', '')} {row.get('alt_model', '')}"
+        ).upper()
+        stock_norm = normalize_part(stock_text)
+        if series_norm not in stock_norm and not stock_norm.startswith(series_norm):
+            continue
+
+        stock_voltage = extract_voltage_signature(stock_text)
+        if not stock_voltage or stock_voltage[0] != requested_voltage[0]:
+            continue
+        if not set(requested_voltage[1]).intersection(stock_voltage[1]):
+            continue
+
+        score = 1000
+        for hint in label_hints:
+            if normalize_part(hint) in stock_norm:
+                score += 250
+
+        stock_name = str(row.get("stock_name") or "").upper()
+        if re.search(r"\b6013\s+A\b", part_u) and re.search(r"\b6013SB\b", stock_name):
+            score += 400
+        if re.search(r"\b6013\s+A\b", part_u) and stock_name.startswith("601300"):
+            score -= 300
+
+        if normalize_part(row.get("api_id")) in lookup_norm_keys(part_u):
+            score += 3000
+        if row.get("stock_qty", 0) >= qty:
+            score += 500
+        elif row.get("stock_qty", 0) > 0:
+            score += 100
+        score += min(int(row.get("stock_qty") or 0), 20) * 5
+
+        if best is None or score > best["score"]:
+            best = {**row, "score": score, "match_type": "BURKERT_LABEL"}
+
+    if best:
+        print(
+            f"   ✅ [ENGINE] Burkert label match: {part_no} → {best['api_id']} | "
+            f"{best['stock_name']} | Stock Qty: {best.get('stock_qty')} | Score: {best.get('score')}"
+        )
+    return best
 
 
 def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
     part_no = str(part_no or "").strip().upper()
     declared_brand = str(declared_brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
 
-    norm = normalize_part(part_no)
-    if not norm:
+    if not lookup_norm_keys(part_no):
         return None
 
-    exact = EXACT_LOOKUP.get(norm)
+    exact, matched_norm = find_exact_warehouse_match(part_no)
     if exact:
-        print(f"   ✅ [ENGINE] Exact lookup match: {part_no} → {exact['api_id']}")
+        if matched_norm != normalize_part(part_no):
+            print(
+                f"   ✅ [ENGINE] Exact lookup match (normalized {matched_norm!r}): "
+                f"{part_no} → {exact['api_id']}"
+            )
+        else:
+            print(f"   ✅ [ENGINE] Exact lookup match: {part_no} → {exact['api_id']}")
         return exact
+
+    if declared_brand == "BURKERT":
+        burkert_match = find_burkert_label_match(part_no, qty=qty)
+        if burkert_match:
+            return burkert_match
 
     # If customer did not give brand, try safe inference before partial matching.
     if declared_brand == "UNKNOWN":
