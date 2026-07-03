@@ -38,9 +38,15 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
         "Read printed model/order codes exactly as shown, including suffixes like #1 or #2 "
         "(example: P36203010#1). Read SMC, OMRON, and other brand logos on labels. "
+        "For BURKERT / BÜRKERT labels, the primary part number is the numeric ID-No "
+        "(example: ID-No 00126094 → part_no '00126094', brand 'BURKERT'). "
+        "Also read barcode numbers under the label when visible. "
+        "If both ID-No and model line are shown (example: '6013 A 3,0 FKM MS'), prefer ID-No "
+        "as part_no and put the model line in a separate item only if clearly a second product. "
         "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
         "For relays, solenoids, coils, and power products, voltage and AC/DC are mandatory: "
-        "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC'). "
+        "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC', "
+        "'6013 A 3,0 FKM MS 230V 50Hz'). "
         "Never substitute another voltage variant. "
         "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
         "a single visible part with '2 pcs' means qty 2. "
@@ -49,7 +55,7 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
         "Do not include markdown, backticks, or conversational text. "
         'Example: [{"part_no": "P36203010#1", "qty": 1, "brand": "SMC"}, '
-        '{"part_no": "P36203009#1", "qty": 1, "brand": "SMC"}]'
+        '{"part_no": "00126094", "qty": 1, "brand": "BURKERT"}]'
     )
 
     try:

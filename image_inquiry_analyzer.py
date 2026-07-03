@@ -50,6 +50,8 @@ Return JSON exactly like:
 
 Rules:
 - Prefer exact printed model numbers over guesses.
+- For BURKERT / BÜRKERT labels, use the numeric ID-No as part_no (example: ID-No 00126094).
+- Read barcode numbers when visible; include voltage on solenoids/relays (example: 230V 50Hz).
 - Do not invent part numbers.
 - If nothing readable, return {{"items": [], "notes": "reason"}}.
 """
