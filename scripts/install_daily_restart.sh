@@ -7,8 +7,9 @@ BASE_DIR="/Users/evon/OpenClaw"
 PLIST_SRC="$BASE_DIR/scripts/com.openclaw.daily-restart.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/com.openclaw.daily-restart.plist"
 RESTART_SCRIPT="$BASE_DIR/scripts/openclaw_daily_restart.sh"
+ENV_SCRIPT="$BASE_DIR/scripts/openclaw_env.sh"
 
-chmod +x "$RESTART_SCRIPT"
+chmod +x "$RESTART_SCRIPT" "$ENV_SCRIPT"
 
 case "${1:-install}" in
     install)

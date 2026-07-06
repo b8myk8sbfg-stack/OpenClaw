@@ -5,6 +5,10 @@
 set -euo pipefail
 
 BASE_DIR="${OPENCLAW_BASE_DIR:-/Users/evon/OpenClaw}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/openclaw_env.sh"
+
 DEPLOY_REMOTE="${OPENCLAW_DEPLOY_REMOTE:-origin}"
 DEPLOY_BRANCH="${OPENCLAW_DEPLOY_BRANCH:-main}"
 DEPLOY_REF="${DEPLOY_REMOTE}/${DEPLOY_BRANCH}"
@@ -79,10 +83,13 @@ mkdir -p "$LOG_DIR"
     log "Fast-forwarding to ${DEPLOY_REF}..."
     git merge --ff-only "$DEPLOY_REF"
 
-    echo "$REMOTE_SHA" > "$SHA_FILE"
-
     log "Restarting OpenClaw..."
-    bash "$RESTART_SCRIPT"
+    if ! bash "$RESTART_SCRIPT"; then
+        log "ERROR: Restart failed after deploy. OpenClaw may be stopped."
+        exit 1
+    fi
+
+    echo "$REMOTE_SHA" > "$SHA_FILE"
 
     log "Deploy complete."
     if [[ "$STASHED" -eq 1 ]]; then

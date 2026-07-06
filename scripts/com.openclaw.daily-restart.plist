@@ -16,6 +16,15 @@
         <key>Minute</key>
         <integer>0</integer>
     </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/evon</string>
+        <key>OPENCLAW_BASE_DIR</key>
+        <string>/Users/evon/OpenClaw</string>
+        <key>PATH</key>
+        <string>/Users/evon/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>/Users/evon/OpenClaw</string>
     <key>StandardOutPath</key>

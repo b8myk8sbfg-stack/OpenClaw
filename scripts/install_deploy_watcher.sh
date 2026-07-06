@@ -8,8 +8,9 @@ PLIST_SRC="$BASE_DIR/scripts/com.openclaw.deploy-watcher.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/com.openclaw.deploy-watcher.plist"
 DEPLOY_SCRIPT="$BASE_DIR/scripts/deploy_and_restart.sh"
 WATCHER_SCRIPT="$BASE_DIR/scripts/deploy_watcher.sh"
+ENV_SCRIPT="$BASE_DIR/scripts/openclaw_env.sh"
 
-chmod +x "$DEPLOY_SCRIPT" "$WATCHER_SCRIPT"
+chmod +x "$DEPLOY_SCRIPT" "$WATCHER_SCRIPT" "$ENV_SCRIPT"
 
 case "${1:-install}" in
     install)
