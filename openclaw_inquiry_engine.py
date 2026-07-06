@@ -8,16 +8,23 @@ from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 
 urllib3.disable_warnings(InsecureRequestWarning)
-load_dotenv()
 
-VERSION = "v1.08-STORE-QTY-SPLIT-BALANCE"
+_ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
+_OPENCLAW_DIR = os.getenv("OPENCLAW_BASE_DIR", _ENGINE_DIR)
+load_dotenv(os.path.join(_OPENCLAW_DIR, ".env"))
+load_dotenv(os.path.join(_ENGINE_DIR, ".env"))
 
-WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
+VERSION = "v1.09-OBM-STORE-QTY-FALLBACK"
+
+WAREHOUSE_CSV = os.path.join(_OPENCLAW_DIR, "Robomatics_Stock_List.csv")
 
 OBM_API_URL = os.getenv("OBM_API_URL", "").rstrip("/")
 OBM_API_KEY = os.getenv("OBM_API_KEY")
 OBM_API_SECRET = os.getenv("OBM_API_SECRET")
 OBM_AUTH = HTTPBasicAuth(OBM_API_KEY, OBM_API_SECRET)
+OBM_REQUEST_TIMEOUT = int(os.getenv("OBM_REQUEST_TIMEOUT", "20"))
+
+_PRODUCT_CACHE = {}
 
 KNOWN_BRANDS = {
     "OMRON", "SMC", "BURKERT", "BÜRKERT", "LEGRIS", "PANASONIC", "PISCO",
@@ -240,17 +247,75 @@ def extract_voltage_signature(text):
     return None
 
 
-def get_usable_store_qty(api_id, warehouse_row=None):
-    """Return STORE-location quantity from OBM, with CSV fallback for legacy PIDs."""
-    obm = get_product(api_id)
-    store_qty = get_store_qty_from_product(obm)
-    if store_qty > 0:
-        return store_qty
+def _obm_error_ok(obm) -> bool:
+    return str(obm.get("error", "")).strip() in ("0", "")
 
-    if str(obm.get("error") or "") == "101" and warehouse_row:
-        return float(warehouse_row.get("stock_qty") or 0)
 
+def parse_purchase_cost(p_res) -> float:
+    """Extract purchase cost from OBM GetPurProductPrice response."""
+    if not isinstance(p_res, dict):
+        return 0.0
+
+    candidates = []
+    unit_price = p_res.get("unit_price")
+    if isinstance(unit_price, dict):
+        candidates.append(unit_price.get("price"))
+    elif unit_price is not None:
+        candidates.append(unit_price)
+
+    for key in ("price", "unit_price", "pur_price", "cost"):
+        if key in p_res:
+            candidates.append(p_res.get(key))
+
+    for value in candidates:
+        try:
+            cost = float(str(value).replace(",", "").strip())
+            if cost > 0:
+                return cost
+        except (TypeError, ValueError):
+            continue
     return 0.0
+
+
+def resolve_store_qty(obm, warehouse_row=None):
+    """Resolve usable STORE quantity from OBM, with warehouse CSV fallback."""
+    if obm and _obm_error_ok(obm):
+        store_qty = get_store_qty_from_product(obm)
+        if store_qty > 0:
+            return store_qty, "obm_location_qty"
+
+        top_location = str(obm.get("location") or "").strip().upper()
+        if top_location == "STORE":
+            try:
+                top_qty = float(obm.get("stock_qty") or 0)
+            except (TypeError, ValueError):
+                top_qty = 0.0
+            if top_qty > 0:
+                return top_qty, "obm_top_level_stock_qty"
+
+        # OBM responded successfully but reports no STORE stock.
+        return 0.0, "obm_no_store_stock"
+
+    if warehouse_row:
+        csv_qty = float(warehouse_row.get("stock_qty") or 0)
+        if csv_qty > 0:
+            reason = "warehouse_csv"
+            if not obm:
+                reason = "warehouse_csv_no_obm"
+            elif str(obm.get("error") or "").strip() == "101":
+                reason = "warehouse_csv_legacy_pid"
+            elif not _obm_error_ok(obm):
+                reason = "warehouse_csv_obm_error"
+            return csv_qty, reason
+
+    return 0.0, "none"
+
+
+def get_usable_store_qty(api_id, warehouse_row=None):
+    """Return STORE-location quantity from OBM, with CSV fallback."""
+    obm = get_product(api_id)
+    qty, _source = resolve_store_qty(obm, warehouse_row=warehouse_row)
+    return qty
 
 
 def _default_cable_variant_bonus(part_no, stock_name):
@@ -327,9 +392,9 @@ def _pick_best_warehouse_candidate(candidates, part_no, qty):
 
     ranked.sort(
         key=lambda item: (
+            item["score"],
             1 if item["can_quote_now"] else 0,
             item["usable"],
-            item["score"],
         ),
         reverse=True,
     )
@@ -531,27 +596,76 @@ def extract_structured_rfq_items(body_text):
     return rfq_items
 
 
+def clear_product_cache():
+    _PRODUCT_CACHE.clear()
+
+
+def _obm_configured() -> bool:
+    return bool(OBM_API_URL and OBM_API_KEY and OBM_API_SECRET)
+
+
 def get_product(api_id):
+    cache_key = ("product", str(api_id or "").strip())
+    if cache_key in _PRODUCT_CACHE:
+        return _PRODUCT_CACHE[cache_key]
+
+    if not _obm_configured():
+        print(
+            "❌ [ENGINE] OBM API not configured "
+            f"(OBM_API_URL={'set' if OBM_API_URL else 'missing'}, "
+            f"key={'set' if OBM_API_KEY else 'missing'}). "
+            "Check .env in OpenClaw directory."
+        )
+        return {}
+
     try:
-        return requests.get(
+        response = requests.get(
             f"{OBM_API_URL}/GetProduct",
             auth=OBM_AUTH,
             params={"pid": api_id},
             verify=False,
-        ).json()
+            timeout=OBM_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            print(f"❌ [ENGINE] GetProduct returned non-JSON object for {api_id}")
+            data = {}
+        elif not _obm_error_ok(data):
+            print(
+                f"⚠️ [ENGINE] GetProduct error for {api_id}: "
+                f"{data.get('error')} {data.get('error_msg', '')}".strip()
+            )
+        _PRODUCT_CACHE[cache_key] = data
+        return data
     except Exception as e:
         print(f"❌ [ENGINE] GetProduct failed for {api_id}: {e}")
         return {}
 
 
 def get_purchase_price(api_id):
+    cache_key = ("price", str(api_id or "").strip())
+    if cache_key in _PRODUCT_CACHE:
+        return _PRODUCT_CACHE[cache_key]
+
+    if not _obm_configured():
+        return {}
+
     try:
-        return requests.get(
+        response = requests.get(
             f"{OBM_API_URL}/GetPurProductPrice",
             auth=OBM_AUTH,
             params={"pid": api_id},
             verify=False,
-        ).json()
+            timeout=OBM_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            print(f"❌ [ENGINE] GetPurProductPrice returned non-JSON object for {api_id}")
+            data = {}
+        _PRODUCT_CACHE[cache_key] = data
+        return data
     except Exception as e:
         print(f"❌ [ENGINE] GetPurProductPrice failed for {api_id}: {e}")
         return {}
@@ -576,16 +690,13 @@ def get_store_qty_from_product(obm):
     return 0.0
 
 
-def build_rows_from_api(api_id, qty, customer_part=None):
+def build_rows_from_api(api_id, qty, customer_part=None, warehouse_row=None):
     print(f"⚙️ [ENGINE] Checking OBM API for: {api_id}")
 
     obm = get_product(api_id)
     p_res = get_purchase_price(api_id)
 
-    # Some legacy OBM product IDs return stock/price metadata incompletely.
-    # Preserve the already-verified warehouse identity instead of degrading a
-    # correct match into an "UNKNOWN" description.
-    warehouse = EXACT_LOOKUP.get(normalize_part(api_id), {})
+    warehouse = warehouse_row or EXACT_LOOKUP.get(normalize_part(api_id), {})
 
     brand = str(obm.get("brand") or warehouse.get("brand") or "UNKNOWN").upper()
     pn = str(
@@ -600,32 +711,22 @@ def build_rows_from_api(api_id, qty, customer_part=None):
     if model and model.upper() not in pn.upper():
         full_desc += f" ({model})"
 
-    try:
-        cost = float(p_res.get("unit_price", {}).get("price") or 0)
-    except Exception:
-        cost = 0.0
+    cost = parse_purchase_cost(p_res)
 
-    product_lookup_invalid = str(obm.get("error") or "") == "101"
-    using_csv_stock_fallback = product_lookup_invalid and bool(warehouse)
+    store_qty, store_source = resolve_store_qty(obm, warehouse_row=warehouse)
+    using_csv_stock_fallback = store_source.startswith("warehouse_csv")
 
     try:
-        total_stock_qty = float(obm.get("stock_qty", 0) or 0)
-    except Exception:
+        total_stock_qty = float(obm.get("stock_qty", 0) or 0) if obm else float(warehouse.get("stock_qty") or 0)
+    except (TypeError, ValueError):
         total_stock_qty = 0.0
 
-    store_qty = get_store_qty_from_product(obm)
-    if using_csv_stock_fallback:
-        store_qty = float(warehouse.get("stock_qty") or 0)
-        total_stock_qty = store_qty
-        print(
-            "   ⚠️ OBM GetProduct rejected this legacy PID; "
-            f"using warehouse CSV quantity fallback: {store_qty}"
-        )
     usable_store_qty = int(store_qty) if store_qty > 0 else 0
     requested_qty = int(qty)
 
     print(f"   Brand: {brand}")
     print(f"   Product: {full_desc}")
+    print(f"   Store qty source: {store_source}")
     stock_label = "Warehouse CSV fallback" if using_csv_stock_fallback else "OBM"
     print(f"   Total Stock Qty from {stock_label}: {total_stock_qty}")
     print(f"   Usable Warehouse Qty Used by Bot: {usable_store_qty}")
@@ -732,6 +833,7 @@ def build_row_from_api(api_id, qty, customer_part=None):
 
 
 def process_structured_items(structured_items):
+    clear_product_cache()
     formatted_rows = []
     tbc_by_brand = {}
     skipped = []
@@ -749,7 +851,12 @@ def process_structured_items(structured_items):
         )
 
         if match:
-            rows, supplier_item = build_rows_from_api(match["api_id"], qty, customer_part=part_no)
+            rows, supplier_item = build_rows_from_api(
+                match["api_id"],
+                qty,
+                customer_part=part_no,
+                warehouse_row=match,
+            )
             formatted_rows.extend(rows)
 
             if supplier_item:
