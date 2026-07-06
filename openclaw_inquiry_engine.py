@@ -166,11 +166,59 @@ def stock_contains_part_family(stock_text, part_no):
     return False
 
 
+def warehouse_match_trusted(customer_part, match) -> bool:
+    """True when a warehouse row clearly corresponds to the customer part number."""
+    customer_norm = normalize_part(customer_part)
+    if not customer_norm or not match:
+        return False
+
+    stock_blob = normalize_part(
+        " ".join(
+            str(match.get(key) or "")
+            for key in ("stock_name", "model_no", "alt_model", "api_id")
+        )
+    )
+    if not stock_blob:
+        return False
+
+    if customer_norm in stock_blob or stock_blob in customer_norm:
+        return True
+
+    # Allow cable-length suffixes such as E2E-X5E1 -> E2E-X5E1 2M.
+    if stock_blob.startswith(customer_norm) and len(customer_norm) >= 5:
+        return True
+
+    return False
+
+
+def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source=""):
+    """Resolve warehouse stock for a part, with stricter rules for visual extraction."""
+    part_no = str(part_no or "").strip().upper()
+    source = str(source or "").upper()
+
+    exact = EXACT_LOOKUP.get(normalize_part(part_no))
+    if exact:
+        return exact
+
+    if source == "COPILOT_VISUAL":
+        partial = find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
+        if partial and warehouse_match_trusted(part_no, partial):
+            return partial
+        if partial:
+            print(
+                f"   ⚠️ [ENGINE] Rejected warehouse remap for visual part {part_no} "
+                f"→ {partial.get('stock_name') or partial.get('api_id')} (different product family)"
+            )
+        return None
+
+    return find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
+
+
 def infer_brand_from_part(part_no):
     part_norm = normalize_part(part_no)
 
     # Safe family inference for common automation brands.
-    if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y"):
+    if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("E2E") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y"):
         return "OMRON"
 
     return "UNKNOWN"
@@ -614,7 +662,12 @@ def process_structured_items(structured_items):
         qty = item["qty"]
         declared_brand = item.get("brand") or "UNKNOWN"
 
-        match = find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
+        match = resolve_warehouse_match(
+            part_no,
+            declared_brand=declared_brand,
+            qty=qty,
+            source=item.get("source") or "",
+        )
 
         if match:
             rows, supplier_item = build_rows_from_api(match["api_id"], qty, customer_part=part_no)
@@ -713,6 +766,10 @@ def build_plain_quotation_reply(rows):
 
     for row in rows:
         desc = row.get("desc", "")
+        customer_part = str(row.get("customer_part") or "").strip()
+        if customer_part and customer_part.upper() not in desc.upper():
+            desc = customer_part
+
         qty = int(row.get("qty", 1))
         price = row.get("price", "[TBC]")
         lt = row.get("lt", "[TBC]")
