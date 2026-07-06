@@ -14,7 +14,7 @@ _OPENCLAW_DIR = os.getenv("OPENCLAW_BASE_DIR", _ENGINE_DIR)
 load_dotenv(os.path.join(_OPENCLAW_DIR, ".env"))
 load_dotenv(os.path.join(_ENGINE_DIR, ".env"))
 
-VERSION = "v1.09-OBM-STORE-QTY-FALLBACK"
+VERSION = "v1.10-MARKUP-30-REPLY-ORDER"
 
 WAREHOUSE_CSV = os.path.join(_OPENCLAW_DIR, "Robomatics_Stock_List.csv")
 
@@ -23,6 +23,7 @@ OBM_API_KEY = os.getenv("OBM_API_KEY")
 OBM_API_SECRET = os.getenv("OBM_API_SECRET")
 OBM_AUTH = HTTPBasicAuth(OBM_API_KEY, OBM_API_SECRET)
 OBM_REQUEST_TIMEOUT = int(os.getenv("OBM_REQUEST_TIMEOUT", "20"))
+MARKUP_RATE = float(os.getenv("OPENCLAW_MARKUP_RATE", "0.30"))
 
 _PRODUCT_CACHE = {}
 
@@ -248,6 +249,12 @@ def extract_voltage_signature(text):
 
 
 def _obm_error_ok(obm) -> bool:
+    return str(obm.get("error", "")).strip() in ("0", "")
+
+
+def sell_price_from_cost(cost: float) -> float:
+    """Apply markup on purchase cost (default 30%)."""
+    return float(cost) * (1.0 + MARKUP_RATE)
     return str(obm.get("error", "")).strip() in ("0", "")
 
 
@@ -739,7 +746,7 @@ def build_rows_from_api(api_id, qty, customer_part=None, warehouse_row=None):
     if usable_store_qty > 0:
         quoted_qty = min(requested_qty, usable_store_qty)
         balance_qty = max(requested_qty - quoted_qty, 0)
-        sell_price = (cost / 0.8) if cost > 0 else None
+        sell_price = sell_price_from_cost(cost) if cost > 0 else None
 
         stock_source = (
             "WAREHOUSE_CSV_STOCK_FALLBACK"
@@ -946,12 +953,6 @@ def process_inquiry_text(inquiry_text):
 
 def build_plain_quotation_reply(rows, ai_research=None):
     msg = "Hi, thank you for your inquiry.\n\n"
-
-    if ai_research:
-        msg += "Product information:\n"
-        msg += str(ai_research).strip()
-        msg += "\n\n"
-
     msg += "Here is the initial status:\n\n"
 
     total = 0.0
@@ -998,4 +999,9 @@ def build_plain_quotation_reply(rows, ai_research=None):
         )
 
     msg += "Items marked [TBC] will be verified and updated shortly."
+
+    if ai_research:
+        msg += "\n\nProduct information:\n"
+        msg += str(ai_research).strip()
+
     return msg

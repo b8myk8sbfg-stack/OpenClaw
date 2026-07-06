@@ -20,6 +20,7 @@ from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
     process_inquiry_text,
     process_structured_items,
+    sell_price_from_cost,
 )
 from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
@@ -40,7 +41,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.37-VOICE-DOWNLOAD-FIX"
+VERSION = "v3.38-MARKUP-30-REPLY-ORDER-VOICE"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -61,7 +62,7 @@ CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.tx
 MAX_UNREAD_CHATS_PER_RUN = 1
 CHECK_INTERVAL_SECONDS = int(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "45"))
 INCOMING_LOOKBACK = 6
-MARKUP_DIVISOR = 0.8
+MARKUP_RATE = float(os.getenv("OPENCLAW_MARKUP_RATE", "0.30"))
 MONITOR_WHATSAPP_PHONE = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONE", "+60167222208")
 
 WHATSAPP_SESSION_READY = False
@@ -3547,9 +3548,10 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
         "Original Message:",
         original_message or "(empty)",
         "",
-        "Generated Reply:",
-        reply_message or "(empty)",
     ])
+
+    if reply_message:
+        lines.append(reply_message.strip())
 
     return "\n".join(lines)
 
@@ -3698,7 +3700,7 @@ def parse_supplier_reply_items(section):
         if supplier_cost is None:
             continue
 
-        customer_unit_price = supplier_cost / MARKUP_DIVISOR
+        customer_unit_price = sell_price_from_cost(supplier_cost)
         customer_subtotal = customer_unit_price * qty
 
         items.append({
@@ -4169,9 +4171,31 @@ def _process_open_chat_body(driver, raw_contact_name):
 
         if media_info.media_type == "voice" and not voice_ok and not enrichment.get("transcript"):
             print(
-                "⚠️ Voice download/transcribe failed — skipping customer reply; "
+                "⚠️ Voice download/transcribe failed — sending fallback reply; "
                 "message stays unread for retry."
             )
+            classification = classify_whatsapp_message("(voice inquiry)", media_info=media_info)
+            classification.media_type = "voice"
+            classification.intent = "rfq_inquiry"
+            classification.handler = "rfq_inquiry"
+            classification.reasoning = "Voice note received but transcription failed."
+            log_classification(contact_name, customer_contact, "", classification, status="VOICE_TRANSCRIBE_FAILED")
+            fallback_reply = (
+                "Hi, we received your voice message but could not transcribe it.\n\n"
+                "Please resend the voice note, or type the part numbers:\n"
+                "E2E-X5E1 Qty:2"
+            )
+            send_customer_reply(
+                driver,
+                fallback_reply,
+                customer_name=contact_name,
+                customer_contact=customer_contact,
+                original_message=latest_message or "(voice note)",
+                context="VOICE_TRANSCRIBE_FAILED",
+                customer_chat_is_open=True,
+                classification_summary=classification.summary(),
+            )
+            append_log(contact_name, latest_message or "(voice)", [], [], "VOICE_TRANSCRIBE_FAILED")
             return
 
         print("")
