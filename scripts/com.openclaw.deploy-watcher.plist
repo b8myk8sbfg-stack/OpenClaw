@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.deploy-watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/evon/OpenClaw/scripts/deploy_watcher.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>WorkingDirectory</key>
+    <string>/Users/evon/OpenClaw</string>
+    <key>StandardOutPath</key>
+    <string>/Users/evon/OpenClaw/logs/deploy_watcher_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evon/OpenClaw/logs/deploy_watcher_stderr.log</string>
+</dict>
+</plist>
