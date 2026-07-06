@@ -53,7 +53,7 @@ def parse_float(value, default=0.0):
 def load_warehouse_map():
     global WAREHOUSE_ROWS, EXACT_LOOKUP, WAREHOUSE_BRANDS
 
-    print("📦 [ENGINE] Loading Warehouse Database...")
+    print("📦 [ENGINE] Loading Warehouse Database (part number → OBM PID lookup)...")
 
     rows = []
     exact_lookup = {}
@@ -320,7 +320,10 @@ def parse_qty_from_caption(text: str, default: int = 1) -> int:
 
 
 def build_warehouse_support_context(message_text: str, part_refs=None, max_lines: int = 4) -> tuple:
-    """Build warehouse stock context for technical support, prioritising in-stock SKUs."""
+    """Build warehouse stock context for technical support, prioritising in-stock SKUs.
+
+    Ex-Stock labels are based on live OBM API STORE quantity, not CSV stock_qty.
+    """
     parts = part_refs or extract_part_references_from_text(message_text)
     text_u = str(message_text or "").upper()
     search_terms = list(parts)
@@ -346,10 +349,10 @@ def build_warehouse_support_context(message_text: str, part_refs=None, max_lines
             if not key or key in seen_keys:
                 continue
             seen_keys.add(key)
-            qty = int(float(row.get("stock_qty") or 0))
             stock_label = str(row.get("stock_name") or key).strip()
             brand_label = str(row.get("brand") or brand or "").strip()
-            if qty > 0:
+            store_qty = get_usable_store_qty(row.get("api_id"), row)
+            if store_qty > 0:
                 lines.append(f"- {brand_label} {stock_label} — Ex-Stock")
             else:
                 lines.append(f"- {brand_label} {stock_label} — available to source")
@@ -378,16 +381,24 @@ def extract_voltage_signature(text):
 
 
 def get_usable_store_qty(api_id, warehouse_row=None):
-    """Return STORE-location quantity from OBM, with CSV fallback for legacy PIDs."""
+    """Return live STORE quantity from OBM API only.
+
+    The warehouse CSV is a part-number → product ID (PID) lookup catalog.
+    It must not be used as a source of stock quantity for customer replies.
+    """
+    api_id = str(api_id or "").strip()
+    if not api_id:
+        return 0.0
+
     obm = get_product(api_id)
+    if str(obm.get("error") or "") == "101":
+        print(f"   ⚠️ OBM API rejected PID {api_id!r} — no Ex-Stock (CSV is lookup-only)")
+        return 0.0
+
     store_qty = get_store_qty_from_product(obm)
     if store_qty > 0:
-        return store_qty
-
-    if str(obm.get("error") or "") == "101" and warehouse_row:
-        return float(warehouse_row.get("stock_qty") or 0)
-
-    return 0.0
+        print(f"   📦 OBM STORE qty for {api_id!r}: {store_qty}")
+    return store_qty
 
 
 def _default_cable_variant_bonus(part_no, stock_name):
@@ -529,9 +540,10 @@ def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
 
     best = _pick_best_warehouse_candidate(candidates, part_no, qty)
     if best:
+        obm_store = get_usable_store_qty(best.get("api_id"), best)
         print(
             f"   ✅ [ENGINE] Partial stock-family match: {part_no} → {best['api_id']} | "
-            f"{best['stock_name']} | CSV Qty: {best.get('stock_qty')} | Score: {best.get('score')}"
+            f"{best['stock_name']} | OBM STORE qty: {obm_store} | Score: {best.get('score')}"
         )
     else:
         print(f"   ⚠️ [ENGINE] No warehouse match: {part_no}")
@@ -743,29 +755,22 @@ def build_rows_from_api(api_id, qty, customer_part=None):
         cost = 0.0
 
     product_lookup_invalid = str(obm.get("error") or "") == "101"
-    using_csv_stock_fallback = product_lookup_invalid and bool(warehouse)
+    if product_lookup_invalid:
+        print(f"   ⚠️ OBM GetProduct error 101 for {api_id!r} — cannot confirm Ex-Stock from API")
+
+    store_qty = get_store_qty_from_product(obm) if not product_lookup_invalid else 0.0
+    usable_store_qty = int(store_qty) if store_qty > 0 else 0
+    requested_qty = int(qty)
 
     try:
         total_stock_qty = float(obm.get("stock_qty", 0) or 0)
     except Exception:
         total_stock_qty = 0.0
 
-    store_qty = get_store_qty_from_product(obm)
-    if using_csv_stock_fallback:
-        store_qty = float(warehouse.get("stock_qty") or 0)
-        total_stock_qty = store_qty
-        print(
-            "   ⚠️ OBM GetProduct rejected this legacy PID; "
-            f"using warehouse CSV quantity fallback: {store_qty}"
-        )
-    usable_store_qty = int(store_qty) if store_qty > 0 else 0
-    requested_qty = int(qty)
-
     print(f"   Brand: {brand}")
     print(f"   Product: {full_desc}")
-    stock_label = "Warehouse CSV fallback" if using_csv_stock_fallback else "OBM"
-    print(f"   Total Stock Qty from {stock_label}: {total_stock_qty}")
-    print(f"   Usable Warehouse Qty Used by Bot: {usable_store_qty}")
+    print(f"   OBM total stock_qty field: {total_stock_qty}")
+    print(f"   OBM STORE qty used for Ex-Stock: {usable_store_qty}")
     print(f"   Cost: RM {cost}")
     print(f"   Customer Qty: {requested_qty}")
 
@@ -777,16 +782,8 @@ def build_rows_from_api(api_id, qty, customer_part=None):
         balance_qty = max(requested_qty - quoted_qty, 0)
         sell_price = (cost / 0.8) if cost > 0 else None
 
-        stock_source = (
-            "WAREHOUSE_CSV_STOCK_FALLBACK"
-            if using_csv_stock_fallback
-            else "STORE_STOCK_AVAILABLE"
-        )
-        stock_lead_time = (
-            "Ex-Stock (Warehouse CSV)"
-            if using_csv_stock_fallback
-            else "Ex-Stock (STORE)"
-        )
+        stock_source = "STORE_STOCK_AVAILABLE"
+        stock_lead_time = "Ex-Stock"
 
         rows.append({
             "desc": full_desc,

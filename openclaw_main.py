@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.09-QUOTE-FORMAT-PRIVACY"
+VERSION = "v1.10-OBM-API-EX-STOCK"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
