@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.02-VISUAL-H3JA-EXTRACTION"
+VERSION = "v1.03-COPILOT-TECH-SUPPORT"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -297,6 +297,91 @@ def build_ai_research_summary(formatted_rows):
         if notes:
             sections.append(f"{part_no}\n{notes}")
     return "\n\n".join(sections)
+
+
+def build_technical_support_reply(message_text: str = "", image_path: str = None) -> str:
+    """Use Copilot + warehouse stock to answer technical support / equivalent-part questions."""
+    if os.getenv("OPENCLAW_COPILOT_TECH_SUPPORT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return ""
+
+    from openclaw_inquiry_engine import build_warehouse_support_context
+
+    message_text = str(message_text or "").strip()
+    if not message_text and not image_path:
+        return ""
+
+    part_refs, warehouse_context = build_warehouse_support_context(message_text)
+    parts_label = ", ".join(part_refs) if part_refs else "(not detected — read from message/photo)"
+
+    print(f"[COPILOT TECH SUPPORT] Parts detected: {parts_label}")
+    if warehouse_context:
+        print("[COPILOT TECH SUPPORT] Warehouse matches found — prioritising in-stock SKUs")
+
+    client = OpenAI(
+        base_url=COPILOT_BASE_URL,
+        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
+        timeout=75.0 if image_path else 60.0,
+        max_retries=1,
+    )
+
+    system_prompt = (
+        "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
+        "Answer customer technical support questions clearly and practically on WhatsApp. "
+        "When the customer asks for an equivalent, replacement, or successor part, recommend the "
+        "best modern replacement and explain briefly why. "
+        "ALWAYS prioritise recommending parts listed in the warehouse stock section below. "
+        "If we have Ex-Stock quantity, say so. Do not recommend external distributors if we stock a suitable item. "
+        "If exact drop-in replacement is unclear, ask 1-2 short clarifying questions such as: "
+        "time range on the dial (5s, 10s, 30s, 3min, etc.) and timing mode (ON-delay, OFF-delay, interval). "
+        "Plain text only. No markdown code fences. Friendly professional tone. Under 280 words."
+    )
+
+    user_prompt = (
+        f"Customer message:\n{message_text or '(see attached photo)'}\n\n"
+        f"Detected part reference(s): {parts_label}\n\n"
+        "Our warehouse stock to PRIORITISE (check these first):\n"
+        f"{warehouse_context or '(no matching warehouse stock found — give best technical guidance anyway)'}\n\n"
+        "Write the WhatsApp reply to the customer now."
+    )
+
+    user_content = user_prompt
+    if image_path and os.path.exists(image_path):
+        print(f"[COPILOT TECH SUPPORT] Including photo: {image_path}")
+        with open(image_path, "rb") as image_file:
+            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{image_b64}",
+                    "detail": "high",
+                },
+            },
+        ]
+
+    try:
+        response = client.chat.completions.create(
+            model=COPILOT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip()
+        if not text:
+            return ""
+        if not text.lower().startswith("hi"):
+            text = f"Hi, thank you for reaching out.\n\n{text}"
+        print(f"[COPILOT TECH SUPPORT] Generated {len(text)} char reply")
+        return text
+    except Exception as exc:
+        print(f"[WARN] Copilot technical support failed: {exc}")
+        return ""
 
 
 def run_process(name, script):

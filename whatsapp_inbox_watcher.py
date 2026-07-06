@@ -24,7 +24,11 @@ from openclaw_inquiry_engine import (
 from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
-from openclaw_main import extract_rfq_with_copilot, build_ai_research_summary
+from openclaw_main import (
+    extract_rfq_with_copilot,
+    build_ai_research_summary,
+    build_technical_support_reply,
+)
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     build_classification_monitor_message,
@@ -40,7 +44,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.40-FIX-VISUAL-H3JA-EXTRACTION"
+VERSION = "v3.41-COPILOT-TECH-SUPPORT"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -4073,10 +4077,12 @@ def process_classified_non_inquiry(
     customer_contact=None,
     image_analysis=None,
     document_items=None,
+    image_path=None,
 ):
     """Handle non-RFQ intents with appropriate acknowledgement while learning in background."""
     customer_contact = customer_contact or contact_name
     handler = classification.handler
+    image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
     reply = classification.suggested_reply or (
         "Hi, thank you for your message.\n\nOur team will review and respond shortly."
     )
@@ -4114,6 +4120,15 @@ def process_classified_non_inquiry(
             document_items=document_items,
         )
         return
+
+    if handler == "technical_support":
+        copilot_reply = build_technical_support_reply(latest_message, image_path=image_path)
+        if copilot_reply:
+            reply = copilot_reply
+            context = "TECHNICAL_SUPPORT_COPILOT"
+            print("🧠 Copilot technical support reply generated.")
+        else:
+            print("⚠️ Copilot technical support unavailable — using default acknowledgement.")
 
     sent = send_customer_reply(
         driver,

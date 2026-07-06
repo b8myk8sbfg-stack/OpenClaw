@@ -458,6 +458,7 @@ def _heuristic_intent(message_text: str, media_info: MediaInfo) -> Optional[Clas
         "NOT WORKING", "FAULTY", "DEFECT", "BROKEN", "TROUBLESHOOT",
         "TECHNICAL SUPPORT", "WARRANTY", "REPAIR", "ERROR CODE", "HOW TO",
         "MANUAL", "WIRING", "CONNECTION", "SPEC", "DATASHEET",
+        "EQUIVALENT", "REPLACEMENT", "SUBSTITUTE", "ALTERNATIVE", "SUCCESSOR",
     ]
     if any(marker in text for marker in support_markers):
         return ClassificationResult(

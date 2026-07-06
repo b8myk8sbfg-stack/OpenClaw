@@ -218,10 +218,123 @@ def infer_brand_from_part(part_no):
     part_norm = normalize_part(part_no)
 
     # Safe family inference for common automation brands.
-    if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("E2E") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y"):
+    if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("E2E") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y") or part_norm.startswith("H3J") or part_norm.startswith("H3CR") or part_norm.startswith("E5CC") or part_norm.startswith("E5CN"):
         return "OMRON"
 
     return "UNKNOWN"
+
+
+PART_REF_PATTERN = re.compile(
+    r"\b("
+    r"[A-Z]{1,4}\d?[A-Z]{0,3}-[A-Z0-9][A-Z0-9\-]*"
+    r"(?:\s+(?:AC|DC)[\d\-/A-Z]+)?"
+    r"|[A-Z]{2,6}\d{3,}[A-Z0-9#\-/]*"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SUCCESSOR_FAMILY_SEARCH = {
+    "H3JA": ("H3CR-A8", "H3CR", "H3Y"),
+    "H3J": ("H3CR-A8", "H3CR", "H3Y"),
+    "H3A": ("H3CR-A8", "H3CR"),
+}
+
+
+def extract_part_references_from_text(message_text: str) -> list:
+    """Pull likely catalogue part numbers from free-text customer messages."""
+    text = str(message_text or "").upper()
+    refs = []
+    seen = set()
+    for match in PART_REF_PATTERN.finditer(text):
+        ref = re.sub(r"\s+", " ", match.group(1)).strip().upper()
+        key = normalize_part(ref)
+        if len(key) < 4 or key in seen:
+            continue
+        seen.add(key)
+        refs.append(ref)
+    return refs
+
+
+def search_warehouse_stock_rows(part_no, brand="UNKNOWN", limit=8):
+    """Return warehouse rows whose stock name/model matches the part family."""
+    part_no = str(part_no or "").upper().strip()
+    part_norm = normalize_part(part_no)
+    if not part_norm:
+        return []
+
+    family_match = re.match(r"^([A-Z]+\d?[A-Z]*)", part_norm)
+    family = family_match.group(1) if family_match else part_norm[:4]
+    brand_u = str(brand or "UNKNOWN").upper().replace("BÜRKERT", "BURKERT")
+
+    hits = []
+    for row in WAREHOUSE_ROWS:
+        row_brand = str(row.get("brand") or "").upper().replace("BÜRKERT", "BURKERT")
+        stock_text = (
+            f"{row.get('stock_name') or ''} {row.get('model_no') or ''} "
+            f"{row.get('alt_model') or ''} {row.get('api_id') or ''}"
+        ).upper()
+        stock_norm = normalize_part(stock_text)
+
+        if brand_u != "UNKNOWN" and row_brand and brand_u not in row_brand:
+            continue
+
+        matched = (
+            part_norm in stock_norm
+            or stock_norm.startswith(part_norm)
+            or part_norm.startswith(stock_norm[: max(len(part_norm), 5)])
+            or (len(family) >= 3 and family in stock_norm)
+        )
+        if not matched:
+            continue
+
+        score = 0
+        if part_norm in stock_norm:
+            score += 2000
+        if family and family in stock_norm:
+            score += 500
+        score += float(row.get("stock_qty") or 0)
+        hits.append({**row, "_score": score})
+
+    hits.sort(key=lambda item: item["_score"], reverse=True)
+    return hits[:limit]
+
+
+def build_warehouse_support_context(message_text: str, part_refs=None) -> tuple:
+    """Build warehouse stock context for technical support, prioritising in-stock SKUs."""
+    parts = part_refs or extract_part_references_from_text(message_text)
+    text_u = str(message_text or "").upper()
+    search_terms = list(parts)
+
+    if any(
+        word in text_u
+        for word in ("EQUIVALENT", "REPLACEMENT", "SUBSTITUTE", "ALTERNATIVE", "SUCCESSOR", "REPLACE")
+    ):
+        for part in parts:
+            part_norm = normalize_part(part)
+            for prefix, successors in SUCCESSOR_FAMILY_SEARCH.items():
+                if part_norm.startswith(prefix):
+                    for successor in successors:
+                        if successor not in search_terms:
+                            search_terms.append(successor)
+
+    seen_keys = set()
+    lines = []
+    for term in search_terms:
+        brand = infer_brand_from_part(term)
+        for row in search_warehouse_stock_rows(term, brand=brand, limit=6):
+            key = str(row.get("api_id") or row.get("stock_name") or "").strip()
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            qty = int(float(row.get("stock_qty") or 0))
+            stock_label = str(row.get("stock_name") or key).strip()
+            brand_label = str(row.get("brand") or brand or "").strip()
+            if qty > 0:
+                lines.append(f"- {brand_label} {stock_label} — Ex-Stock (warehouse qty {qty})")
+            else:
+                lines.append(f"- {brand_label} {stock_label} — available to source (warehouse qty 0)")
+
+    return parts, "\n".join(lines)
 
 
 def extract_voltage_signature(text):
