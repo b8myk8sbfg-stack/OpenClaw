@@ -1049,6 +1049,34 @@ function cleanPhone(raw) {
     return digits;
 }
 
+function looksLikePhoneLine(line) {
+    const t = String(line || '').trim();
+    if (!t) return false;
+    if (!/^[+\\d\\s\\-()]+$/.test(t)) return false;
+    const digits = t.replace(/\\D/g, '');
+    return digits.length >= 8 && digits.length <= 15;
+}
+
+function isAddressOrBusinessLine(line) {
+    const t = String(line || '').trim();
+    if (!t) return true;
+    if (/^(contact info|close|edit)$/i.test(t)) return true;
+    if (/^(open now|closed|business account|whatsapp business)$/i.test(t)) return true;
+    if (/^(search|add notes|media|links|starred|mute|encryption|groups in common|about and phone number)$/i.test(t)) return true;
+    if (/^https?:\\/\\//i.test(t)) return true;
+    if (/@/.test(t)) return true;
+    if (/\\b(jalan|malaysia|singapore|kawasan|perindustrian|tampoi|johore|johor|street|road|avenue|blvd|postcode|address)\\b/i.test(t)) return true;
+    if (/\\b\\d{1,4}\\s*,\\s*[A-Za-z]/.test(t)) return true;
+    if (/\\b\\d{1,2}:\\d{2}\\s*(am|pm)?\\b/i.test(t) && /\\d{1,2}:\\d{2}/.test(t)) return true;
+    if (/[A-Za-z]{3,}/.test(t) && !/^\\+/.test(t)) return true;
+    return false;
+}
+
+function phoneFromLine(line) {
+    if (!looksLikePhoneLine(line)) return '';
+    return cleanPhone(line);
+}
+
 function findContactPanel() {
     const selectors = [
         '[data-testid="drawer-right"]',
@@ -1060,13 +1088,43 @@ function findContactPanel() {
         const nodes = document.querySelectorAll(sel);
         for (const node of nodes) {
             const text = node.innerText || '';
-            if (/contact info|about and phone number/i.test(text)) return node;
+            if (/contact info/i.test(text)) return node;
         }
     }
-    if (/about and phone number/i.test(document.body.innerText || '')) {
-        return document.querySelector('[data-testid="drawer-right"]') || document.body;
+    return document.querySelector('[data-testid="drawer-right"]') || null;
+}
+
+function scrapeBusinessPhone(lines) {
+    for (let i = 0; i < lines.length; i++) {
+        if (!/about and phone number/i.test(lines[i])) continue;
+        for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+            if (/^(last seen|about|media|links|starred|mute|encryption|groups in common|search|add notes)/i.test(lines[j])) break;
+            const p = phoneFromLine(lines[j]);
+            if (p) return p;
+        }
     }
-    return null;
+    return '';
+}
+
+function scrapeStandardPhoneUnderName(lines) {
+    let seenName = false;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^contact info$/i.test(line)) continue;
+        if (/^(search|add notes|media|links|starred|mute|encryption|groups in common)$/i.test(line)) break;
+        if (/about and phone number/i.test(line)) break;
+        if (isAddressOrBusinessLine(line)) {
+            if (seenName) break;
+            continue;
+        }
+        if (!seenName) {
+            seenName = true;
+            continue;
+        }
+        const p = phoneFromLine(line);
+        if (p) return p;
+    }
+    return '';
 }
 
 const panel = findContactPanel();
@@ -1076,8 +1134,6 @@ for (const sel of [
     '[data-testid="phone-number"]',
     '[data-testid="contact-phone-number"]',
     'a[href^="tel:"]',
-    'span[dir="ltr"]',
-    'span.selectable-text',
 ]) {
     for (const node of panel.querySelectorAll(sel)) {
         const raw = node.getAttribute('href') || node.innerText || node.textContent || '';
@@ -1086,30 +1142,14 @@ for (const sel of [
     }
 }
 
-const bodyText = panel.innerText || '';
-const regexMatch = bodyText.match(/\\+?60[\\s\\-]?1\\d[\\d\\s\\-]{7,14}/);
-if (regexMatch) {
-    const p = cleanPhone(regexMatch[0]);
-    if (p) return p;
-}
+const lines = (panel.innerText || '').split('\\n').map(function(s) { return s.trim(); }).filter(Boolean);
 
-const lines = bodyText.split('\\n').map(function(s) { return s.trim(); }).filter(Boolean);
-for (let i = 0; i < lines.length; i++) {
-    if (/about and phone number/i.test(lines[i])) {
-        for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
-            if (/^(last seen|about|media|starred|mute|encryption|groups in common)/i.test(lines[j])) break;
-            const p = cleanPhone(lines[j]);
-            if (p) return p;
-        }
-    }
-}
+const businessPhone = scrapeBusinessPhone(lines);
+if (businessPhone) return businessPhone;
 
-for (const line of lines) {
-    if (/^\\+[\\d\\s\\-()]{8,}$/.test(line) || /^60[\\d\\s\\-]{8,}$/.test(line)) {
-        const p = cleanPhone(line);
-        if (p) return p;
-    }
-}
+const standardPhone = scrapeStandardPhoneUnderName(lines);
+if (standardPhone) return standardPhone;
+
 return '';
 """
 
@@ -1124,11 +1164,55 @@ function cleanPhone(raw) {
     return digits;
 }
 
-function phoneFromText(text) {
-    const t = String(text || '').trim();
-    if (!t) return '';
-    if (!/^[+\\d\\s\\-()]+$/.test(t)) return '';
-    return cleanPhone(t);
+function looksLikePhoneLine(line) {
+    const t = String(line || '').trim();
+    if (!t) return false;
+    if (!/^[+\\d\\s\\-()]+$/.test(t)) return false;
+    const digits = t.replace(/\\D/g, '');
+    return digits.length >= 8 && digits.length <= 15;
+}
+
+function phoneFromLine(line) {
+    if (!looksLikePhoneLine(line)) return '';
+    return cleanPhone(line);
+}
+
+function scrapeBusinessPhone(lines) {
+    for (let i = 0; i < lines.length; i++) {
+        if (!/about and phone number/i.test(lines[i])) continue;
+        for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+            if (/^(last seen|about|media|links|starred|mute|encryption|groups in common|search|add notes)/i.test(lines[j])) break;
+            const p = phoneFromLine(lines[j]);
+            if (p) return p;
+        }
+    }
+    return '';
+}
+
+function scrapeStandardPhoneUnderName(lines) {
+    let seenName = false;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^contact info$/i.test(line)) continue;
+        if (/^(search|add notes|media|links|starred|mute|encryption|groups in common)$/i.test(line)) break;
+        if (/about and phone number/i.test(line)) break;
+        if (/\\b(jalan|malaysia|singapore|kawasan|perindustrian|https?:|\\@)/i.test(line)) {
+            if (seenName) break;
+            continue;
+        }
+        if (/[A-Za-z]{3,}/.test(line) && !/^\\+/.test(line)) {
+            if (seenName) break;
+            seenName = true;
+            continue;
+        }
+        if (!seenName) {
+            seenName = true;
+            continue;
+        }
+        const p = phoneFromLine(line);
+        if (p) return p;
+    }
+    return '';
 }
 
 // Contact info drawer if already open
@@ -1140,26 +1224,22 @@ for (const sel of [
     const drawer = document.querySelector(sel);
     if (!drawer) continue;
     const lines = (drawer.innerText || '').split('\\n').map(function(s) { return s.trim(); }).filter(Boolean);
-    for (let i = 0; i < lines.length; i++) {
-        if (/about and phone number/i.test(lines[i])) {
-            for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
-                const p = phoneFromText(lines[j]);
-                if (p) return p;
-            }
-        }
-    }
+    const businessPhone = scrapeBusinessPhone(lines);
+    if (businessPhone) return businessPhone;
+    const standardPhone = scrapeStandardPhoneUnderName(lines);
+    if (standardPhone) return standardPhone;
 }
 
-// Conversation header subtitle
+// Conversation header subtitle (standard WhatsApp often shows phone here)
 const header = document.querySelector('#main header');
 if (header) {
     for (const node of header.querySelectorAll('[title]')) {
-        const p = phoneFromText(node.getAttribute('title'));
+        const p = phoneFromLine(node.getAttribute('title') || '');
         if (p) return p;
     }
     const lines = (header.innerText || '').split('\\n').map(function(s) { return s.trim(); }).filter(Boolean);
     for (let i = 1; i < lines.length; i++) {
-        const p = phoneFromText(lines[i]);
+        const p = phoneFromLine(lines[i]);
         if (p) return p;
     }
 }
@@ -1171,8 +1251,20 @@ return '';
 def contact_info_drawer_is_open(driver):
     try:
         return bool(driver.execute_script(
-            "return /Contact info/i.test(document.body.innerText || '') "
-            "&& /About and phone number/i.test(document.body.innerText || '');"
+            "const t = document.body.innerText || '';"
+            "if (!/Contact info/i.test(t)) return false;"
+            "if (/About and phone number/i.test(t)) return true;"
+            "const drawer = document.querySelector('[data-testid=\"drawer-right\"]');"
+            "if (!drawer) return false;"
+            "const lines = (drawer.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);"
+            "let seenName = false;"
+            "for (const line of lines) {"
+            "  if (/^(search|add notes|groups in common)$/i.test(line)) break;"
+            "  if (/\\b(jalan|malaysia|https?:|@)/i.test(line)) { if (seenName) break; continue; }"
+            "  if (/^[+\\d\\s\\-()]+$/.test(line) && line.replace(/\\D/g,'').length >= 8) return true;"
+            "  if (!/^contact info$/i.test(line) && line.length > 1) seenName = true;"
+            "}"
+            "return false;"
         ))
     except Exception:
         return False
