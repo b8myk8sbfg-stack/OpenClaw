@@ -40,7 +40,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.39-FIX-READ-REPLY-LOOP"
+VERSION = "v3.40-FIX-VISUAL-H3JA-EXTRACTION"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3078,11 +3078,16 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 continue
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
-            if not copilot_items and not document_items:
+            if not copilot_items and not document_items and not is_quote_without_part_number(unit_text):
                 items = extract_rfq_with_copilot(unit_text, image_path=None)
                 if items:
                     copilot_items = items
                     print(f"   📝 Text step: Copilot extracted {len(items)} item(s)")
+            elif is_quote_without_part_number(unit_text) and not image_path:
+                print(
+                    "   📝 Text step: quote caption without part number — "
+                    "waiting for paired image step (no text-only guess)."
+                )
             else:
                 print("   📝 Text step: caption/qty merged with prior image/document extraction.")
 
@@ -3852,11 +3857,17 @@ def process_customer_inquiry(
     document_items = document_items or []
     image_path = image_analysis.get("image_path") if image_analysis else None
 
-    if pre_extracted_copilot_items:
+    if image_path:
+        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
+        print(
+            f"🤖 Visual extraction from captured photo ({os.path.basename(image_path)}): "
+            f"{len(copilot_items)} item(s)"
+        )
+    elif pre_extracted_copilot_items:
         copilot_items = pre_extracted_copilot_items
         print(f"🤖 Using {len(copilot_items)} item(s) from sequential extraction.")
     else:
-        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
+        copilot_items = extract_rfq_with_copilot(latest_message, image_path=None)
 
     if copilot_items:
         print(f"🤖 Copilot is primary: processing {len(copilot_items)} visually extracted item(s).")
