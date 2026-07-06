@@ -3879,24 +3879,25 @@ def process_supplier_reply(driver, contact_name, latest_message):
 def process_customer_inquiry(
     driver, contact_name, latest_message, image_analysis=None, customer_contact=None,
     classification=None, document_items=None, pre_extracted_copilot_items=None,
-    voice_enrichment=None,
+    voice_enrichment=None, image_path=None,
 ):
     customer_contact = customer_contact or contact_name
     classification_summary = classification.summary() if classification else None
     document_items = document_items or []
-    image_path = image_analysis.get("image_path") if image_analysis else None
+    image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
 
-    if image_path:
-        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
-        print(
-            f"🤖 Visual extraction from captured photo ({os.path.basename(image_path)}): "
-            f"{len(copilot_items)} item(s)"
-        )
-    elif pre_extracted_copilot_items:
+    if pre_extracted_copilot_items:
         copilot_items = pre_extracted_copilot_items
-        print(f"🤖 Using {len(copilot_items)} item(s) from sequential extraction.")
-    else:
+        print(f"🤖 Using {len(copilot_items)} item(s) from sequential visual extraction.")
+    elif image_path:
+        print(f"🤖 Image-first Copilot extraction: {os.path.basename(image_path)}")
+        copilot_items = _resolve_visual_items(latest_message, image_path=image_path)
+        print(f"🤖 Visual extraction result: {len(copilot_items)} item(s)")
+    elif not is_quote_without_part_number(latest_message):
         copilot_items = extract_rfq_with_copilot(latest_message, image_path=None)
+    else:
+        print("⚠️ Quote caption without part number and no image — skipping text-only guess.")
+        copilot_items = []
 
     if copilot_items:
         print(f"🤖 Copilot is primary: processing {len(copilot_items)} visually extracted item(s).")
@@ -4407,6 +4408,7 @@ def _process_open_chat_body(driver, raw_contact_name):
                 document_items=document_items,
                 pre_extracted_copilot_items=copilot_items or None,
                 voice_enrichment=enrichment,
+                image_path=image_path,
             )
             return
 

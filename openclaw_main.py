@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.06-EQUIVALENT-ROUTING"
+VERSION = "v1.07-IMAGE-FIRST-COPILOT"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -48,6 +48,14 @@ def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool
 
     if not part_u:
         return False
+
+    if (
+        "BATTERY" in type_u
+        or "LITHIUM" in type_u
+        or part_key.startswith("ER")
+        or part_key.startswith("CR")
+    ):
+        return True
 
     if type_u:
         if "PROXIMITY" in type_u and not part_key.startswith("E2E"):
@@ -134,13 +142,13 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
         "Read printed model/order codes exactly as shown on the label/nameplate in THIS photo only. "
         "Read character-by-character; do not substitute a different catalog number. "
-        "OMRON product families on labels: "
-        "E2E- = proximity sensor (example E2E-X5E1); "
-        "H3JA-/H3Y- = timer relay (example H3JA-8A); "
-        "E5CC-/E5CN- = temperature controller; "
-        "MY2/MY4 = relay. "
-        "If the label says TIMER or shows H3JA-, never return E2E/E5CC. "
-        "If the label says PROXIMITY SENSOR or shows E2E-, never return H3JA/E5CC. "
+        "Never default to OMRON E2E-X5E1 — only return E2E if those exact characters are printed on the label. "
+        "Product families (read what is actually printed): "
+        "E2E- = OMRON proximity sensor; H3JA-/H3Y- = OMRON timer; E5CC-/E5CN- = temperature controller; "
+        "MY2/MY4 = relay; ER-/CR- = lithium battery (e.g. TOSHIBA ER6C 3.6V). "
+        "If the label says TIMER or H3JA-, never return E2E. "
+        "If the label says LITHIUM/BATTERY or shows ER6C/ER17500, never return E2E/H3JA. "
+        "If the label says PROXIMITY SENSOR or E2E-, never return H3JA/battery models. "
         "Include supply voltage on the part_no when printed (example H3JA-8A AC200-240). "
         "Match the brand field to the visible manufacturer logo (OMRON, SMC, etc.). "
         "Never reuse a part number from chat history or from a different message. "
@@ -155,7 +163,8 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "Quantity must be a positive integer. Do not guess missing part numbers. "
         "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
         "Do not include markdown, backticks, or conversational text. "
-        'Example: [{"part_no": "H3JA-8A AC200-240", "qty": 1, "brand": "OMRON", "product_type": "TIMER"}]'
+        'Example: [{"part_no": "H3JA-8A AC200-240", "qty": 1, "brand": "OMRON", "product_type": "TIMER"}, '
+        '{"part_no": "ER6C 3.6V", "qty": 1, "brand": "TOSHIBA", "product_type": "LITHIUM BATTERY"}]'
     )
 
     try:
@@ -255,7 +264,7 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
         "- One-sentence product description\n"
         "- Main specifications as short bullet points\n"
         "- Typical applications (one short bullet list)\n"
-        "Keep the answer under 180 words. Plain text only. No markdown code fences."
+        "Keep the answer under 180 words. Plain text only. No markdown, no headers, no hyperlinks."
     )
     try:
         response = client.chat.completions.create(
@@ -265,7 +274,8 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
                     "role": "system",
                     "content": (
                         "You are an industrial automation product specialist. "
-                        "Give accurate, practical summaries for sales staff."
+                        "Give accurate, practical summaries for sales staff. "
+                        "Plain text only — no markdown, no links."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -276,7 +286,7 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
             lines = text.splitlines()
             text = "\n".join(lines[1:-1]).strip()
         print(f"[COPILOT RESEARCH] {len(text)} chars for {part_no}")
-        return text
+        return _sanitize_whatsapp_reply(text)
     except Exception as exc:
         print(f"[WARN] Copilot research failed for {part_no}: {exc}")
         return ""
@@ -334,6 +344,20 @@ def _filter_conflicting_visual_items(items: list) -> list:
         if filtered:
             return filtered
 
+    has_battery = any(
+        "BATTERY" in str(item.get("product_type") or "").upper()
+        or "LITHIUM" in str(item.get("product_type") or "").upper()
+        or _normalize_part_key(item.get("part_no")).startswith("ER")
+        for item in items
+    )
+    if has_battery:
+        filtered = [
+            item for item in items
+            if not _normalize_part_key(item.get("part_no")).startswith("E2E")
+        ]
+        if filtered:
+            return filtered
+
     has_proximity = any(
         "PROXIMITY" in str(item.get("product_type") or "").upper()
         or "SENSOR" in str(item.get("product_type") or "").upper()
@@ -367,21 +391,24 @@ def extract_label_from_image(caption: str = "", image_path: str = None) -> dict:
         max_retries=1,
     )
     system_instruction = (
-        "You transcribe industrial product labels from photos. "
+        "You transcribe industrial product labels from photos (sensors, timers, relays, "
+        "batteries, PLC modules, etc.). "
         "Read the largest printed model/order code character-by-character from the nameplate. "
         "Do not guess or substitute a different catalog number. "
-        "If the label says TIMER or H3JA-/H3Y-, the model is a timer relay — never E2E/E5CC. "
-        "If the label says PROXIMITY SENSOR or E2E-, it is a proximity sensor — never H3JA/H3Y. "
+        "Never default to OMRON E2E-X5E1 unless those exact characters are printed on the label. "
+        "TIMER/H3JA-/H3Y- = timer relay — never E2E. "
+        "LITHIUM/BATTERY/ER6C/ER17500 = battery — never E2E/H3JA. "
+        "PROXIMITY SENSOR/E2E- = proximity sensor — never H3JA/battery. "
         "Return STRICTLY one raw JSON object with keys: "
         "part_no, brand, product_type, supply_voltage. "
-        "part_no must match the label exactly (include AC/DC voltage suffix when printed). "
-        "product_type is the printed description (TIMER, PROXIMITY SENSOR, etc.). "
+        "part_no must match the label exactly (include voltage when printed, e.g. ER6C 3.6V). "
+        "product_type is the printed description (TIMER, LITHIUM BATTERY, PROXIMITY SENSOR, etc.). "
         "supply_voltage is the printed source rating when visible, else empty string. "
         "No markdown, no array, no extra keys."
     )
     user_text = (
         "Transcribe the product label in THIS photo only. "
-        "Read character-by-character — e.g. H3JA-8A is H-3-J-A-8-A, not E2E-X5E1. "
+        "Read character-by-character what is printed — do not substitute a different catalog number. "
         f"Customer caption:\n{caption or '(none)'}"
     )
 
@@ -467,19 +494,43 @@ def _reconcile_visual_items(existing_items: list, label_item: dict) -> list:
     return _filter_conflicting_visual_items(filtered)
 
 
+def _is_unconfirmed_e2e_guess(items: list, label_item: dict) -> bool:
+    """True when the only extracted part is E2E but label OCR did not confirm it."""
+    if not items or len(items) != 1:
+        return False
+    part_key = _normalize_part_key(items[0].get("part_no"))
+    if not part_key.startswith("E2E"):
+        return False
+    if label_item:
+        label_key = _normalize_part_key(label_item.get("part_no"))
+        return not label_key.startswith("E2E")
+    return True
+
+
 def _resolve_visual_items(caption: str, image_path: str = None, copilot_items: list = None) -> list:
     """Merge prior extraction, label OCR, and RFQ visual extraction."""
     items = list(copilot_items or [])
+    label_item = {}
 
     if image_path and os.path.exists(image_path):
         label_item = extract_label_from_image(caption, image_path=image_path)
         if label_item:
             items = _reconcile_visual_items(items, label_item)
         elif not items:
-            print("[COPILOT TECH SUPPORT] Label OCR empty — trying RFQ visual extraction...")
+            print("[COPILOT VISUAL] Label OCR empty — trying structured RFQ visual extraction...")
             items = extract_rfq_with_copilot(caption, image_path=image_path)
 
-    return _filter_conflicting_visual_items(items)
+    items = _filter_conflicting_visual_items(items)
+
+    if _is_unconfirmed_e2e_guess(items, label_item):
+        if label_item:
+            print("[COPILOT VISUAL] Using label OCR over unconfirmed E2E guess.")
+            items = [label_item]
+        elif _is_quote_without_part_text(caption):
+            print("[COPILOT VISUAL] Rejecting unconfirmed E2E guess on quote caption + photo.")
+            items = []
+
+    return items
 
 
 def _timer_voltage_note(part_no: str) -> str:
