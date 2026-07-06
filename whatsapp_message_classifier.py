@@ -34,7 +34,28 @@ LEGACY_LEARNING = os.path.join(BASE_DIR, "whatsapp_classification_learning.json"
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
 
-VERSION = "v1.02-VOICE-NOT-AVATAR"
+EQUIVALENT_SUPPORT_MARKERS = (
+    "EQUIVALENT",
+    "REPLACEMENT",
+    "SUBSTITUTE",
+    "ALTERNATIVE",
+    "SUCCESSOR",
+    "REPLACE WITH",
+    "COMPATIBLE",
+    "INTERCHANGE",
+)
+
+
+def is_equivalent_support_request(message_text: str) -> bool:
+    """True when customer wants an equivalent/replacement, not a price quote."""
+    text_u = str(message_text or "").upper()
+    if not any(marker in text_u for marker in EQUIVALENT_SUPPORT_MARKERS):
+        return False
+    if re.search(r"\b(QUOTE|QUOTATION|PRICE|HOW MUCH|UNIT PRICE|COST|RFQ)\b", text_u):
+        return False
+    return True
+
+VERSION = "v1.03-EQUIVALENT-TECH-SUPPORT"
 
 MEDIA_TYPES = (
     "text",
@@ -458,8 +479,17 @@ def _heuristic_intent(message_text: str, media_info: MediaInfo) -> Optional[Clas
         "NOT WORKING", "FAULTY", "DEFECT", "BROKEN", "TROUBLESHOOT",
         "TECHNICAL SUPPORT", "WARRANTY", "REPAIR", "ERROR CODE", "HOW TO",
         "MANUAL", "WIRING", "CONNECTION", "SPEC", "DATASHEET",
-        "EQUIVALENT", "REPLACEMENT", "SUBSTITUTE", "ALTERNATIVE", "SUCCESSOR",
     ]
+    if is_equivalent_support_request(message_text):
+        return ClassificationResult(
+            media_type=media_info.media_type,
+            intent="technical_support",
+            confidence=0.93,
+            reasoning="Customer asking for equivalent/replacement part — technical support, not RFQ.",
+            media_filename=media_info.filename,
+            handler="technical_support",
+        )
+
     if any(marker in text for marker in support_markers):
         return ClassificationResult(
             media_type=media_info.media_type,
@@ -620,9 +650,9 @@ Return STRICT JSON only:
 {{"intent": "<one of {list(INTENT_TYPES)}>", "confidence": 0.0-1.0, "reasoning": "short reason"}}
 
 Intent guide:
-- rfq_inquiry: customer asking price/availability for parts
+- rfq_inquiry: customer asking price/availability for parts (quote me, how much, qty, RFQ)
 - purchase_order: PO, formal order document, PR
-- technical_support: product fault, wiring, specs, how-to
+- technical_support: product fault, wiring, specs, how-to, AND equivalent/replacement/substitute/successor part questions (even with a photo)
 - delivery_tracking: shipment, courier, ETA
 - payment_invoice: invoice, payment, receipt
 - supplier_reply: reply containing WA-YYYYMMDD-BRAND-XXXX ref
@@ -632,6 +662,9 @@ Intent guide:
 - junk_ad: ads, promotions, spam, unrelated marketing
 - general_chat: other business chat
 - unknown: cannot tell
+
+IMPORTANT: "find equivalent", "replacement for", "substitute", "successor", "alternative part"
+→ always technical_support, NOT rfq_inquiry (unless they also explicitly ask for price/quote).
 
 Learned examples:
 {examples_block}
@@ -734,6 +767,17 @@ def classify_whatsapp_message(
 
     final.media_info = media_info
     final.suggested_reply = final.suggested_reply or _default_reply(final.intent, media_info.media_type)
+
+    if is_equivalent_support_request(message_text):
+        was_rfq = final.intent == "rfq_inquiry"
+        final.intent = "technical_support"
+        final.handler = "technical_support"
+        final.confidence = max(final.confidence, 0.93)
+        if was_rfq:
+            final.reasoning = (
+                "Equivalent/replacement request — routed to technical support, not quotation."
+            )
+
     record_classification_example(
         message_text, media_info.media_type, final.intent, final.confidence, channel="whatsapp",
     )

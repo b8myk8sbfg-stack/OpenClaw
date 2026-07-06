@@ -35,6 +35,7 @@ from whatsapp_message_classifier import (
     build_classification_monitor_message,
     classify_whatsapp_message,
     detect_bubble_media,
+    is_equivalent_support_request,
     log_classification,
 )
 from whatsapp_attachment_processor import (
@@ -4310,6 +4311,14 @@ def _process_open_chat_body(driver, raw_contact_name):
         print("=" * 90)
 
         classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
+        if is_equivalent_support_request(inquiry_text):
+            classification.intent = "technical_support"
+            classification.handler = "technical_support"
+            classification.confidence = max(classification.confidence, 0.93)
+            classification.reasoning = (
+                "Equivalent/replacement request — technical support, not RFQ quotation."
+            )
+            print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
         if media_info.media_type == "voice":
             classification.media_type = "voice"
             if classification.media_info is not None:
@@ -4329,26 +4338,29 @@ def _process_open_chat_body(driver, raw_contact_name):
                 "Our team is reviewing the document and will confirm shortly."
             )
         if copilot_items and classification.intent in ("unknown", "general_chat"):
-            classification.intent = "rfq_inquiry"
-            classification.handler = "rfq_inquiry"
-            classification.confidence = max(classification.confidence, 0.85)
-            if enrichment.get("transcript"):
-                classification.reasoning = "Parts extracted from voice transcript."
-            elif image_path:
-                classification.reasoning = "Parts extracted from customer photo."
-            else:
-                classification.reasoning = "Parts extracted from customer message."
+            if not is_equivalent_support_request(inquiry_text):
+                classification.intent = "rfq_inquiry"
+                classification.handler = "rfq_inquiry"
+                classification.confidence = max(classification.confidence, 0.85)
+                if enrichment.get("transcript"):
+                    classification.reasoning = "Parts extracted from voice transcript."
+                elif image_path:
+                    classification.reasoning = "Parts extracted from customer photo."
+                else:
+                    classification.reasoning = "Parts extracted from customer message."
         if enrichment.get("transcript") and classification.handler in (
             "monitor_only", "voice_note", "unknown", "general_chat"
         ):
-            classification.intent = "rfq_inquiry"
-            classification.handler = "rfq_inquiry"
-            classification.confidence = max(classification.confidence, 0.85)
-            classification.reasoning = "Voice note transcribed — processing as inquiry."
+            if not is_equivalent_support_request(inquiry_text):
+                classification.intent = "rfq_inquiry"
+                classification.handler = "rfq_inquiry"
+                classification.confidence = max(classification.confidence, 0.85)
+                classification.reasoning = "Voice note transcribed — processing as inquiry."
         if (
             (image_path or getattr(media_info, "has_image", False))
             and classification.intent in ("unknown", "general_chat", "greeting")
             and getattr(media_info, "media_type", "") != "voice"
+            and not is_equivalent_support_request(inquiry_text)
         ):
             classification.intent = "rfq_inquiry"
             classification.handler = "rfq_inquiry"
@@ -4380,7 +4392,11 @@ def _process_open_chat_body(driver, raw_contact_name):
         if classification.handler == "rfq_inquiry" or (
             classification.handler == "purchase_order"
             and (document_items or image_analysis or media_info.media_type == "pdf")
-        ) or (enrichment.get("transcript") and inquiry_text):
+        ) or (
+            enrichment.get("transcript")
+            and inquiry_text
+            and not is_equivalent_support_request(inquiry_text)
+        ):
             process_customer_inquiry(
                 driver,
                 contact_name,

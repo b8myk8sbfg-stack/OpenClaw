@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.05-TECH-SUPPORT-LABEL-OCR"
+VERSION = "v1.06-EQUIVALENT-ROUTING"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
