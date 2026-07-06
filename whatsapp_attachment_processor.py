@@ -1522,6 +1522,12 @@ def ensure_voice_transcript(
     Never reuse a previous customer's recording.
     """
     expected_id = str(message_data_id or "").strip()
+
+    if voice_path and os.path.exists(voice_path) and _file_is_recent(voice_path, max_age_seconds):
+        text = transcribe_audio(voice_path)
+        if text:
+            return text
+
     manifest = _read_voice_manifest()
     manifest_id = str(manifest.get("data_id") or "").strip()
 
@@ -1550,8 +1556,7 @@ def ensure_voice_transcript(
         print(f"⚠️ [VOICE] Audio file not fresh enough: {upload_path}")
         return ""
 
-    text = transcribe_audio(upload_path)
-    return text
+    return transcribe_audio(upload_path)
 
 
 def transcribe_audio_via_copilot_chat(audio_path: str, caption: str = "") -> str:
@@ -1816,19 +1821,7 @@ def enrich_message_from_attachments(
             voice_path = download_voice_from_bubble(
                 driver, bubble, contact_name, message_data_id=message_data_id
             )
-            manifest = _read_voice_manifest()
-            manifest_id = str(manifest.get("data_id") or "").strip()
-            expected_id = str(message_data_id or "").strip()
-            has_fresh_opus = (
-                os.path.exists(VOICE_LATEST_OPUS)
-                and manifest_id
-                and (
-                    not expected_id
-                    or expected_id in manifest_id
-                    or manifest_id in expected_id
-                )
-            )
-            if voice_path and has_fresh_opus:
+            if voice_path and os.path.exists(voice_path):
                 result["voice_path"] = voice_path
                 transcript = ensure_voice_transcript(
                     voice_path,
@@ -1842,7 +1835,7 @@ def enrich_message_from_attachments(
                     result["text"] = latest_message
             elif latest_message:
                 result["text"] = latest_message
-            elif not has_fresh_opus:
+            else:
                 print("⚠️ [VOICE] Download failed — no valid opus saved for this message.")
 
     doc_types = ("pdf", "office_word", "office_excel", "office_powerpoint", "document")
