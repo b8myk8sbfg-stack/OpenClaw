@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.03-COPILOT-TECH-SUPPORT"
+VERSION = "v1.04-TECH-SUPPORT-VISION"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -299,7 +299,26 @@ def build_ai_research_summary(formatted_rows):
     return "\n\n".join(sections)
 
 
-def build_technical_support_reply(message_text: str = "", image_path: str = None) -> str:
+def _part_refs_from_copilot_items(copilot_items) -> list:
+    """Collect unique part numbers from prior visual/text Copilot extraction."""
+    refs = []
+    seen = set()
+    for item in copilot_items or []:
+        part_no = str(item.get("part_no") or "").strip().upper()
+        if not part_no:
+            continue
+        key = _normalize_part_key(part_no)
+        if key and key not in seen:
+            seen.add(key)
+            refs.append(part_no)
+    return refs
+
+
+def build_technical_support_reply(
+    message_text: str = "",
+    image_path: str = None,
+    copilot_items: list = None,
+) -> str:
     """Use Copilot + warehouse stock to answer technical support / equivalent-part questions."""
     if os.getenv("OPENCLAW_COPILOT_TECH_SUPPORT", "1").strip().lower() in ("0", "false", "no", "off"):
         return ""
@@ -310,8 +329,29 @@ def build_technical_support_reply(message_text: str = "", image_path: str = None
     if not message_text and not image_path:
         return ""
 
-    part_refs, warehouse_context = build_warehouse_support_context(message_text)
-    parts_label = ", ".join(part_refs) if part_refs else "(not detected — read from message/photo)"
+    part_refs = _part_refs_from_copilot_items(copilot_items)
+    if not part_refs and image_path and os.path.exists(image_path):
+        print("[COPILOT TECH SUPPORT] Running visual label extraction before reply...")
+        visual_items = extract_rfq_with_copilot(message_text, image_path=image_path)
+        part_refs = _part_refs_from_copilot_items(visual_items)
+
+    part_refs, warehouse_context = build_warehouse_support_context(
+        message_text,
+        part_refs=part_refs if part_refs else None,
+    )
+    if part_refs:
+        parts_label = ", ".join(part_refs)
+        identification_note = (
+            f"Model identified from customer text/label: {parts_label}. "
+            "State this model clearly in your reply."
+        )
+    else:
+        parts_label = "(not yet identified from text)"
+        identification_note = (
+            "No part number in the customer text. You MUST read the attached product "
+            "label/nameplate and state the exact printed model number (e.g. OMRON H3JA-8A). "
+            "Do not ask the customer to re-send the model if it is clearly visible on the label."
+        )
 
     print(f"[COPILOT TECH SUPPORT] Parts detected: {parts_label}")
     if warehouse_context:
@@ -327,18 +367,22 @@ def build_technical_support_reply(message_text: str = "", image_path: str = None
     system_prompt = (
         "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
         "Answer customer technical support questions clearly and practically on WhatsApp. "
+        "When a product photo is attached, read the label/nameplate first and identify the exact "
+        "printed model number before answering. "
         "When the customer asks for an equivalent, replacement, or successor part, recommend the "
         "best modern replacement and explain briefly why. "
+        "For OMRON H3JA or H3Y timer relays, the usual modern successor is H3CR-A8 (8-pin socket, DPDT). "
         "ALWAYS prioritise recommending parts listed in the warehouse stock section below. "
         "If we have Ex-Stock quantity, say so. Do not recommend external distributors if we stock a suitable item. "
-        "If exact drop-in replacement is unclear, ask 1-2 short clarifying questions such as: "
-        "time range on the dial (5s, 10s, 30s, 3min, etc.) and timing mode (ON-delay, OFF-delay, interval). "
+        "Only if the time range on the dial or timing mode (ON-delay, OFF-delay, interval) is not visible "
+        "on the label, ask 1-2 short clarifying questions. "
+        "Never tell the customer you could not identify the model when the label is clearly readable. "
         "Plain text only. No markdown code fences. Friendly professional tone. Under 280 words."
     )
 
     user_prompt = (
         f"Customer message:\n{message_text or '(see attached photo)'}\n\n"
-        f"Detected part reference(s): {parts_label}\n\n"
+        f"{identification_note}\n\n"
         "Our warehouse stock to PRIORITISE (check these first):\n"
         f"{warehouse_context or '(no matching warehouse stock found — give best technical guidance anyway)'}\n\n"
         "Write the WhatsApp reply to the customer now."

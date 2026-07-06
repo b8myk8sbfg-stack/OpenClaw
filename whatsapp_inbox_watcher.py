@@ -2696,6 +2696,22 @@ def is_quote_without_part_number(text):
     return len(text_u) < 80
 
 
+def is_support_without_part_number(text):
+    """Caption like 'find equivalent' with no part number — needs paired image."""
+    text_u = str(text or "").upper().strip()
+    if not text_u:
+        return False
+    support_markers = (
+        "EQUIVALENT", "REPLACEMENT", "SUBSTITUTE", "ALTERNATIVE",
+        "SUCCESSOR", "REPLACE", "COMPATIBLE",
+    )
+    if not any(marker in text_u for marker in support_markers):
+        return False
+    if re.search(r"[A-Z]{1,4}[-]?\d{1,}[A-Z0-9#\-/]*", text_u):
+        return False
+    return True
+
+
 def bubble_contains_image(bubble):
     container = resolve_message_container(bubble)
     return find_media_image_in_bubble(container) is not None
@@ -2919,10 +2935,13 @@ def plan_sequential_units(units, contact_name: str = "", contact_hint: str = "")
         print("📨 Sequential plan: 1) document  2) text caption")
         return [newest, prev]
 
-    if newest["kind"] == "text" and is_quote_without_part_number(newest.get("text")):
+    if newest["kind"] == "text" and (
+        is_quote_without_part_number(newest.get("text"))
+        or is_support_without_part_number(newest.get("text"))
+    ):
         image_unit = find_image_unit(working)
         if image_unit and image_unit is not newest:
-            print("📨 Sequential plan: image + quote caption (within lookback window)")
+            print("📨 Sequential plan: image + caption without part number (within lookback window)")
             return [image_unit, newest]
 
     if newest["kind"] == "document":
@@ -3082,14 +3101,18 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 continue
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
-            if not copilot_items and not document_items and not is_quote_without_part_number(unit_text):
+            if not copilot_items and not document_items and not (
+                is_quote_without_part_number(unit_text) or is_support_without_part_number(unit_text)
+            ):
                 items = extract_rfq_with_copilot(unit_text, image_path=None)
                 if items:
                     copilot_items = items
                     print(f"   📝 Text step: Copilot extracted {len(items)} item(s)")
-            elif is_quote_without_part_number(unit_text) and not image_path:
+            elif (
+                is_quote_without_part_number(unit_text) or is_support_without_part_number(unit_text)
+            ) and not image_path:
                 print(
-                    "   📝 Text step: quote caption without part number — "
+                    "   📝 Text step: caption without part number — "
                     "waiting for paired image step (no text-only guess)."
                 )
             else:
@@ -4078,6 +4101,7 @@ def process_classified_non_inquiry(
     image_analysis=None,
     document_items=None,
     image_path=None,
+    copilot_items=None,
 ):
     """Handle non-RFQ intents with appropriate acknowledgement while learning in background."""
     customer_contact = customer_contact or contact_name
@@ -4122,7 +4146,14 @@ def process_classified_non_inquiry(
         return
 
     if handler == "technical_support":
-        copilot_reply = build_technical_support_reply(latest_message, image_path=image_path)
+        prior_items = list(copilot_items or [])
+        if not prior_items and image_analysis:
+            prior_items = list(image_analysis.get("items") or [])
+        copilot_reply = build_technical_support_reply(
+            latest_message,
+            image_path=image_path,
+            copilot_items=prior_items or None,
+        )
         if copilot_reply:
             reply = copilot_reply
             context = "TECHNICAL_SUPPORT_COPILOT"
@@ -4340,6 +4371,8 @@ def _process_open_chat_body(driver, raw_contact_name):
                 driver, contact_name, inquiry_text, classification,
                 customer_contact=customer_contact, image_analysis=image_analysis,
                 document_items=document_items,
+                image_path=image_path,
+                copilot_items=copilot_items,
             )
             return
 
@@ -4368,6 +4401,8 @@ def _process_open_chat_body(driver, raw_contact_name):
             customer_contact=customer_contact,
             image_analysis=image_analysis,
             document_items=document_items,
+            image_path=image_path,
+            copilot_items=copilot_items,
         )
     finally:
         finalize_chat_processing(
