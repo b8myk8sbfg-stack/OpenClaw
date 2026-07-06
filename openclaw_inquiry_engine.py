@@ -240,6 +240,116 @@ def extract_voltage_signature(text):
     return None
 
 
+def get_usable_store_qty(api_id, warehouse_row=None):
+    """Return STORE-location quantity from OBM, with CSV fallback for legacy PIDs."""
+    obm = get_product(api_id)
+    store_qty = get_store_qty_from_product(obm)
+    if store_qty > 0:
+        return store_qty
+
+    if str(obm.get("error") or "") == "101" and warehouse_row:
+        return float(warehouse_row.get("stock_qty") or 0)
+
+    return 0.0
+
+
+def _default_cable_variant_bonus(part_no, stock_name):
+    """When the customer omits cable length, prefer common 2M pre-wired variants."""
+    part_u = str(part_no or "").upper()
+    stock_u = str(stock_name or "").upper()
+    if re.search(r"\d\s*M\b", part_u):
+        return 0
+    if part_u.startswith("E2E") and re.search(r"\b2M\b", stock_u):
+        return 2500
+    return 0
+
+
+def _score_warehouse_candidate(row, part_no, qty, declared_brand, requested_voltage, candidate_voltages):
+    row_brand = str(row.get("brand") or "").upper()
+    stock_text = (
+        f"{row['api_id']} {row['stock_name']} {row['model_no']} "
+        f"{row['alt_model']} {row['brand']} {row['raw']}"
+    ).upper()
+
+    if declared_brand != "UNKNOWN" and row_brand and declared_brand not in row_brand and declared_brand not in stock_text:
+        return None
+
+    if not stock_contains_part_family(stock_text, part_no):
+        return None
+
+    stock_voltage = extract_voltage_signature(stock_text)
+    if requested_voltage:
+        if not stock_voltage or stock_voltage[0] != requested_voltage[0]:
+            return None
+        if not set(requested_voltage[1]).intersection(stock_voltage[1]):
+            return None
+    if stock_voltage:
+        candidate_voltages.add(stock_voltage)
+
+    score = 0
+    score += startswith_part_boundary(row.get("stock_name"), part_no)
+
+    part_norm = normalize_part(part_no)
+    if part_norm in normalize_part(stock_text):
+        score += 1000 + len(part_norm)
+
+    if requested_voltage and stock_voltage == requested_voltage:
+        score += 5000
+
+    score += _default_cable_variant_bonus(part_no, row.get("stock_name"))
+
+    if part_norm.startswith("E3Z") and "PHOTOELECTRIC SENSOR" in stock_text:
+        score += 200
+    if part_norm.startswith("E39") and "RETROREFLECTOR" in stock_text:
+        score += 200
+
+    if score <= 0:
+        return None
+
+    return {**row, "score": score, "match_type": "PARTIAL_STOCK_FAMILY"}
+
+
+def _pick_best_warehouse_candidate(candidates, part_no, qty):
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    ranked = []
+    for row in candidates:
+        usable = get_usable_store_qty(row.get("api_id"), row)
+        ranked.append({
+            "row": row,
+            "usable": usable,
+            "score": row.get("score") or 0,
+            "can_quote_now": usable >= qty,
+        })
+
+    ranked.sort(
+        key=lambda item: (
+            1 if item["can_quote_now"] else 0,
+            item["usable"],
+            item["score"],
+        ),
+        reverse=True,
+    )
+
+    best = ranked[0]["row"]
+    if len(ranked) > 1:
+        print(
+            f"   📦 [ENGINE] Chose in-stock variant for {part_no}: "
+            f"{best.get('stock_name') or best.get('api_id')} "
+            f"(usable STORE qty={ranked[0]['usable']:.0f})"
+        )
+        for alt in ranked[1:4]:
+            alt_row = alt["row"]
+            print(
+                f"      alt: {alt_row.get('stock_name') or alt_row.get('api_id')} "
+                f"| usable={alt['usable']:.0f} | score={alt['score']}"
+            )
+    return best
+
+
 def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
     part_no = str(part_no or "").strip().upper()
     declared_brand = str(declared_brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
@@ -253,81 +363,42 @@ def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
         print(f"   ✅ [ENGINE] Exact lookup match: {part_no} → {exact['api_id']}")
         return exact
 
-    # If customer did not give brand, try safe inference before partial matching.
     if declared_brand == "UNKNOWN":
         declared_brand = infer_brand_from_part(part_no)
 
-    best = None
     requested_voltage = extract_voltage_signature(part_no)
     candidate_voltages = set()
+    candidates = []
 
     for row in WAREHOUSE_ROWS:
         if not row.get("api_id") or not row.get("stock_name"):
             continue
+        scored = _score_warehouse_candidate(
+            row, part_no, qty, declared_brand, requested_voltage, candidate_voltages
+        )
+        if scored:
+            candidates.append(scored)
 
-        row_brand = str(row.get("brand") or "").upper()
-        stock_text = f"{row['api_id']} {row['stock_name']} {row['model_no']} {row['alt_model']} {row['brand']} {row['raw']}".upper()
+    if not candidates:
+        print(f"   ⚠️ [ENGINE] No warehouse match: {part_no}")
+        return None
 
-        if declared_brand != "UNKNOWN" and row_brand and declared_brand not in row_brand and declared_brand not in stock_text:
-            continue
-
-        if not stock_contains_part_family(stock_text, part_no):
-            continue
-
-        stock_voltage = extract_voltage_signature(stock_text)
-        if requested_voltage:
-            if not stock_voltage or stock_voltage[0] != requested_voltage[0]:
-                continue
-            if not set(requested_voltage[1]).intersection(stock_voltage[1]):
-                continue
-        if stock_voltage:
-            candidate_voltages.add(stock_voltage)
-
-        score = 0
-        score += startswith_part_boundary(row.get("stock_name"), part_no)
-
-        part_norm = normalize_part(part_no)
-        if part_norm in normalize_part(stock_text):
-            score += 1000 + len(part_norm)
-
-        if requested_voltage and stock_voltage == requested_voltage:
-            score += 5000
-
-        if row.get("stock_qty", 0) >= qty:
-            score += 500
-        elif row.get("stock_qty", 0) > 0:
-            score += 100
-
-        score += min(int(row.get("stock_qty") or 0), 20) * 10
-
-        # Prefer PHOTOELECTRIC SENSOR for E3Z/E39 family.
-        if part_norm.startswith("E3Z") and "PHOTOELECTRIC SENSOR" in stock_text:
-            score += 200
-        if part_norm.startswith("E39") and "RETROREFLECTOR" in stock_text:
-            score += 200
-
-        if score <= 0:
-            continue
-
-        if best is None or score > best["score"]:
-            best = {**row, "score": score, "match_type": "PARTIAL_STOCK_FAMILY"}
-
-    if best and not requested_voltage and len(candidate_voltages) > 1:
+    if not requested_voltage and len(candidate_voltages) > 1:
         print(
             f"   ⚠️ [ENGINE] Ambiguous voltage variants for {part_no}: "
             f"{sorted(candidate_voltages)}. Refusing to guess."
         )
         return None
 
+    best = _pick_best_warehouse_candidate(candidates, part_no, qty)
     if best:
         print(
             f"   ✅ [ENGINE] Partial stock-family match: {part_no} → {best['api_id']} | "
-            f"{best['stock_name']} | Stock Qty: {best.get('stock_qty')} | Score: {best.get('score')}"
+            f"{best['stock_name']} | CSV Qty: {best.get('stock_qty')} | Score: {best.get('score')}"
         )
-        return best
-
-    print(f"   ⚠️ [ENGINE] No warehouse match: {part_no}")
-    return None
+    else:
+        print(f"   ⚠️ [ENGINE] No warehouse match: {part_no}")
+    return best
 
 
 def extract_structured_rfq_items(body_text):
@@ -758,8 +829,15 @@ def process_inquiry_text(inquiry_text):
     }
 
 
-def build_plain_quotation_reply(rows):
-    msg = "Hi, thank you for your inquiry.\n\nHere is the initial status:\n\n"
+def build_plain_quotation_reply(rows, ai_research=None):
+    msg = "Hi, thank you for your inquiry.\n\n"
+
+    if ai_research:
+        msg += "Product information:\n"
+        msg += str(ai_research).strip()
+        msg += "\n\n"
+
+    msg += "Here is the initial status:\n\n"
 
     total = 0.0
     has_total = False

@@ -172,6 +172,74 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
     return []
 
 
+def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
+    """Look up a part with Copilot and return a short technical summary for customer replies."""
+    part_no = str(part_no or "").strip().upper()
+    brand = str(brand or "UNKNOWN").strip().upper()
+    if not part_no:
+        return ""
+
+    if os.getenv("OPENCLAW_COPILOT_RESEARCH", "1").strip().lower() in ("0", "false", "no", "off"):
+        return ""
+
+    print(f"[COPILOT RESEARCH] Looking up {part_no} ({brand})...")
+    client = OpenAI(
+        base_url=COPILOT_BASE_URL,
+        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
+        timeout=45.0,
+        max_retries=1,
+    )
+    prompt = (
+        f"Research the industrial automation part {part_no}"
+        f"{f' by {brand}' if brand and brand != 'UNKNOWN' else ''}.\n"
+        "Write a concise technical summary suitable for a sales quotation reply.\n"
+        "Include:\n"
+        "- One-sentence product description\n"
+        "- Main specifications as short bullet points\n"
+        "- Typical applications (one short bullet list)\n"
+        "Keep the answer under 180 words. Plain text only. No markdown code fences."
+    )
+    try:
+        response = client.chat.completions.create(
+            model=COPILOT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an industrial automation product specialist. "
+                        "Give accurate, practical summaries for sales staff."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip()
+        print(f"[COPILOT RESEARCH] {len(text)} chars for {part_no}")
+        return text
+    except Exception as exc:
+        print(f"[WARN] Copilot research failed for {part_no}: {exc}")
+        return ""
+
+
+def build_ai_research_summary(formatted_rows):
+    """Build Copilot research notes for the unique customer parts in a quote."""
+    sections = []
+    seen = set()
+    for row in formatted_rows or []:
+        part_no = str(row.get("customer_part") or row.get("pid") or "").strip().upper()
+        if not part_no or part_no in seen:
+            continue
+        seen.add(part_no)
+        brand = str(row.get("brand") or "UNKNOWN").strip().upper()
+        notes = research_part_with_copilot(part_no, brand)
+        if notes:
+            sections.append(f"{part_no}\n{notes}")
+    return "\n\n".join(sections)
+
+
 def run_process(name, script):
     print(f"🚀 Starting {name}...")
     return subprocess.Popen(

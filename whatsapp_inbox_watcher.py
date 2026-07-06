@@ -24,7 +24,7 @@ from openclaw_inquiry_engine import (
 from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
-from openclaw_main import extract_rfq_with_copilot
+from openclaw_main import extract_rfq_with_copilot, build_ai_research_summary
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     build_classification_monitor_message,
@@ -3991,7 +3991,10 @@ def process_customer_inquiry(
             f"Price: {row.get('price')} | LT: {row.get('lt')} | Brand: {row.get('brand')}"
         )
 
-    customer_reply = build_plain_quotation_reply(formatted_rows)
+    customer_reply = build_plain_quotation_reply(
+        formatted_rows,
+        ai_research=build_ai_research_summary(formatted_rows),
+    )
     sent = send_customer_reply(
         driver,
         customer_reply,
