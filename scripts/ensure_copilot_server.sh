@@ -13,6 +13,8 @@ COPILOT_PORT="${COPILOT_PORT:-8000}"
 COPILOT_HEALTH_URL="${COPILOT_HEALTH_URL:-http://${COPILOT_HOST}:${COPILOT_PORT}/v1/models}"
 COPILOT_START_TIMEOUT="${COPILOT_START_TIMEOUT:-180}"
 COPILOT_FORCE_RESTART="${COPILOT_FORCE_RESTART:-0}"
+COPILOT_VENV_PY="$COPILOT_DIR/venv/bin/python"
+COPILOT_VENV_PIP="$COPILOT_DIR/venv/bin/pip"
 
 mkdir -p "$LOG_DIR"
 
@@ -27,6 +29,10 @@ copilot_health_ok() {
 find_copilot_pids() {
     pgrep -f "$COPILOT_DIR/app.py" 2>/dev/null || true
     pgrep -f "$COPILOT_DIR.*uvicorn server.api:app" 2>/dev/null || true
+}
+
+copilot_process_running() {
+    [[ -n "$(find_copilot_pids | tr -d '[:space:]')" ]]
 }
 
 stop_copilot_if_requested() {
@@ -44,24 +50,46 @@ stop_copilot_if_requested() {
     kill -9 $pids 2>/dev/null || true
 }
 
+ensure_copilot_venv() {
+    if [[ -n "${COPILOT_PYTHON:-}" && -x "${COPILOT_PYTHON}" ]]; then
+        if ! "${COPILOT_PYTHON}" -c "import fastapi" >/dev/null 2>&1; then
+            log "ERROR: COPILOT_PYTHON is set but fastapi is missing."
+            log "Run: bash $BASE_DIR/scripts/setup_copilot_server.sh"
+            exit 1
+        fi
+        return 0
+    fi
+
+    if [[ ! -x "$COPILOT_VENV_PY" ]]; then
+        log "Copilot virtualenv missing — running setup..."
+        bash "$BASE_DIR/scripts/setup_copilot_server.sh"
+    fi
+
+    if ! "$COPILOT_VENV_PY" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+        log "Copilot dependencies missing — installing..."
+        "$COPILOT_VENV_PIP" install -r "$COPILOT_DIR/requirements.txt"
+    fi
+
+    if ! "$COPILOT_VENV_PY" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+        log "ERROR: Copilot dependencies still missing after install."
+        log "Run manually: bash $BASE_DIR/scripts/setup_copilot_server.sh"
+        exit 1
+    fi
+}
+
 choose_python() {
     if [[ -n "${COPILOT_PYTHON:-}" && -x "${COPILOT_PYTHON}" ]]; then
         echo "$COPILOT_PYTHON"
         return
     fi
-    if [[ -x "$COPILOT_DIR/venv/bin/python" ]]; then
-        echo "$COPILOT_DIR/venv/bin/python"
-        return
+    echo "$COPILOT_VENV_PY"
+}
+
+copilot_startup_failed() {
+    if [[ ! -f "$COPILOT_LOG" ]]; then
+        return 1
     fi
-    if [[ -x "$BASE_DIR/.venv/bin/python" ]]; then
-        echo "$BASE_DIR/.venv/bin/python"
-        return
-    fi
-    if command -v uv >/dev/null 2>&1; then
-        echo "uv run python"
-        return
-    fi
-    echo "python3"
+    tail -40 "$COPILOT_LOG" | grep -Eq "ModuleNotFoundError|ImportError|Traceback|Address already in use"
 }
 
 start_copilot_server() {
@@ -74,8 +102,11 @@ start_copilot_server() {
         exit 1
     fi
 
+    ensure_copilot_venv
+
     local py
     py="$(choose_python)"
+    : > "$COPILOT_LOG"
     log "Starting Copilot server from $COPILOT_DIR using: $py"
     log "Health check URL: $COPILOT_HEALTH_URL"
     log "Log file: $COPILOT_LOG"
@@ -84,11 +115,7 @@ start_copilot_server() {
         cd "$COPILOT_DIR"
         export HOST="$COPILOT_HOST"
         export PORT="$COPILOT_PORT"
-        if [[ "$py" == "uv run python" ]]; then
-            nohup uv run python app.py >> "$COPILOT_LOG" 2>&1 &
-        else
-            nohup "$py" app.py >> "$COPILOT_LOG" 2>&1 &
-        fi
+        nohup "$py" app.py >> "$COPILOT_LOG" 2>&1 &
         echo $! > "$LOG_DIR/copilot_server.pid"
     )
 }
@@ -100,6 +127,14 @@ wait_for_copilot_server() {
             log "Copilot server is healthy (${COPILOT_HEALTH_URL})"
             return 0
         fi
+
+        if ! copilot_process_running && copilot_startup_failed; then
+            log "ERROR: Copilot server exited during startup"
+            tail -30 "$COPILOT_LOG" 2>/dev/null || true
+            log "Try: bash $BASE_DIR/scripts/setup_copilot_server.sh"
+            exit 1
+        fi
+
         sleep 2
         elapsed=$((elapsed + 2))
         if (( elapsed % 10 == 0 )); then
@@ -109,6 +144,7 @@ wait_for_copilot_server() {
     log "ERROR: Copilot server did not become healthy within ${COPILOT_START_TIMEOUT}s"
     log "Check log: $COPILOT_LOG"
     tail -30 "$COPILOT_LOG" 2>/dev/null || true
+    log "Try: bash $BASE_DIR/scripts/setup_copilot_server.sh"
     exit 1
 }
 
