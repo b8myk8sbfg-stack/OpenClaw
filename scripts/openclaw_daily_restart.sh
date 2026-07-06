@@ -33,6 +33,13 @@ log() {
 
     sleep 5
 
+    log "Ensuring Copilot server is running before OpenClaw..."
+    if ! bash "$BASE_DIR/scripts/ensure_copilot_server.sh"; then
+        log "ERROR: Copilot server failed to start. OpenClaw not started."
+        log "Check $LOG_DIR/copilot_server.log"
+        exit 1
+    fi
+
     log "Starting OpenClaw unified runner..."
     cd "$BASE_DIR"
     nohup uv run python openclaw_main.py >> "$MAIN_LOG" 2>&1 &
