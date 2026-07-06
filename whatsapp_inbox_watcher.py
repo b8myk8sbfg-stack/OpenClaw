@@ -4149,13 +4149,10 @@ def process_classified_non_inquiry(
         return
 
     if handler == "technical_support":
-        prior_items = list(copilot_items or [])
-        if not prior_items and image_analysis:
-            prior_items = list(image_analysis.get("items") or [])
         copilot_reply = build_technical_support_reply(
             latest_message,
             image_path=image_path,
-            copilot_items=prior_items or None,
+            copilot_items=None,
         )
         if copilot_reply:
             reply = copilot_reply
