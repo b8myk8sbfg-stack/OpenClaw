@@ -36,8 +36,9 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "You are an industrial automation data extraction assistant. "
         "Visually inspect the provided industrial product photo, label, nameplate, barcode sticker, "
         "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
-        "Read printed model/order codes exactly as shown, including suffixes like #1 or #2 "
-        "(example: P36203010#1). Read SMC, OMRON, and other brand logos on labels. "
+        "Read printed model/order codes exactly as shown on the label/nameplate in THIS photo only. "
+        "Match the brand field to the visible manufacturer logo (OMRON, SMC, etc.). "
+        "Never reuse a part number from chat history or from a different message. "
         "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
         "For relays, solenoids, coils, and power products, voltage and AC/DC are mandatory: "
         "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC'). "
@@ -54,8 +55,8 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
 
     try:
         user_text = (
-            "Identify every industrial part in this customer inquiry. "
-            "Use only the current request; never reuse a part number from chat history. "
+            "Identify every industrial part in THIS customer message only. "
+            "Read only the attached photo and caption below — ignore all prior chat context. "
             f"Customer caption/text:\n{raw_email_body or '(none)'}"
         )
         user_content = user_text

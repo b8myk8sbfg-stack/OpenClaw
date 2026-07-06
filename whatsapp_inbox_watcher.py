@@ -2160,14 +2160,26 @@ def relocate_message_container(driver, data_id):
     if not data_id:
         return None
     try:
-        return driver.find_element(By.CSS_SELECTOR, f'div[data-id="{data_id}"]')
+        element = driver.find_element(By.CSS_SELECTOR, f'div[data-id="{data_id}"]')
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            element,
+        )
+        time.sleep(1)
+        return element
     except Exception:
         pass
     try:
-        return driver.find_element(
+        element = driver.find_element(
             By.CSS_SELECTOR,
             f'div[data-testid="msg-container"][data-id="{data_id}"]',
         )
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            element,
+        )
+        time.sleep(1)
+        return element
     except Exception:
         return None
 
@@ -2346,6 +2358,31 @@ def _data_id_from_container(container) -> str:
     return ""
 
 
+def _caption_from_container(container) -> str:
+    return normalize_unit_text(extract_text_from_message_container(container))
+
+
+def container_matches_unit(unit, container) -> bool:
+    """Verify a DOM bubble belongs to the scraped WhatsApp unit."""
+    if container is None or unit is None:
+        return False
+
+    expected_id = str(unit.get("data_id") or "").strip()
+    actual_id = _data_id_from_container(container)
+    if expected_id and actual_id and expected_id != actual_id:
+        return False
+
+    expected_text = normalize_unit_text(unit.get("text") or "")
+    if expected_text:
+        actual_text = _caption_from_container(container)
+        if actual_text and expected_text != actual_text:
+            exp_key = expected_text.lower().replace(" ", "")
+            act_key = actual_text.lower().replace(" ", "")
+            if exp_key not in act_key and act_key not in exp_key:
+                return False
+    return True
+
+
 def _voice_data_id_from_unit(unit, container) -> str:
     data_id = str(unit.get("data_id") or "").strip()
     if data_id:
@@ -2367,30 +2404,43 @@ def _voice_data_id_from_unit(unit, container) -> str:
 
 def resolve_unit_container(driver, unit):
     """Ensure we have a live WebElement for a scraped message unit."""
+    expected_id = str(unit.get("data_id") or "").strip()
+
     container = unit.get("container")
     if container is not None:
         try:
             container.is_enabled()
-            return container
+            if container_matches_unit(unit, container):
+                return container
+            print(
+                f"   ⚠️ Stale container for data_id={expected_id[:24]!r} "
+                f"(actual={_data_id_from_container(container)[:24]!r}) — relocating"
+            )
+            container = None
         except Exception:
-            pass
+            container = None
 
-    data_id = str(unit.get("data_id") or "").strip()
-    if data_id:
-        container = relocate_message_container(driver, data_id)
-        if container is not None:
+    if expected_id:
+        container = relocate_message_container(driver, expected_id)
+        if container is not None and container_matches_unit(unit, container):
             unit["container"] = container
             return container
+        if container is not None:
+            print(
+                f"   ❌ data-id {expected_id[:24]!r} resolved to mismatched bubble "
+                f"(caption={_caption_from_container(container)[:60]!r})"
+            )
+            container = None
 
     incoming_index = unit.get("incoming_index")
     if incoming_index is not None:
         container = relocate_incoming_by_index(driver, incoming_index)
-        if container is not None:
+        if container is not None and container_matches_unit(unit, container):
             unit["container"] = container
             print(f"   📍 Relocated bubble via incoming index {incoming_index}")
             return container
 
-    if unit.get("kind") == "image":
+    if unit.get("kind") == "image" and not expected_id:
         container = relocate_last_incoming_image(driver)
         if container is not None:
             unit["container"] = container
@@ -2907,18 +2957,22 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 print("   🎤 Reclassified image → voice (PTT bubble detected)")
         if kind == "image":
             if container is None:
-                container = relocate_last_incoming_image(driver)
-                if container is not None:
-                    unit["container"] = container
-                    print("   🖼️ Image step: recovered container via last-incoming-image fallback")
-            if container is None:
                 print("   ❌ Image step: container element missing — cannot capture photo.")
+                continue
+            if not container_matches_unit(unit, container):
+                print(
+                    f"   ❌ Image step: bubble mismatch for data_id="
+                    f"{str(unit.get('data_id') or '')[:24]!r} — skipping to avoid wrong photo."
+                )
                 continue
             caption = normalize_unit_text(unit_text or latest_message)
             if caption:
                 latest_message = caption
             media_info = detect_bubble_media(container, caption_text=caption)
-            image_path = capture_bubble_image(driver, container, contact_name)
+            message_data_id = str(unit.get("data_id") or "").strip()
+            image_path = capture_bubble_image(
+                driver, container, contact_name, message_data_id=message_data_id
+            )
             items = extract_rfq_with_copilot(caption, image_path=image_path)
             if items:
                 copilot_items = items
@@ -3169,18 +3223,142 @@ def bubble_has_media_image(bubble):
     return find_media_image_in_bubble(bubble) is not None
 
 
-def capture_bubble_image(driver, bubble, contact_name):
+def wait_for_media_image_ready(driver, media, timeout=8):
+    try:
+        return bool(
+            driver.execute_async_script(
+                """
+                const img = arguments[0];
+                const timeoutMs = arguments[1];
+                const done = arguments[arguments.length - 1];
+                const started = Date.now();
+                function ready() {
+                    return img && img.complete && (img.naturalWidth || 0) > 80;
+                }
+                if (ready()) return done(true);
+                const timer = setInterval(() => {
+                    if (ready()) {
+                        clearInterval(timer);
+                        done(true);
+                    } else if (Date.now() - started > timeoutMs) {
+                        clearInterval(timer);
+                        done(false);
+                    }
+                }, 200);
+                """,
+                media,
+                int(timeout * 1000),
+            )
+        )
+    except Exception:
+        time.sleep(1)
+        return True
+
+
+def close_media_viewer(driver):
+    for selector in (
+        '[data-testid="btn-closer-drawer"]',
+        '[data-testid="x"]',
+        '[aria-label="Close"]',
+        'span[data-icon="x"]',
+    ):
+        try:
+            for button in driver.find_elements(By.CSS_SELECTOR, selector):
+                if button.is_displayed():
+                    button.click()
+                    time.sleep(0.5)
+                    return
+        except Exception:
+            continue
+    try:
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+
+def capture_image_via_media_viewer(driver, bubble, image_path):
+    """Open WhatsApp's full-screen viewer so we capture the correct photo."""
+    thumb = find_media_image_in_bubble(bubble)
+    if thumb is None:
+        return None
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            thumb,
+        )
+        time.sleep(0.8)
+        driver.execute_script("arguments[0].click();", thumb)
+        time.sleep(2)
+
+        viewer_selectors = [
+            '[data-testid="media-viewer-panel"] img[src]',
+            'div[data-animate-media-viewer="true"] img[src]',
+            'img[src*="blob:"]',
+            'img[src*="mmg"]',
+        ]
+        best = None
+        best_area = 0
+        for selector in viewer_selectors:
+            for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                try:
+                    if not element.is_displayed():
+                        continue
+                    src = (element.get_attribute("src") or "").lower()
+                    if is_profile_or_ui_image_src(src):
+                        continue
+                    size = element.size or {}
+                    area = int(size.get("width") or 0) * int(size.get("height") or 0)
+                    if area > best_area:
+                        best = element
+                        best_area = area
+                except Exception:
+                    continue
+
+        if best is not None and wait_for_media_image_ready(driver, best):
+            best.screenshot(image_path)
+            print(f"🖼️ Saved WhatsApp image from media viewer: {image_path}")
+            return image_path
+    except Exception as exc:
+        print(f"⚠️ Media viewer capture failed: {exc}")
+    finally:
+        close_media_viewer(driver)
+    return None
+
+
+def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     bubble = resolve_message_container(bubble)
-    media = find_media_image_in_bubble(bubble)
+    if bubble is None:
+        return None
 
     os.makedirs(IMAGE_CAPTURE_DIR, exist_ok=True)
     safe_contact = re.sub(r"[^A-Za-z0-9._-]+", "_", str(contact_name or "contact"))[:60]
+    id_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(message_data_id or ""))[:24]
+    suffix = f"_{id_slug}" if id_slug else ""
     image_path = os.path.join(
         IMAGE_CAPTURE_DIR,
-        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}.png"
+        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}.png",
     )
 
-    if media is None and container_has_image(bubble):
+    viewer_path = capture_image_via_media_viewer(driver, bubble, image_path)
+    if viewer_path:
+        return viewer_path
+
+    media = find_media_image_in_bubble(bubble)
+    if media is not None:
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                media,
+            )
+            wait_for_media_image_ready(driver, media)
+            media.screenshot(image_path)
+            print(f"🖼️ Saved incoming WhatsApp image (thumb): {image_path}")
+            return image_path
+        except Exception as e:
+            print(f"❌ Failed to capture WhatsApp image thumb: {e}")
+
+    if container_has_image(bubble):
         try:
             driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
@@ -3192,23 +3370,8 @@ def capture_bubble_image(driver, bubble, contact_name):
             return image_path
         except Exception as e:
             print(f"❌ Container screenshot fallback failed: {e}")
-            return None
 
-    if media is None:
-        return None
-
-    try:
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-            media
-        )
-        time.sleep(1)
-        media.screenshot(image_path)
-        print(f"🖼️ Saved incoming WhatsApp image: {image_path}")
-        return image_path
-    except Exception as e:
-        print(f"❌ Failed to capture WhatsApp image: {e}")
-        return None
+    return None
 
 
 def analyze_whatsapp_image(image_path, caption_text=""):
