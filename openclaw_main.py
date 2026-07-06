@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.01-UNIFIED-RUNNER"
+VERSION = "v1.02-VISUAL-H3JA-EXTRACTION"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -25,6 +25,20 @@ def _normalize_part_key(part_no: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
 
 
+def _is_quote_without_part_text(text: str) -> bool:
+    """True for captions like 'Quote me 2 pcs' with no embedded part number."""
+    text_u = str(text or "").upper().strip()
+    if not text_u:
+        return False
+    if not re.search(r"\b(QUOTE|QUOTATION|RFQ|ENQ|PRICE|PLS QUOTE|KINDLY QUOTE|QUOTE ME)\b", text_u):
+        return False
+    if re.search(r"[A-Z]{1,4}\d{3,}[A-Z0-9#\-/]*", text_u):
+        return False
+    if re.search(r"\b(QTY|PCS|PC|PIECES|PIECE|EA|EACH|UNIT|UNITS)\b", text_u):
+        return True
+    return len(text_u) < 80
+
+
 def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool:
     """Reject obvious vision mismatches between label type and model family."""
     part_u = str(part_no or "").upper().strip()
@@ -37,6 +51,12 @@ def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool
 
     if type_u:
         if "PROXIMITY" in type_u and not part_key.startswith("E2E"):
+            print(
+                f"[WARN] Visual mismatch: label type {product_type!r} "
+                f"does not match part {part_no!r}"
+            )
+            return False
+        if "TIMER" in type_u and not (part_key.startswith("H3J") or part_key.startswith("H3Y")):
             print(
                 f"[WARN] Visual mismatch: label type {product_type!r} "
                 f"does not match part {part_no!r}"
@@ -64,19 +84,48 @@ def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool
         )
         return False
 
+    if part_key.startswith("E2E") and type_u and "PROXIMITY" not in type_u and "SENSOR" not in type_u:
+        print(
+            f"[WARN] OMRON E2E part {part_no!r} rejected — label type was {product_type!r}, "
+            "not a proximity sensor."
+        )
+        return False
+
+    if (part_key.startswith("H3J") or part_key.startswith("H3Y")) and type_u and "TIMER" not in type_u:
+        print(
+            f"[WARN] OMRON timer part {part_no!r} rejected — label type was {product_type!r}, "
+            "not a timer."
+        )
+        return False
+
     return True
 
 
 def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -> list:
     """Extract RFQ items from text and/or an image through the local Copilot proxy."""
-    if not str(raw_email_body or "").strip() and not image_path:
+    caption = str(raw_email_body or "").strip()
+    if not caption and not image_path:
         return []
 
-    print("[API READ] Sending raw data payload to local Copilot server...")
+    if not image_path:
+        if _is_quote_without_part_text(caption):
+            print(
+                "[WARN] Quote caption without part number requires a product photo — "
+                "skipping text-only Copilot extraction to avoid guessing."
+            )
+            return []
+        if not caption:
+            return []
+
+    if image_path:
+        print(f"[API READ] Visual extraction using image: {image_path}")
+    else:
+        print("[API READ] Text-only extraction (no image attached)...")
+
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
         api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=30.0,
+        timeout=60.0 if image_path else 30.0,
         max_retries=1,
     )
     system_instruction = (
@@ -85,8 +134,14 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
         "Read printed model/order codes exactly as shown on the label/nameplate in THIS photo only. "
         "Read character-by-character; do not substitute a different catalog number. "
-        "OMRON proximity sensors use E2E- (example E2E-X5E1). OMRON temperature controllers use E5CC-/E5CN-. "
-        "If the label says PROXIMITY SENSOR or shows E2E-, never return E5CC/E5CN. "
+        "OMRON product families on labels: "
+        "E2E- = proximity sensor (example E2E-X5E1); "
+        "H3JA-/H3Y- = timer relay (example H3JA-8A); "
+        "E5CC-/E5CN- = temperature controller; "
+        "MY2/MY4 = relay. "
+        "If the label says TIMER or shows H3JA-, never return E2E/E5CC. "
+        "If the label says PROXIMITY SENSOR or shows E2E-, never return H3JA/E5CC. "
+        "Include supply voltage on the part_no when printed (example H3JA-8A AC200-240). "
         "Match the brand field to the visible manufacturer logo (OMRON, SMC, etc.). "
         "Never reuse a part number from chat history or from a different message. "
         "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
@@ -96,19 +151,20 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
         "a single visible part with '2 pcs' means qty 2. "
         "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
-        "product_type is the visible product description on the label (example: PROXIMITY SENSOR, LIMIT SWITCH). "
+        "product_type is the visible product description on the label (example: TIMER, PROXIMITY SENSOR). "
         "Quantity must be a positive integer. Do not guess missing part numbers. "
         "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
         "Do not include markdown, backticks, or conversational text. "
-        'Example: [{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}, '
-        '{"part_no": "P36203010#1", "qty": 1, "brand": "SMC", "product_type": "CYLINDER"}]'
+        'Example: [{"part_no": "H3JA-8A AC200-240", "qty": 1, "brand": "OMRON", "product_type": "TIMER"}, '
+        '{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}]'
     )
 
     try:
         user_text = (
             "Identify every industrial part in THIS customer message only. "
             "Read only the attached photo and caption below — ignore all prior chat context. "
-            f"Customer caption/text:\n{raw_email_body or '(none)'}"
+            "Transcribe the exact model number printed on the product label/nameplate. "
+            f"Customer caption/text:\n{caption or '(none)'}"
         )
         user_content = user_text
 
@@ -163,7 +219,10 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
                     continue
                 if image_path and not _visual_part_consistent(part_no, brand, product_type):
                     continue
-                extracted_items.append({"part_no": part_no, "qty": qty, "brand": brand})
+                item_out = {"part_no": part_no, "qty": qty, "brand": brand}
+                if product_type:
+                    item_out["product_type"] = product_type
+                extracted_items.append(item_out)
         return extracted_items
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[ERROR] Copilot returned invalid JSON data: {exc}")

@@ -40,7 +40,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.37-VOICE-DOWNLOAD-FIX"
+VERSION = "v3.40-FIX-VISUAL-H3JA-EXTRACTION"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -517,6 +517,26 @@ def registry_entry_for_hint(contact_hint):
             return entry
 
     return None
+
+
+def contact_store_key(contact_name: str = "", contact_hint: str = "") -> str:
+    """Stable key for whatsapp_last_processed.json across aliases."""
+    for hint in (contact_name, contact_hint):
+        entry = registry_entry_for_hint(hint)
+        if entry:
+            canonical = str(entry.get("canonical_name") or "").strip()
+            if canonical:
+                return canonical.lower()
+    return str(contact_name or contact_hint or "").strip().lower()
+
+
+def watch_read_contacts_enabled() -> bool:
+    return os.getenv("OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def resolve_search_hint(contact_hint):
@@ -1693,17 +1713,17 @@ def is_monitor_phone(phone: str) -> bool:
     return digits == monitor or digits.endswith(monitor[-9:])
 
 
-def get_processed_data_ids(contact_name: str) -> set:
+def get_processed_data_ids(contact_name: str = "", contact_hint: str = "") -> set:
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
+    key = contact_store_key(contact_name, contact_hint)
     entry = store.get(key) or {}
     ids = entry.get("processed_data_ids") or []
     return set(str(x) for x in ids if x)
 
 
-def filter_processable_units(units, contact_name: str = ""):
+def filter_processable_units(units, contact_name: str = "", contact_hint: str = ""):
     """Keep only new, non-bot incoming customer messages."""
-    processed_ids = get_processed_data_ids(contact_name)
+    processed_ids = get_processed_data_ids(contact_name, contact_hint)
     kept = []
     for unit in units or []:
         kind = unit.get("kind") or "empty"
@@ -2846,13 +2866,13 @@ def find_image_unit(units):
     return None
 
 
-def plan_sequential_units(units, contact_name: str = ""):
+def plan_sequential_units(units, contact_name: str = "", contact_hint: str = ""):
     """
     When customer sends photo then 'Quote 2 pcs' as separate messages,
     process image bubble first, then text bubble — one at a time.
     Only returns NEW unprocessed units (never the whole lookback window).
     """
-    units = filter_processable_units(units, contact_name)
+    units = filter_processable_units(units, contact_name, contact_hint)
     if not units:
         return []
 
@@ -3058,11 +3078,16 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 continue
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
-            if not copilot_items and not document_items:
+            if not copilot_items and not document_items and not is_quote_without_part_number(unit_text):
                 items = extract_rfq_with_copilot(unit_text, image_path=None)
                 if items:
                     copilot_items = items
                     print(f"   📝 Text step: Copilot extracted {len(items)} item(s)")
+            elif is_quote_without_part_number(unit_text) and not image_path:
+                print(
+                    "   📝 Text step: quote caption without part number — "
+                    "waiting for paired image step (no text-only guess)."
+                )
             else:
                 print("   📝 Text step: caption/qty merged with prior image/document extraction.")
 
@@ -3832,11 +3857,17 @@ def process_customer_inquiry(
     document_items = document_items or []
     image_path = image_analysis.get("image_path") if image_analysis else None
 
-    if pre_extracted_copilot_items:
+    if image_path:
+        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
+        print(
+            f"🤖 Visual extraction from captured photo ({os.path.basename(image_path)}): "
+            f"{len(copilot_items)} item(s)"
+        )
+    elif pre_extracted_copilot_items:
         copilot_items = pre_extracted_copilot_items
         print(f"🤖 Using {len(copilot_items)} item(s) from sequential extraction.")
     else:
-        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
+        copilot_items = extract_rfq_with_copilot(latest_message, image_path=None)
 
     if copilot_items:
         print(f"🤖 Copilot is primary: processing {len(copilot_items)} visually extracted item(s).")
@@ -4137,7 +4168,8 @@ def _process_open_chat_body(driver, raw_contact_name):
                 "ℹ️ No incoming customer messages in this chat lookback window. "
                 "OpenClaw ignores outgoing bubbles (messages sent FROM this WhatsApp account)."
             )
-        plan = plan_sequential_units(units, raw_contact_name)
+        store_key = contact_store_key(raw_contact_name)
+        plan = plan_sequential_units(units, store_key, raw_contact_name)
         bubble = plan[-1]["container"] if plan else None
 
         if not plan:
@@ -4323,7 +4355,12 @@ def _process_open_chat_body(driver, raw_contact_name):
             document_items=document_items,
         )
     finally:
-        finalize_chat_processing(contact_name, plan, voice_ok=voice_ok)
+        finalize_chat_processing(
+            contact_name,
+            plan,
+            voice_ok=voice_ok,
+            contact_hint=raw_contact_name,
+        )
 
 
 def _process_open_chat_legacy_removed(driver):
@@ -4611,19 +4648,23 @@ def save_last_processed_store(store):
 def build_plan_fingerprint(plan):
     parts = []
     for unit in plan or []:
+        data_id = str(unit.get("data_id") or "").strip()
+        if data_id:
+            parts.append(f"id:{data_id}")
+            continue
         parts.append(
-            f"{unit.get('data_id') or ''}|{unit.get('kind') or ''}|"
+            f"{unit.get('incoming_index') or ''}|{unit.get('kind') or ''}|"
             f"{(unit.get('text') or '')[:80]}"
         )
     return "||".join(parts)
 
 
-def build_process_fingerprint(units, contact_name: str = ""):
-    plan = plan_sequential_units(units, contact_name)
+def build_process_fingerprint(units, contact_name: str = "", contact_hint: str = ""):
+    plan = plan_sequential_units(units, contact_name, contact_hint)
     return build_plan_fingerprint(plan)
 
 
-def finalize_chat_processing(contact_name, plan, voice_ok: bool = True):
+def finalize_chat_processing(contact_name, plan, voice_ok: bool = True, contact_hint: str = ""):
     if not plan:
         return
     if not voice_ok:
@@ -4635,37 +4676,50 @@ def finalize_chat_processing(contact_name, plan, voice_ok: bool = True):
         return
     fingerprint = build_plan_fingerprint(plan)
     data_ids = [str(u.get("data_id") or "").strip() for u in plan if u.get("data_id")]
-    mark_watch_contact_processed(contact_name, fingerprint, data_ids)
+    store_key = contact_store_key(contact_name, contact_hint)
+    mark_watch_contact_processed(store_key, fingerprint, data_ids)
     clear_wa_audio_workspace()
 
 
-def should_process_watch_contact(contact_name, fingerprint):
+def should_process_watch_contact(contact_name, fingerprint, plan=None, contact_hint: str = ""):
     if not fingerprint:
         return False
+    store_key = contact_store_key(contact_name, contact_hint)
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
-    prev = store.get(key)
-    if not prev:
-        return True
-    return prev.get("fingerprint") != fingerprint
+    prev = store.get(store_key)
+    if prev and prev.get("fingerprint") == fingerprint:
+        return False
+
+    processed_ids = get_processed_data_ids(store_key)
+    if plan and processed_ids:
+        units_with_ids = [
+            u for u in plan
+            if str(u.get("data_id") or "").strip()
+        ]
+        if units_with_ids and all(
+            str(u.get("data_id") or "").strip() in processed_ids for u in units_with_ids
+        ):
+            return False
+
+    return True
 
 
 def mark_watch_contact_processed(contact_name, fingerprint, data_ids=None):
     if not fingerprint and not data_ids:
         return
+    store_key = contact_store_key(contact_name)
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
-    prev = store.get(key) or {}
+    prev = store.get(store_key) or {}
     prev_ids = list(prev.get("processed_data_ids") or [])
     merged_ids = list(dict.fromkeys([*(data_ids or []), *prev_ids]))[:80]
-    store[key] = {
+    store[store_key] = {
         "fingerprint": fingerprint or prev.get("fingerprint") or "",
         "processed_at": now_iso(),
         "processed_data_ids": merged_ids,
     }
     save_last_processed_store(store)
     if data_ids:
-        print(f"✅ Marked {len(data_ids)} WhatsApp message(s) processed for {contact_name!r}")
+        print(f"✅ Marked {len(data_ids)} WhatsApp message(s) processed for {store_key!r}")
 
 
 def process_watched_contacts(driver, max_contacts: int = 1):
@@ -4699,20 +4753,20 @@ def process_watched_contacts(driver, max_contacts: int = 1):
         raw_contact_name = get_contact_name_from_open_chat(driver)
         units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
         contact_name = raw_contact_name or contact_hint
-        plan = plan_sequential_units(units, contact_name)
+        store_key = contact_store_key(contact_name, contact_hint)
+        plan = plan_sequential_units(units, contact_name, contact_hint)
         if not plan:
             print(f"   ℹ️ {contact_name}: no new unprocessed incoming messages")
             continue
 
         fingerprint = build_plan_fingerprint(plan)
 
-        if not should_process_watch_contact(contact_name, fingerprint):
+        if not should_process_watch_contact(contact_name, fingerprint, plan=plan, contact_hint=contact_hint):
             print(f"   ℹ️ {contact_name}: already processed latest incoming cluster")
             continue
 
         print(f"   🆕 {contact_name}: new incoming detected — processing now")
         process_open_chat(driver)
-        mark_watch_contact_processed(contact_name, fingerprint)
         processed_any = True
         print("↩️ Returning to WhatsApp chat list after watch contact...")
         ensure_on_chat_list(driver)
@@ -4820,9 +4874,12 @@ def watch_unread_with_existing_driver(driver):
 
     if not unread_rows:
         print("✅ No unread WhatsApp chats found.")
-        if process_watched_contacts(driver, max_contacts=1):
+        if watch_read_contacts_enabled() and process_watched_contacts(driver, max_contacts=1):
             return
-        print('ℹ️ To force-process a read chat: uv run python whatsapp_inbox_watcher.py process "Stephen"')
+        print(
+            'ℹ️ To force-process a read chat: uv run python whatsapp_inbox_watcher.py process "Stephen"\n'
+            'ℹ️ To disable read-chat polling: set OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS=0'
+        )
         return
 
     row = unread_rows[0]
@@ -4834,13 +4891,6 @@ def watch_unread_with_existing_driver(driver):
         return
 
     process_open_chat(driver)
-
-    try:
-        contact_name = get_contact_name_from_open_chat(driver)
-        units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
-        mark_watch_contact_processed(contact_name, build_process_fingerprint(units, contact_name))
-    except Exception:
-        pass
 
     print("↩️ Returning to WhatsApp chat list after completed chat...")
     ensure_on_chat_list(driver)
