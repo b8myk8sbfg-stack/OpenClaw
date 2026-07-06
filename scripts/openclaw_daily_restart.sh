@@ -15,17 +15,64 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+stop_pattern() {
+    local pattern="$1"
+    pkill -f "$pattern" 2>/dev/null || true
+}
+
+stop_openclaw_processes() {
+    stop_pattern "$BASE_DIR/openclaw_main.py"
+    stop_pattern "openclaw_main.py"
+    stop_pattern "uv run python openclaw_main.py"
+    stop_pattern "$BASE_DIR/auto_claw.py"
+    stop_pattern "auto_claw.py"
+    stop_pattern "$BASE_DIR/whatsapp_inbox_watcher.py"
+    stop_pattern "whatsapp_inbox_watcher.py"
+}
+
+wait_for_processes_to_exit() {
+    local pattern="$1"
+    local attempts="${2:-15}"
+    local i
+    for ((i = 1; i <= attempts; i++)); do
+        if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+count_openclaw_main() {
+    pgrep -f "openclaw_main.py" 2>/dev/null | wc -l | tr -d ' '
+}
+
 {
     log "=========================================="
     log "OpenClaw daily restart starting"
     log "=========================================="
 
-    log "Stopping OpenClaw processes..."
-    pkill -f "$BASE_DIR/openclaw_main.py" 2>/dev/null || true
-    pkill -f "$BASE_DIR/auto_claw.py" 2>/dev/null || true
-    pkill -f "$BASE_DIR/whatsapp_inbox_watcher.py" 2>/dev/null || true
+    BEFORE_COUNT="$(count_openclaw_main)"
+    if [[ "$BEFORE_COUNT" -gt 0 ]]; then
+        log "Found $BEFORE_COUNT openclaw_main.py process(es) before stop"
+    fi
 
-    sleep 3
+    log "Stopping OpenClaw processes..."
+    stop_openclaw_processes
+    sleep 2
+
+    if ! wait_for_processes_to_exit "openclaw_main.py" 10; then
+        log "Force-killing remaining openclaw_main.py processes..."
+        pkill -9 -f "openclaw_main.py" 2>/dev/null || true
+        sleep 2
+    fi
+
+    REMAINING="$(count_openclaw_main)"
+    if [[ "$REMAINING" -gt 0 ]]; then
+        log "WARN: $REMAINING openclaw_main.py process(es) still running after stop"
+    else
+        log "All openclaw_main.py processes stopped"
+    fi
 
     log "Stopping WhatsApp Chrome / chromedriver..."
     pkill -f "chrome_whatsapp_profile" 2>/dev/null || true
@@ -41,7 +88,11 @@ log() {
     sleep 2
 
     if ps -p "$new_pid" > /dev/null 2>&1; then
-        log "OpenClaw started (PID $new_pid)"
+        AFTER_COUNT="$(count_openclaw_main)"
+        log "OpenClaw started (launcher PID $new_pid, openclaw_main.py processes=$AFTER_COUNT)"
+        if [[ "$AFTER_COUNT" -gt 2 ]]; then
+            log "WARN: expected at most 2 openclaw_main.py processes (uv + python), found $AFTER_COUNT"
+        fi
     else
         log "ERROR: OpenClaw failed to start. Check $MAIN_LOG"
         exit 1
