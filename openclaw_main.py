@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.08-EQUIVALENT-NO-E2E"
+VERSION = "v1.09-QUOTE-FORMAT-PRIVACY"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -686,7 +686,11 @@ def _build_timer_equivalent_reply(items: list, warehouse_context: str) -> str:
     ]
 
     if warehouse_context:
-        lines.extend(["", "We currently have these Ex-Stock / available in our warehouse:", warehouse_context])
+        lines.extend([
+            "",
+            "We currently have matching variants Ex-Stock / available in our warehouse, for example:",
+            warehouse_context,
+        ])
     else:
         lines.extend(["", "We can source the matching H3CR-A8 variant for you."])
 
@@ -829,7 +833,8 @@ def build_technical_support_reply(
         "best modern replacement and explain briefly why. "
         "For OMRON H3JA or H3Y timer relays, the usual modern successor is H3CR-A8 (8-pin socket, DPDT). "
         "ALWAYS prioritise recommending parts listed in the warehouse stock section below. "
-        "If we have Ex-Stock quantity, say so. Do not recommend external distributors if we stock a suitable item. "
+        "If we have Ex-Stock, say Ex-Stock is available — never disclose warehouse quantity numbers. "
+        "Do not recommend external distributors if we stock a suitable item. "
         "Only if the time range on the dial or timing mode is not visible on the label, ask 1-2 short clarifying questions. "
         "Plain text only. No markdown, no hyperlinks, no asterisks. Friendly professional tone. Under 280 words."
     )

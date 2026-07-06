@@ -299,7 +299,27 @@ def search_warehouse_stock_rows(part_no, brand="UNKNOWN", limit=8):
     return hits[:limit]
 
 
-def build_warehouse_support_context(message_text: str, part_refs=None) -> tuple:
+def parse_qty_from_caption(text: str, default: int = 1) -> int:
+    """Parse requested quantity from a customer caption; default to 1 pc when absent."""
+    text_u = str(text or "").upper()
+    patterns = (
+        r"\b(?:QTY|QUANTITY)\s*[:;]?\s*(\d{1,4})\b",
+        r"\b(\d{1,4})\s*(?:PCS|PC|PCE|PIECES|PIECE|UNIT|UNITS|EA|EACH|KE|BUAH)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text_u)
+        if match:
+            qty = int(match.group(1))
+            if qty > 0:
+                return qty
+    try:
+        qty = int(default or 1)
+    except (TypeError, ValueError):
+        qty = 1
+    return max(1, qty)
+
+
+def build_warehouse_support_context(message_text: str, part_refs=None, max_lines: int = 4) -> tuple:
     """Build warehouse stock context for technical support, prioritising in-stock SKUs."""
     parts = part_refs or extract_part_references_from_text(message_text)
     text_u = str(message_text or "").upper()
@@ -330,9 +350,13 @@ def build_warehouse_support_context(message_text: str, part_refs=None) -> tuple:
             stock_label = str(row.get("stock_name") or key).strip()
             brand_label = str(row.get("brand") or brand or "").strip()
             if qty > 0:
-                lines.append(f"- {brand_label} {stock_label} — Ex-Stock (warehouse qty {qty})")
+                lines.append(f"- {brand_label} {stock_label} — Ex-Stock")
             else:
-                lines.append(f"- {brand_label} {stock_label} — available to source (warehouse qty 0)")
+                lines.append(f"- {brand_label} {stock_label} — available to source")
+            if len(lines) >= max_lines:
+                break
+        if len(lines) >= max_lines:
+            break
 
     return parts, "\n".join(lines)
 
@@ -952,12 +976,6 @@ def process_inquiry_text(inquiry_text):
 
 def build_plain_quotation_reply(rows, ai_research=None):
     msg = "Hi, thank you for your inquiry.\n\n"
-
-    if ai_research:
-        msg += "Product information:\n"
-        msg += str(ai_research).strip()
-        msg += "\n\n"
-
     msg += "Here is the initial status:\n\n"
 
     total = 0.0
@@ -1004,4 +1022,9 @@ def build_plain_quotation_reply(rows, ai_research=None):
         )
 
     msg += "Items marked [TBC] will be verified and updated shortly."
+
+    if ai_research:
+        msg += "\n\nProduct information:\n"
+        msg += str(ai_research).strip()
+
     return msg

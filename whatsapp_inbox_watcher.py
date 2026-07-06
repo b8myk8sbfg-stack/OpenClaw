@@ -18,6 +18,7 @@ from selenium.webdriver.chrome.options import Options
 
 from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
+    parse_qty_from_caption,
     process_inquiry_text,
     process_structured_items,
 )
@@ -3908,16 +3909,17 @@ def process_customer_inquiry(
             part_norm = re.sub(r"[^A-Z0-9]", "", part_no)
             if not part_norm or part_norm in existing_norms:
                 continue
+            qty = parse_qty_from_caption(latest_message, default=int(item.get("qty") or 1))
             structured_items.append({
                 "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
                 "part_no": part_no,
                 "desc": part_no,
-                "qty": int(item["qty"]),
+                "qty": qty,
                 "norm": part_norm,
                 "source": "COPILOT_VISUAL" if image_path else "COPILOT_TEXT",
             })
             existing_norms.add(part_norm)
-            print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {item['qty']}")
+            print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {qty}")
 
         formatted_rows, tbc_by_brand, skipped = process_structured_items(structured_items)
         result = {
