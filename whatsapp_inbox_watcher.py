@@ -28,6 +28,7 @@ from openclaw_main import (
     extract_rfq_with_copilot,
     build_ai_research_summary,
     build_technical_support_reply,
+    _resolve_visual_items,
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
@@ -3016,7 +3017,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             image_path = capture_bubble_image(
                 driver, container, contact_name, message_data_id=message_data_id
             )
-            items = extract_rfq_with_copilot(caption, image_path=image_path)
+            items = _resolve_visual_items(caption, image_path=image_path, copilot_items=None)
             if items:
                 copilot_items = items
                 print(f"   👁️ Image step: Copilot extracted {len(items)} item(s)")

@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.04-TECH-SUPPORT-VISION"
+VERSION = "v1.05-TECH-SUPPORT-LABEL-OCR"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -155,8 +155,7 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
         "Quantity must be a positive integer. Do not guess missing part numbers. "
         "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
         "Do not include markdown, backticks, or conversational text. "
-        'Example: [{"part_no": "H3JA-8A AC200-240", "qty": 1, "brand": "OMRON", "product_type": "TIMER"}, '
-        '{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}]'
+        'Example: [{"part_no": "H3JA-8A AC200-240", "qty": 1, "brand": "OMRON", "product_type": "TIMER"}]'
     )
 
     try:
@@ -314,6 +313,244 @@ def _part_refs_from_copilot_items(copilot_items) -> list:
     return refs
 
 
+def _is_timer_visual_item(item: dict) -> bool:
+    part_key = _normalize_part_key(item.get("part_no"))
+    product_type = str(item.get("product_type") or "").upper()
+    return "TIMER" in product_type or part_key.startswith("H3J") or part_key.startswith("H3Y")
+
+
+def _filter_conflicting_visual_items(items: list) -> list:
+    """Drop cross-family hallucinations (e.g. E2E when label is a timer)."""
+    items = [item for item in (items or []) if isinstance(item, dict) and item.get("part_no")]
+    if not items:
+        return []
+
+    has_timer = any(_is_timer_visual_item(item) for item in items)
+    if has_timer:
+        filtered = [
+            item for item in items
+            if not _normalize_part_key(item.get("part_no")).startswith("E2E")
+        ]
+        if filtered:
+            return filtered
+
+    has_proximity = any(
+        "PROXIMITY" in str(item.get("product_type") or "").upper()
+        or "SENSOR" in str(item.get("product_type") or "").upper()
+        or _normalize_part_key(item.get("part_no")).startswith("E2E")
+        for item in items
+    )
+    if has_proximity:
+        filtered = [
+            item for item in items
+            if not (
+                _normalize_part_key(item.get("part_no")).startswith("H3J")
+                or _normalize_part_key(item.get("part_no")).startswith("H3Y")
+            )
+        ]
+        if filtered:
+            return filtered
+
+    return items
+
+
+def extract_label_from_image(caption: str = "", image_path: str = None) -> dict:
+    """OCR-style label read for tech support — one product label per photo."""
+    if not image_path or not os.path.exists(image_path):
+        return {}
+
+    print(f"[COPILOT LABEL OCR] Reading nameplate from: {image_path}")
+    client = OpenAI(
+        base_url=COPILOT_BASE_URL,
+        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
+        timeout=60.0,
+        max_retries=1,
+    )
+    system_instruction = (
+        "You transcribe industrial product labels from photos. "
+        "Read the largest printed model/order code character-by-character from the nameplate. "
+        "Do not guess or substitute a different catalog number. "
+        "If the label says TIMER or H3JA-/H3Y-, the model is a timer relay — never E2E/E5CC. "
+        "If the label says PROXIMITY SENSOR or E2E-, it is a proximity sensor — never H3JA/H3Y. "
+        "Return STRICTLY one raw JSON object with keys: "
+        "part_no, brand, product_type, supply_voltage. "
+        "part_no must match the label exactly (include AC/DC voltage suffix when printed). "
+        "product_type is the printed description (TIMER, PROXIMITY SENSOR, etc.). "
+        "supply_voltage is the printed source rating when visible, else empty string. "
+        "No markdown, no array, no extra keys."
+    )
+    user_text = (
+        "Transcribe the product label in THIS photo only. "
+        "Read character-by-character — e.g. H3JA-8A is H-3-J-A-8-A, not E2E-X5E1. "
+        f"Customer caption:\n{caption or '(none)'}"
+    )
+
+    try:
+        with open(image_path, "rb") as image_file:
+            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+        user_content = [
+            {"type": "text", "text": user_text},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{image_b64}",
+                    "detail": "high",
+                },
+            },
+        ]
+        response = client.chat.completions.create(
+            model=COPILOT_MODEL,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        raw_content = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT LABEL OCR RAW] {raw_content}")
+        if raw_content.startswith("```"):
+            lines = raw_content.splitlines()
+            raw_content = "\n".join(lines[1:-1]).strip()
+
+        parsed = json.loads(raw_content)
+        if not isinstance(parsed, dict):
+            return {}
+
+        part_no = str(parsed.get("part_no") or "").strip().upper()
+        if not part_no:
+            return {}
+
+        brand = str(parsed.get("brand") or "UNKNOWN").strip().upper()
+        product_type = str(parsed.get("product_type") or "").strip().upper()
+        supply_voltage = str(parsed.get("supply_voltage") or "").strip()
+
+        if not _visual_part_consistent(part_no, brand, product_type):
+            return {}
+
+        item = {
+            "part_no": part_no,
+            "qty": 1,
+            "brand": brand,
+            "product_type": product_type,
+        }
+        if supply_voltage:
+            item["supply_voltage"] = supply_voltage
+        print(f"[COPILOT LABEL OCR] Identified {brand} {part_no} ({product_type})")
+        return item
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"[WARN] Label OCR returned invalid JSON: {exc}")
+    except Exception as exc:
+        print(f"[WARN] Label OCR failed: {exc}")
+    return {}
+
+
+def _reconcile_visual_items(existing_items: list, label_item: dict) -> list:
+    """Prefer dedicated label OCR over generic RFQ extraction."""
+    label_part = str(label_item.get("part_no") or "").strip().upper()
+    label_key = _normalize_part_key(label_part)
+    if not label_key:
+        return _filter_conflicting_visual_items(existing_items)
+
+    filtered = []
+    for item in existing_items or []:
+        part_key = _normalize_part_key(item.get("part_no"))
+        if label_key.startswith("H3J") and part_key.startswith("E2E"):
+            print(f"[COPILOT TECH SUPPORT] Dropping wrong E2E extraction — label says {label_part}")
+            continue
+        if _is_timer_visual_item(label_item) and part_key.startswith("E2E"):
+            print(f"[COPILOT TECH SUPPORT] Dropping E2E — label OCR says TIMER {label_part}")
+            continue
+        filtered.append(item)
+
+    if not any(_normalize_part_key(item.get("part_no")) == label_key for item in filtered):
+        filtered.insert(0, label_item)
+    return _filter_conflicting_visual_items(filtered)
+
+
+def _resolve_visual_items(caption: str, image_path: str = None, copilot_items: list = None) -> list:
+    """Merge prior extraction, label OCR, and RFQ visual extraction."""
+    items = list(copilot_items or [])
+
+    if image_path and os.path.exists(image_path):
+        label_item = extract_label_from_image(caption, image_path=image_path)
+        if label_item:
+            items = _reconcile_visual_items(items, label_item)
+        elif not items:
+            print("[COPILOT TECH SUPPORT] Label OCR empty — trying RFQ visual extraction...")
+            items = extract_rfq_with_copilot(caption, image_path=image_path)
+
+    return _filter_conflicting_visual_items(items)
+
+
+def _timer_voltage_note(part_no: str) -> str:
+    part_u = str(part_no or "").upper()
+    if re.search(r"200[\s\-]*(?:TO[\s\-]*)?240|AC200.?240", part_u):
+        return "200-240VAC"
+    if re.search(r"100[\s\-]*(?:TO[\s\-]*)?120|AC100.?120", part_u):
+        return "100-120VAC"
+    if re.search(r"\bDC24\b", part_u):
+        return "DC24V"
+    if re.search(r"\bAC24\b", part_u):
+        return "AC24V"
+    return ""
+
+
+def _build_timer_equivalent_reply(items: list, warehouse_context: str) -> str:
+    """Deterministic reply for OMRON H3JA/H3Y timer equivalent requests."""
+    primary = items[0]
+    part_no = str(primary.get("part_no") or "").strip().upper()
+    brand = str(primary.get("brand") or "OMRON").strip().upper()
+    base_match = re.search(r"(H3J[AY]-\d+[A-Z]?)", part_no, re.I)
+    base_model = base_match.group(1).upper() if base_match else part_no.split()[0]
+    voltage_note = _timer_voltage_note(part_no)
+
+    lines = [
+        "Hi, thank you for reaching out.",
+        "",
+        f"From your photo this is an {brand} {base_model} timer relay"
+        + (
+            f" ({voltage_note}, 8-pin octal base, DPDT contacts, 7A 250VAC resistive)."
+            if voltage_note
+            else " (8-pin octal base, DPDT contacts)."
+        ),
+        "",
+        f"The modern direct equivalent / successor is the {brand} H3CR-A8 series "
+        "(same 8-pin socket, improved accuracy and easier setting).",
+    ]
+
+    if warehouse_context:
+        lines.extend(["", "We currently have these Ex-Stock / available in our warehouse:", warehouse_context])
+    else:
+        lines.extend(["", "We can source the matching H3CR-A8 variant for you."])
+
+    lines.extend([
+        "",
+        "If you can share the time range on the dial (e.g. 5S, 30S, 3M) and whether "
+        "you need ON-delay or OFF-delay, I can match the exact H3CR-A8 variant for you.",
+    ])
+    return "\n".join(lines)
+
+
+def _sanitize_whatsapp_reply(text: str) -> str:
+    """Strip markdown links/formatting Copilot sometimes adds."""
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = cleaned.replace("*", "")
+    return cleaned.strip()
+
+
+def _reply_contradicts_visual_items(reply: str, items: list) -> bool:
+    reply_u = str(reply or "").upper()
+    for item in items or []:
+        if not _is_timer_visual_item(item):
+            continue
+        part_key = _normalize_part_key(item.get("part_no"))
+        if part_key.startswith("H3J") and re.search(r"\bE2E[\s\-]?X5E1\b", reply_u):
+            print("[COPILOT TECH SUPPORT] Reply contradicts timer label — mentions E2E-X5E1")
+            return True
+    return False
+
+
 def build_technical_support_reply(
     message_text: str = "",
     image_path: str = None,
@@ -329,28 +566,32 @@ def build_technical_support_reply(
     if not message_text and not image_path:
         return ""
 
-    part_refs = _part_refs_from_copilot_items(copilot_items)
-    if not part_refs and image_path and os.path.exists(image_path):
-        print("[COPILOT TECH SUPPORT] Running visual label extraction before reply...")
-        visual_items = extract_rfq_with_copilot(message_text, image_path=image_path)
-        part_refs = _part_refs_from_copilot_items(visual_items)
+    visual_items = _resolve_visual_items(message_text, image_path=image_path, copilot_items=copilot_items)
+    part_refs = _part_refs_from_copilot_items(visual_items)
 
     part_refs, warehouse_context = build_warehouse_support_context(
         message_text,
         part_refs=part_refs if part_refs else None,
     )
+
+    if visual_items and all(_is_timer_visual_item(item) for item in visual_items):
+        print("[COPILOT TECH SUPPORT] Timer detected — using deterministic equivalent reply")
+        return _build_timer_equivalent_reply(visual_items, warehouse_context)
+
     if part_refs:
         parts_label = ", ".join(part_refs)
         identification_note = (
             f"Model identified from customer text/label: {parts_label}. "
-            "State this model clearly in your reply."
+            "You MUST state this exact model in your reply. "
+            "Do NOT substitute a different part family (e.g. never say E2E if the label is H3JA)."
         )
     else:
         parts_label = "(not yet identified from text)"
         identification_note = (
             "No part number in the customer text. You MUST read the attached product "
             "label/nameplate and state the exact printed model number (e.g. OMRON H3JA-8A). "
-            "Do not ask the customer to re-send the model if it is clearly visible on the label."
+            "Do not ask the customer to re-send the model if it is clearly visible on the label. "
+            "Never guess E2E-X5E1 unless that exact code is printed on the label."
         )
 
     print(f"[COPILOT TECH SUPPORT] Parts detected: {parts_label}")
@@ -360,24 +601,21 @@ def build_technical_support_reply(
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
         api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=75.0 if image_path else 60.0,
+        timeout=60.0,
         max_retries=1,
     )
 
     system_prompt = (
         "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
         "Answer customer technical support questions clearly and practically on WhatsApp. "
-        "When a product photo is attached, read the label/nameplate first and identify the exact "
-        "printed model number before answering. "
+        "Use ONLY the identified model from the label — never invent or substitute a different catalog number. "
         "When the customer asks for an equivalent, replacement, or successor part, recommend the "
         "best modern replacement and explain briefly why. "
         "For OMRON H3JA or H3Y timer relays, the usual modern successor is H3CR-A8 (8-pin socket, DPDT). "
         "ALWAYS prioritise recommending parts listed in the warehouse stock section below. "
         "If we have Ex-Stock quantity, say so. Do not recommend external distributors if we stock a suitable item. "
-        "Only if the time range on the dial or timing mode (ON-delay, OFF-delay, interval) is not visible "
-        "on the label, ask 1-2 short clarifying questions. "
-        "Never tell the customer you could not identify the model when the label is clearly readable. "
-        "Plain text only. No markdown code fences. Friendly professional tone. Under 280 words."
+        "Only if the time range on the dial or timing mode is not visible on the label, ask 1-2 short clarifying questions. "
+        "Plain text only. No markdown, no hyperlinks, no asterisks. Friendly professional tone. Under 280 words."
     )
 
     user_prompt = (
@@ -388,36 +626,24 @@ def build_technical_support_reply(
         "Write the WhatsApp reply to the customer now."
     )
 
-    user_content = user_prompt
-    if image_path and os.path.exists(image_path):
-        print(f"[COPILOT TECH SUPPORT] Including photo: {image_path}")
-        with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
-        user_content = [
-            {"type": "text", "text": user_prompt},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{image_b64}",
-                    "detail": "high",
-                },
-            },
-        ]
-
     try:
         response = client.chat.completions.create(
             model=COPILOT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
+                {"role": "user", "content": user_prompt},
             ],
         )
-        text = (response.choices[0].message.content or "").strip()
+        text = _sanitize_whatsapp_reply(response.choices[0].message.content or "")
         if text.startswith("```"):
             lines = text.splitlines()
-            text = "\n".join(lines[1:-1]).strip()
+            text = _sanitize_whatsapp_reply("\n".join(lines[1:-1]))
         if not text:
+            return ""
+        if visual_items and _reply_contradicts_visual_items(text, visual_items):
+            if any(_is_timer_visual_item(item) for item in visual_items):
+                print("[COPILOT TECH SUPPORT] Regenerating with deterministic timer template")
+                return _build_timer_equivalent_reply(visual_items, warehouse_context)
             return ""
         if not text.lower().startswith("hi"):
             text = f"Hi, thank you for reaching out.\n\n{text}"
@@ -425,6 +651,8 @@ def build_technical_support_reply(
         return text
     except Exception as exc:
         print(f"[WARN] Copilot technical support failed: {exc}")
+        if visual_items and any(_is_timer_visual_item(item) for item in visual_items):
+            return _build_timer_equivalent_reply(visual_items, warehouse_context)
         return ""
 
 
