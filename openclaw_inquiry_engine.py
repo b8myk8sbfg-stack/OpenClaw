@@ -635,10 +635,10 @@ def build_rows_from_api(api_id, qty, customer_part=None):
     rows = []
     supplier_item = None
 
-    if usable_store_qty > 0 and cost > 0:
+    if usable_store_qty > 0:
         quoted_qty = min(requested_qty, usable_store_qty)
         balance_qty = max(requested_qty - quoted_qty, 0)
-        sell_price = cost / 0.8
+        sell_price = (cost / 0.8) if cost > 0 else None
 
         stock_source = (
             "WAREHOUSE_CSV_STOCK_FALLBACK"
@@ -654,7 +654,7 @@ def build_rows_from_api(api_id, qty, customer_part=None):
         rows.append({
             "desc": full_desc,
             "qty": quoted_qty,
-            "price": f"{sell_price:,.2f}",
+            "price": f"{sell_price:,.2f}" if sell_price is not None else "[TBC]",
             "lt": stock_lead_time,
             "pid": api_id,
             "brand": brand,
@@ -663,12 +663,17 @@ def build_rows_from_api(api_id, qty, customer_part=None):
             "needs_supplier": False,
         })
 
-        print(f"   ✅ Warehouse stock available. Quoting Qty {quoted_qty} at RM {sell_price:,.2f}")
+        if sell_price is not None:
+            print(f"   ✅ Warehouse stock available. Quoting Qty {quoted_qty} at RM {sell_price:,.2f}")
+        else:
+            print(
+                f"   ✅ Warehouse stock available. Quoting Qty {quoted_qty} Ex-Stock "
+                "(unit price TBC — no purchase cost on file)"
+            )
 
         if balance_qty > 0:
-            balance_desc = f"{full_desc} (Balance Qty)"
             rows.append({
-                "desc": balance_desc,
+                "desc": full_desc,
                 "qty": balance_qty,
                 "price": "[TBC]",
                 "lt": "[TBC]",
@@ -680,17 +685,20 @@ def build_rows_from_api(api_id, qty, customer_part=None):
             })
 
             supplier_item = {
-                "desc": balance_desc,
+                "desc": full_desc,
                 "qty": balance_qty,
                 "pid": api_id,
                 "brand": brand,
             }
 
-            print(f"   ⚠️ Requested Qty exceeds STORE stock. Balance Qty {balance_qty} added to supplier RFQ.")
+            print(
+                f"   ⚠️ Requested qty {requested_qty} exceeds STORE stock {usable_store_qty}. "
+                f"Balance qty {balance_qty} quoted as [TBC]."
+            )
 
         return rows, supplier_item
 
-    print("   ⚠️ No usable STORE stock or no cost. Full quantity added to supplier RFQ queue.")
+    print("   ⚠️ No usable STORE stock. Full quantity added to supplier RFQ queue.")
 
     rows.append({
         "desc": full_desc if full_desc else api_id,
@@ -841,6 +849,8 @@ def build_plain_quotation_reply(rows, ai_research=None):
 
     total = 0.0
     has_total = False
+    has_ex_stock = False
+    has_tbc_balance = False
 
     for row in rows:
         desc = row.get("desc", "")
@@ -851,6 +861,11 @@ def build_plain_quotation_reply(rows, ai_research=None):
         qty = int(row.get("qty", 1))
         price = row.get("price", "[TBC]")
         lt = row.get("lt", "[TBC]")
+
+        if str(lt).startswith("Ex-Stock"):
+            has_ex_stock = True
+        if price == "[TBC]" and str(lt) == "[TBC]":
+            has_tbc_balance = True
 
         msg += f"- {desc}\n"
         msg += f"  Qty: {qty}\n"
@@ -868,6 +883,12 @@ def build_plain_quotation_reply(rows, ai_research=None):
 
     if has_total:
         msg += f"Total available quoted amount: RM {total:,.2f}\n\n"
+
+    if has_ex_stock and has_tbc_balance:
+        msg += (
+            "Available STORE quantity is quoted Ex-Stock above. "
+            "Any remaining quantity is marked [TBC] and will be verified shortly.\n\n"
+        )
 
     msg += "Items marked [TBC] will be verified and updated shortly."
     return msg
