@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.32-BATTERY-FOREGROUND-FIX"
+VERSION = "v1.33-COPILOT-SINGLE-PASS"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -65,90 +65,6 @@ def _normalize_part_key(part_no: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
 
 
-def _is_quote_without_part_text(text: str) -> bool:
-    """True for captions like 'Quote me 2 pcs' with no embedded part number."""
-    text_u = str(text or "").upper().strip()
-    if not text_u:
-        return False
-    if not re.search(r"\b(QUOTE|QUOTATION|RFQ|ENQ|PRICE|PLS QUOTE|KINDLY QUOTE|QUOTE ME)\b", text_u):
-        return False
-    if re.search(r"[A-Z]{1,4}\d{3,}[A-Z0-9#\-/]*", text_u):
-        return False
-    if re.search(r"\b(QTY|PCS|PC|PIECES|PIECE|EA|EACH|UNIT|UNITS)\b", text_u):
-        return True
-    return len(text_u) < 80
-
-
-def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool:
-    """Reject obvious vision mismatches between label type and model family."""
-    part_u = str(part_no or "").upper().strip()
-    part_key = _normalize_part_key(part_u)
-    brand_u = str(brand or "").upper().strip()
-    type_u = str(product_type or "").upper().strip()
-
-    if not part_u:
-        return False
-
-    if (
-        "BATTERY" in type_u
-        or "LITHIUM" in type_u
-        or part_key.startswith("ER")
-        or part_key.startswith("CR")
-    ):
-        return True
-
-    if type_u:
-        if "PROXIMITY" in type_u and not part_key.startswith("E2E"):
-            print(
-                f"[WARN] Visual mismatch: label type {product_type!r} "
-                f"does not match part {part_no!r}"
-            )
-            return False
-        if "TIMER" in type_u and not (part_key.startswith("H3J") or part_key.startswith("H3Y")):
-            print(
-                f"[WARN] Visual mismatch: label type {product_type!r} "
-                f"does not match part {part_no!r}"
-            )
-            return False
-        if "TEMPERATURE CONTROLLER" in type_u and not (
-            part_key.startswith("E5CC") or part_key.startswith("E5CN")
-        ):
-            print(
-                f"[WARN] Visual mismatch: label type {product_type!r} "
-                f"does not match part {part_no!r}"
-            )
-            return False
-        if "LIMIT SWITCH" in type_u and not part_key.startswith("WLD"):
-            print(
-                f"[WARN] Visual mismatch: label type {product_type!r} "
-                f"does not match part {part_no!r}"
-            )
-            return False
-
-    if brand_u == "OMRON" and part_key.startswith("E5CC") and type_u and "TEMPERATURE" not in type_u:
-        print(
-            f"[WARN] OMRON part {part_no!r} looks like a temperature controller "
-            "but label type was not temperature controller."
-        )
-        return False
-
-    if part_key.startswith("E2E") and type_u and "PROXIMITY" not in type_u and "SENSOR" not in type_u:
-        print(
-            f"[WARN] OMRON E2E part {part_no!r} rejected — label type was {product_type!r}, "
-            "not a proximity sensor."
-        )
-        return False
-
-    if (part_key.startswith("H3J") or part_key.startswith("H3Y")) and type_u and "TIMER" not in type_u:
-        print(
-            f"[WARN] OMRON timer part {part_no!r} rejected — label type was {product_type!r}, "
-            "not a timer."
-        )
-        return False
-
-    return True
-
-
 COPILOT_ANALYZE_INTENTS = {
     "rfq_inquiry",
     "technical_support",
@@ -190,186 +106,34 @@ def _normalize_copilot_intent(intent: str) -> str:
 
 OPENCLAW_UNIFIED_PROMPT = """NEW INQUIRY
 
-Analyze ONLY the attached message/image.
-Do NOT use information from previous conversations.
+Analyze ONLY this attached message and/or image. Do not use prior conversations or catalog memory.
+
+You are the vision expert. Look at the image yourself and decide what the customer is asking about.
 
 Tasks:
-1. Classify the message:
-   - Request for Quotation (RFQ)
-   - Technical Support
-   - Purchase Order
-   - Voice Message (transcribe first if WAV)
-   - Junk Advertisement
-   - Promotion Pamphlet
+1. Classify intent: rfq_inquiry | technical_support | purchase_order | junk_ad | greeting | general_chat | unknown
+2. Identify the product the customer wants quoted or discussed.
+3. Transcribe the exact model/part code on that product's label, character by character. Never substitute a different catalog number.
+4. Describe what is in the foreground vs background. Quote the foreground subject, not background equipment.
+5. Extract quantity from caption or image (default 1).
+6. Summarize technical details for the identified product.
 
-2. Extract all important details.
+Image guidance:
+- Photo + short caption (e.g. "quote me 1 pc") usually shows ONE product — the item held in hand or closest to the camera.
+- Ignore background wiring, terminal blocks, and panel equipment unless the customer is clearly quoting those.
+- RFQ/enquiry tables: read only rows visible in the image; count rows; do not invent extra line items.
+- Equivalent/replacement requests: intent=technical_support unless they also ask for price/quote.
 
-3. Determine whether the item is used in Industrial Automation.
+Return plain-text analysis first. Include:
+- What product is in the foreground (what the customer is quoting)
+- Exact label transcription (character by character)
+- What background items you are ignoring
 
-4. Check whether it belongs to or is commonly associated with these brands:
-Omron, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, etc.
+On the very last line only, append one JSON object (no markdown fences):
+{"intent":"rfq_inquiry","confidence":0.9,"visual_analysis":{"foreground_subject":"...","label_transcription":"...","background_ignored":"..."},"items":[{"part_no":"EXACT-CODE","qty":1,"brand":"BRAND","product_type":"TYPE"}],"technical_summary":"...","is_industrial_automation":true,"compatible_brands":[],"reasoning":"..."}
 
-5. Provide technical specifications.
-
-If the attached image shows an RFQ / enquiry table (columns such as No, Item, Picture, Qty):
-- The customer caption may only say "PLS QUOTE" — part numbers and quantities are IN THE IMAGE.
-- Read the Item column text AND any product label/nameplate in the Picture column.
-- Read the Qty column for quantity (default 1 if not shown).
-- Example row: Item "Allen-Bradley Soft Starter Model 150-C25NBD", Qty 3
-  → part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
-- Transcribe model codes character-by-character from labels (e.g. CAT 150-C25NBD).
-
-If the caption says "find equivalent", "replacement", "substitute", or "successor":
-- intent MUST be technical_support (NOT rfq_inquiry) unless they also ask for price/quote.
-- Still read the exact model printed on the product label in the image (e.g. H3JA-8A timer).
-
-Return the result in plain text.
-
-On the very last line only (after your plain-text analysis), append one JSON object with no markdown fences:
-{"intent":"rfq_inquiry","confidence":0.9,"items":[{"part_no":"MODEL","qty":1,"brand":"BRAND","product_type":"TYPE"}],"technical_summary":"...","is_industrial_automation":true,"compatible_brands":[],"reasoning":"..."}
-
-intent must be one of: rfq_inquiry, technical_support, purchase_order, junk_ad, greeting, general_chat, unknown
-confidence must be a number from 0.0 to 1.0
-items must be an array of objects with keys part_no, qty, brand, product_type
+items: one entry per distinct part the customer is inquiring about. part_no must match the label transcription.
 """
-
-RFQ_TABLE_FOCUS_PROMPT = """NEW INQUIRY
-
-This is a brand-new RFQ photo. Analyze ONLY the attached image in this message.
-Do NOT use information from previous conversations, chat history, or typical catalog examples.
-
-The WhatsApp caption may only say "MORNING MS AMEERA PLS QUOTE". All part numbers must come from THIS image only.
-
-STEP 1 — Count how many table data rows are actually visible (columns: No, Item, Picture, Qty).
-STEP 2 — Extract one item per visible row ONLY. If only ONE row is visible, return exactly ONE item.
-
-Read each visible row:
-- part_no from Item column text AND/OR the product label in the Picture column
-- qty from the Qty column (exact number printed)
-- brand from Item text or nameplate (e.g. ALLEN-BRADLEY)
-
-Example when ONE row is visible:
-Allen-Bradley Soft Starter Model 150-C25NBD, Qty 3
-→ row_count=1, part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
-
-NEVER invent extra rows. If the table shows only No=1, do NOT add H3CR-A8, SY3120, PZ-V31, CDQ2B, E3Z-T61, or any part not printed in this image.
-NEVER return parts from memory or prior RFQ examples — only what you can read in this photo.
-
-Return plain-text analysis (include visible row count), then on the last line only append JSON (no markdown):
-{"row_count":1,"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
-"""
-
-RFQ_TABLE_VERIFY_PROMPT = """NEW INQUIRY
-
-Re-read ONLY the attached RFQ table image. Ignore all prior analysis and conversation history.
-
-Your job: count visible table rows, then list ONLY those rows — nothing else.
-
-1. How many data rows with No/Item/Qty are visible in THIS photo? (Often just 1 row.)
-2. For each visible row only, extract part_no, qty, brand from text printed in that row.
-
-If you see only ONE row (e.g. No=1, Allen-Bradley 150-C25NBD, Qty=3):
-→ row_count MUST be 1 and items array MUST have exactly 1 object.
-
-Do NOT add rows for H3CR-A8, SY3120, PZ-V31, 3RT2026, VQZ3121, CDQ2B, E3Z-T61 unless that exact part is printed in a visible table row in this image.
-
-Return plain-text (state visible row count first), then JSON on the last line only:
-{"row_count":1,"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
-"""
-
-LABEL_FOCUS_PROMPT = """NEW INQUIRY
-
-This is a brand-new product label photo. Analyze ONLY this attached image.
-Do NOT use prior conversations, chat history, or catalog memory.
-
-The customer shows ONE product in the foreground (any industrial part: battery, timer, sensor, cylinder, relay, starter, etc.).
-The quoted product is usually HELD IN HAND or closest to the camera — read THAT label only.
-Ignore background PLC wiring, terminal blocks, control panels, timers, and unrelated equipment behind the subject.
-
-A small cylindrical cell with "Lithium" text (e.g. ER6C (AA) 3.6V) is a BATTERY — not an OMRON H3JA timer in the background.
-
-Read the exact model/code printed on the product label character-by-character.
-Extract brand from the label when visible. Default qty 1 unless caption states otherwise.
-
-Return plain-text analysis of what you read on the label, then on the last line only append JSON (no markdown):
-{"items":[{"part_no":"EXACT-CODE-FROM-LABEL","qty":1,"brand":"BRAND","product_type":"PRODUCT TYPE"}],"technical_summary":"..."}
-"""
-
-LABEL_VERIFY_PROMPT = """NEW INQUIRY
-
-Independent verification — re-read ONLY the attached product label photo.
-Ignore all prior analysis, guesses, and conversation history.
-
-Step 1: What ONE product is in the foreground? (any type — battery, timer, sensor, valve, relay, etc.)
-Step 2: Transcribe the exact part/model code printed on the label character-by-character.
-Step 3: State brand and product type from what is printed on the label.
-
-Rules:
-- Return ONLY what you can read in this image — never invent or substitute a catalog part.
-- Background wiring/equipment/panel timers are NOT the product — read the foreground label only.
-- A cylindrical "Lithium" cell (ER6C, ER17500, CR123A, etc.) held in hand is a battery, not H3JA.
-- If the caption asks for a quote, qty defaults to 1 unless printed on the label.
-
-Return plain-text (include your character-by-character transcription), then JSON on the last line only:
-{"items":[{"part_no":"EXACT-CODE-FROM-LABEL","qty":1,"brand":"BRAND","product_type":"PRODUCT TYPE"}],"technical_summary":"..."}
-"""
-
-
-def _is_single_product_photo_inquiry(message_text: str) -> bool:
-    """True for 'quote me 1 pce' style — one product label photo, not an RFQ table."""
-    text = str(message_text or "").upper()
-    return bool(
-        re.search(
-            r"\b(QUOTE ME|(?:^|\s)1\s*(?:PCE|PC|PCS|PIECE|PIECES)|ONE PCE|ONE PC)\b",
-            text,
-        )
-    )
-
-
-def _is_rfq_table_inquiry(message_text: str) -> bool:
-    """True for RFQ table photos (PLS QUOTE / MORNING MS) — not single label photos."""
-    if _is_single_product_photo_inquiry(message_text):
-        return False
-    text = str(message_text or "").upper()
-    return bool(
-        re.search(
-            r"\b(PLS QUOTE|KINDLY QUOTE|MORNING MS|RFQ|ENQUIRY TABLE)\b",
-            text,
-        )
-    )
-
-
-def _should_run_rfq_table_focus(message_text: str = "", analysis_text: str = "") -> bool:
-    """RFQ table focus only for table-style quote requests — not single label photos."""
-    if _is_rfq_table_inquiry(message_text):
-        return True
-    blob = f"{message_text}\n{analysis_text}".upper()
-    return bool(re.search(r"\b(RFQ|QTY\s*3|ENQUIRY TABLE)\b", blob))
-
-
-def _normalize_part_key(part_no: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
-
-
-def _items_need_label_reverify(items: list, message_text: str) -> bool:
-    """Re-read label when Copilot returns a sensor part on a single-product photo."""
-    if not _is_single_product_photo_inquiry(message_text) or not items:
-        return False
-    for item in items:
-        part_key = re.sub(r"[^A-Z0-9]", "", str(item.get("part_no") or "").upper())
-        ptype = str(item.get("product_type") or "").upper()
-        if part_key.startswith(("E3Z", "E2E", "E39")):
-            if "SENSOR" not in ptype and "PHOTO" not in ptype and "PROXIMITY" not in ptype:
-                return True
-    return False
-
-
-def _items_need_battery_challenger(items: list, message_text: str) -> bool:
-    """Timer on a single-product quote photo is often a background panel misread (e.g. H3JA vs ER6C)."""
-    if not _is_single_product_photo_inquiry(message_text) or not items:
-        return False
-    return _is_timer_visual_item(items[0])
-
 
 def _parse_caption_qty(text: str, default: int = 1) -> int:
     """Parse qty from caption without loading the warehouse engine."""
@@ -603,283 +367,6 @@ def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_t
     return items_out
 
 
-def _copilot_label_focus_pass(
-    client,
-    message_text: str = "",
-    image_path: str = None,
-    voice_transcript: str = "",
-) -> tuple:
-    """Fresh Copilot call to read a single product label/nameplate (battery, timer, etc.)."""
-    if not image_path or not os.path.exists(image_path):
-        return [], ""
-
-    from whatsapp_attachment_processor import validate_image_file
-
-    ok_img, reason = validate_image_file(image_path)
-    if not ok_img:
-        print(f"[COPILOT LABEL] Skipping focus pass — invalid image: {reason}")
-        return [], ""
-
-    parts = [LABEL_FOCUS_PROMPT]
-    if message_text:
-        parts.append(f"Customer caption:\n{message_text}")
-    user_content = _copilot_user_content_with_image("\n\n".join(parts), image_path)
-
-    print("[COPILOT LABEL] Focus pass — read product label/nameplate from image...")
-    try:
-        response = _copilot_fresh_chat(
-            client,
-            [{"role": "user", "content": user_content}],
-            timeout=120.0,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT LABEL RAW] {raw[:400]}")
-        prose, parsed = _extract_json_from_copilot_text(raw)
-        if not isinstance(parsed, dict):
-            return [], prose
-        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
-        if items:
-            print(f"[COPILOT LABEL] Extracted {len(items)} item(s) from label focus pass")
-
-        verify_items, verify_prose = _copilot_label_verify_pass(
-            client,
-            message_text=message_text,
-            image_path=image_path,
-            voice_transcript=voice_transcript,
-        )
-        if verify_items:
-            if not items:
-                items = verify_items
-                prose = verify_prose or prose
-            elif _normalize_part_key(items[0].get("part_no")) != _normalize_part_key(
-                verify_items[0].get("part_no")
-            ):
-                print(
-                    f"[COPILOT LABEL] Verify overrides focus pass: "
-                    f"{items[0].get('part_no')} → {verify_items[0].get('part_no')}"
-                )
-                items = verify_items
-                prose = verify_prose or prose
-            else:
-                print("[COPILOT LABEL] Verify confirms focus pass part number")
-        items, prose = _apply_battery_challenger(
-            items,
-            message_text=message_text,
-            image_path=image_path,
-            client=client,
-            prose=prose,
-        )
-        return items, prose
-    except Exception as exc:
-        print(f"[WARN] Copilot label focus pass failed: {exc}")
-        return [], ""
-
-
-def _apply_battery_challenger(
-    items: list,
-    message_text: str = "",
-    image_path: str = None,
-    client=None,
-    prose: str = "",
-) -> tuple:
-    """When label focus returns a timer on a single-product photo, check for foreground battery."""
-    if not _items_need_battery_challenger(items, message_text):
-        return items, prose
-
-    battery_item = extract_battery_label_from_image(
-        message_text,
-        image_path,
-        client=client,
-    )
-    if not battery_item or not _is_battery_visual_item(battery_item):
-        return items, prose
-
-    timer_part = str(items[0].get("part_no") or "").strip().upper()
-    battery_part = str(battery_item.get("part_no") or "").strip().upper()
-    if _normalize_part_key(timer_part) == _normalize_part_key(battery_part):
-        return items, prose
-
-    print(
-        f"[COPILOT LABEL] Battery challenger overrides timer misread: "
-        f"{timer_part} → {battery_part}"
-    )
-    battery_item["qty"] = items[0].get("qty") or _parse_caption_qty(message_text)
-    battery_item["source"] = "COPILOT_BATTERY"
-    return [battery_item], prose
-
-
-def _copilot_label_verify_pass(
-    client,
-    message_text: str = "",
-    image_path: str = None,
-    voice_transcript: str = "",
-) -> tuple:
-    """Second fresh Copilot call — independent label re-read (any product type)."""
-    if not image_path or not os.path.exists(image_path):
-        return [], ""
-
-    from whatsapp_attachment_processor import validate_image_file
-
-    ok_img, reason = validate_image_file(image_path)
-    if not ok_img:
-        return [], ""
-
-    parts = [LABEL_VERIFY_PROMPT]
-    if message_text:
-        parts.append(f"Customer caption:\n{message_text}")
-    user_content = _copilot_user_content_with_image("\n\n".join(parts), image_path)
-
-    print("[COPILOT LABEL] Verify pass — independent AI re-read of product label...")
-    try:
-        response = _copilot_fresh_chat(
-            client,
-            [{"role": "user", "content": user_content}],
-            timeout=120.0,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT LABEL VERIFY RAW] {raw[:400]}")
-        prose, parsed = _extract_json_from_copilot_text(raw)
-        if not isinstance(parsed, dict):
-            return [], prose
-        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
-        if items:
-            print(f"[COPILOT LABEL] Verify pass extracted {len(items)} item(s)")
-        return items, prose
-    except Exception as exc:
-        print(f"[WARN] Copilot label verify pass failed: {exc}")
-        return [], ""
-
-
-def _apply_rfq_row_count_cap(items: list, parsed: dict) -> list:
-    """Trim items to row_count when Copilot reports how many rows are visible."""
-    if not items or not isinstance(parsed, dict):
-        return items
-    row_count = parsed.get("row_count", parsed.get("visible_rows"))
-    if row_count is None:
-        return items
-    try:
-        n = int(row_count)
-    except (TypeError, ValueError):
-        return items
-    if n > 0 and len(items) > n:
-        print(
-            f"[COPILOT RFQ TABLE] row_count={n} — dropping "
-            f"{len(items) - n} extra item(s) not in visible table"
-        )
-        return items[:n]
-    return items
-
-
-def _copilot_rfq_table_verify_pass(
-    client,
-    message_text: str = "",
-    image_path: str = None,
-    voice_transcript: str = "",
-) -> tuple:
-    """Second fresh Copilot call — count visible rows and drop hallucinated extras."""
-    if not image_path or not os.path.exists(image_path):
-        return [], ""
-
-    from whatsapp_attachment_processor import validate_image_file
-
-    ok_img, reason = validate_image_file(image_path)
-    if not ok_img:
-        return [], ""
-
-    parts = [RFQ_TABLE_VERIFY_PROMPT]
-    if message_text:
-        parts.append(f"Customer caption (quote request only):\n{message_text}")
-    user_content = _copilot_user_content_with_image("\n\n".join(parts), image_path)
-
-    print("[COPILOT RFQ TABLE] Verify pass — count visible rows in this image only...")
-    try:
-        response = _copilot_fresh_chat(
-            client,
-            [{"role": "user", "content": user_content}],
-            timeout=120.0,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT RFQ TABLE VERIFY RAW] {raw[:400]}")
-        prose, parsed = _extract_json_from_copilot_text(raw)
-        if not isinstance(parsed, dict):
-            return [], prose
-        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
-        items = _apply_rfq_row_count_cap(items, parsed)
-        if items:
-            print(f"[COPILOT RFQ TABLE] Verify pass — {len(items)} visible row(s)")
-        return items, prose
-    except Exception as exc:
-        print(f"[WARN] Copilot RFQ table verify pass failed: {exc}")
-        return [], ""
-
-
-def _copilot_rfq_table_focus_pass(
-    client,
-    message_text: str = "",
-    image_path: str = None,
-    voice_transcript: str = "",
-) -> tuple:
-    """Fresh Copilot call focused on reading RFQ table rows from the image only."""
-    if not image_path or not os.path.exists(image_path):
-        return [], ""
-
-    from whatsapp_attachment_processor import validate_image_file
-
-    ok_img, reason = validate_image_file(image_path)
-    if not ok_img:
-        print(f"[COPILOT RFQ TABLE] Skipping focus pass — invalid image: {reason}")
-        return [], ""
-
-    parts = [RFQ_TABLE_FOCUS_PROMPT]
-    if message_text:
-        parts.append(f"Customer caption (quote request only):\n{message_text}")
-    user_text = "\n\n".join(parts)
-    user_content = _copilot_user_content_with_image(user_text, image_path)
-
-    print("[COPILOT RFQ TABLE] Focus pass — read RFQ table / nameplate from image...")
-    try:
-        response = _copilot_fresh_chat(
-            client,
-            [{"role": "user", "content": user_content}],
-            timeout=120.0,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT RFQ TABLE RAW] {raw[:400]}")
-        prose, parsed = _extract_json_from_copilot_text(raw)
-        if not isinstance(parsed, dict):
-            return [], prose
-        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
-        items = _apply_rfq_row_count_cap(items, parsed)
-        if items:
-            print(f"[COPILOT RFQ TABLE] Extracted {len(items)} item(s) from table focus pass")
-
-        verify_items, verify_prose = _copilot_rfq_table_verify_pass(
-            client,
-            message_text=message_text,
-            image_path=image_path,
-            voice_transcript=voice_transcript,
-        )
-        if verify_items:
-            if len(verify_items) != len(items):
-                print(
-                    f"[COPILOT RFQ TABLE] Verify overrides focus pass: "
-                    f"{len(items)} item(s) → {len(verify_items)} visible row(s)"
-                )
-            elif items and _normalize_part_key(items[0].get("part_no")) != _normalize_part_key(
-                verify_items[0].get("part_no")
-            ):
-                print(
-                    f"[COPILOT RFQ TABLE] Verify overrides focus part: "
-                    f"{items[0].get('part_no')} → {verify_items[0].get('part_no')}"
-                )
-            items = verify_items
-            prose = verify_prose or prose
-        return items, prose
-    except Exception as exc:
-        print(f"[WARN] Copilot RFQ table focus pass failed: {exc}")
-        return [], ""
-
-
 def analyze_incoming_inquiry_with_copilot(
     message_text: str = "",
     image_path: str = None,
@@ -937,9 +424,9 @@ def analyze_incoming_inquiry_with_copilot(
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
     if image_path and os.path.exists(image_path):
         prompt_parts.append(
-            "IMPORTANT: The attached image is the customer's RFQ photo. "
-            "Read ALL text visible in the image — tables, labels, nameplates. "
-            "The caption may only ask for a quote; part numbers are in the image."
+            "Attached image: identify the foreground product the customer is quoting. "
+            "Transcribe its label exactly. Ignore background panels and wiring unless "
+            "the customer is clearly quoting background equipment."
         )
     elif not message_text and not voice_transcript and not document_text:
         prompt_parts.append("Attached image: see screenshot (analyze this message only).")
@@ -1000,109 +487,6 @@ def analyze_incoming_inquiry_with_copilot(
             parsed, message_text=message_text, voice_transcript=voice_transcript
         )
 
-        focus_prose = ""
-        if image_path and os.path.exists(image_path):
-            if _is_single_product_photo_inquiry(message_text):
-                label_items, label_prose = _copilot_label_focus_pass(
-                    client,
-                    message_text=message_text,
-                    image_path=image_path,
-                    voice_transcript=voice_transcript,
-                )
-                if label_items:
-                    first_key = _normalize_part_key((items_out[0] or {}).get("part_no"))
-                    label_key = _normalize_part_key(label_items[0].get("part_no"))
-                    if items_out and first_key != label_key:
-                        print(
-                            f"[COPILOT ANALYZE] Label focus overrides first pass: "
-                            f"{items_out[0].get('part_no')} → {label_items[0].get('part_no')}"
-                        )
-                    items_out = label_items
-                    focus_prose = label_prose
-                    for item in items_out:
-                        item["source"] = "COPILOT_LABEL"
-                elif not items_out:
-                    print("[COPILOT ANALYZE] Label focus returned no items — keeping first pass")
-            elif _is_rfq_table_inquiry(message_text):
-                table_items, table_prose = _copilot_rfq_table_focus_pass(
-                    client,
-                    message_text=message_text,
-                    image_path=image_path,
-                    voice_transcript=voice_transcript,
-                )
-                if table_items:
-                    first_key = _normalize_part_key((items_out[0] or {}).get("part_no"))
-                    table_key = _normalize_part_key(table_items[0].get("part_no"))
-                    if items_out and first_key != table_key:
-                        print(
-                            f"[COPILOT ANALYZE] RFQ table focus overrides first pass: "
-                            f"{items_out[0].get('part_no')} → {table_items[0].get('part_no')}"
-                        )
-                    items_out = table_items
-                    focus_prose = table_prose
-                    for item in items_out:
-                        item["source"] = "COPILOT_RFQ_TABLE"
-                elif not items_out:
-                    print("[COPILOT ANALYZE] RFQ table focus returned no items — keeping first pass")
-            elif _is_equivalent_support_request(message_text):
-                label_items, label_prose = _copilot_label_focus_pass(
-                    client,
-                    message_text=message_text,
-                    image_path=image_path,
-                    voice_transcript=voice_transcript,
-                )
-                if label_items:
-                    first_key = _normalize_part_key((items_out[0] or {}).get("part_no"))
-                    label_key = _normalize_part_key(label_items[0].get("part_no"))
-                    if items_out and first_key != label_key:
-                        print(
-                            f"[COPILOT ANALYZE] Label focus overrides first pass: "
-                            f"{items_out[0].get('part_no')} → {label_items[0].get('part_no')}"
-                        )
-                    items_out = label_items
-                    focus_prose = label_prose
-                    for item in items_out:
-                        item["source"] = "COPILOT_LABEL"
-                elif not items_out:
-                    print("[COPILOT ANALYZE] Label focus returned no items — keeping first pass")
-            elif _items_need_label_reverify(items_out, message_text):
-                print(
-                    "[COPILOT ANALYZE] Sensor-like guess on single-product photo — "
-                    "re-reading label"
-                )
-                items_out = []
-
-            if not items_out:
-                if _should_run_rfq_table_focus(message_text, analysis_text):
-                    table_items, table_prose = _copilot_rfq_table_focus_pass(
-                        client,
-                        message_text=message_text,
-                        image_path=image_path,
-                        voice_transcript=voice_transcript,
-                    )
-                    items_out = table_items
-                    focus_prose = table_prose or focus_prose
-                    for item in items_out:
-                        item["source"] = "COPILOT_RFQ_TABLE"
-                elif not _is_single_product_photo_inquiry(message_text):
-                    label_items, label_prose = _copilot_label_focus_pass(
-                        client,
-                        message_text=message_text,
-                        image_path=image_path,
-                        voice_transcript=voice_transcript,
-                    )
-                    items_out = label_items
-                    focus_prose = label_prose or focus_prose
-                    for item in items_out:
-                        item["source"] = "COPILOT_LABEL"
-
-        if focus_prose:
-            technical_summary = _sanitize_whatsapp_reply(focus_prose[:800])
-            part_list = ", ".join(
-                str(item.get("part_no") or "") for item in items_out if item.get("part_no")
-            )
-            if part_list:
-                reasoning = f"Focus pass read from image: {part_list}"
 
         if _is_equivalent_support_request(message_text):
             intent = "technical_support"
@@ -1171,133 +555,12 @@ def analyze_incoming_inquiry_with_copilot(
 
 
 def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -> list:
-    """Extract RFQ items from text and/or an image through the local Copilot proxy."""
-    caption = str(raw_email_body or "").strip()
-    if not caption and not image_path:
-        return []
-
-    if not image_path:
-        if _is_quote_without_part_text(caption):
-            print(
-                "[WARN] Quote caption without part number requires a product photo — "
-                "skipping text-only Copilot extraction to avoid guessing."
-            )
-            return []
-        if not caption:
-            return []
-
-    if image_path:
-        print(f"[API READ] Visual extraction using image: {image_path}")
-    else:
-        print("[API READ] Text-only extraction (no image attached)...")
-
-    client = OpenAI(
-        base_url=COPILOT_BASE_URL,
-        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=60.0 if image_path else 30.0,
-        max_retries=1,
+    """Extract RFQ items via the same single-pass Copilot analyze used by WhatsApp."""
+    analysis = analyze_incoming_inquiry_with_copilot(
+        message_text=raw_email_body,
+        image_path=image_path,
     )
-    system_instruction = (
-        "You are an industrial automation data extraction assistant. "
-        "Visually inspect the provided industrial product photo, label, nameplate, barcode sticker, "
-        "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
-        "Read printed model/order codes exactly as shown on the label/nameplate in THIS photo only. "
-        "Read character-by-character; do not substitute a different catalog number. "
-        "Never default to OMRON E2E-X5E1 — only return E2E if those exact characters are printed on the label. "
-        "Product families (read what is actually printed): "
-        "E2E- = OMRON proximity sensor; H3JA-/H3Y- = OMRON timer; E5CC-/E5CN- = temperature controller; "
-        "MY2/MY4 = relay; ER-/CR- = lithium battery (e.g. TOSHIBA ER6C 3.6V). "
-        "If the label says TIMER or H3JA-, never return E2E. "
-        "If the label says LITHIUM/BATTERY or shows ER6C/ER17500, never return E2E/H3JA. "
-        "If the label says PROXIMITY SENSOR or E2E-, never return H3JA/battery models. "
-        "Include supply voltage on the part_no when printed (example H3JA-8A AC200-240). "
-        "Match the brand field to the visible manufacturer logo (OMRON, SMC, etc.). "
-        "Never reuse a part number from chat history or from a different message. "
-        "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
-        "For relays, solenoids, coils, and power products, voltage and AC/DC are mandatory: "
-        "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC'). "
-        "Never substitute another voltage variant. "
-        "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
-        "a single visible part with '2 pcs' means qty 2. "
-        "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
-        "product_type is the visible product description on the label (example: TIMER, PROXIMITY SENSOR). "
-        "Quantity must be a positive integer. Do not guess missing part numbers. "
-        "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
-        "Do not include markdown, backticks, or conversational text. "
-        'Example: [{"part_no": "H3JA-8A AC200-240", "qty": 1, "brand": "OMRON", "product_type": "TIMER"}, '
-        '{"part_no": "ER6C 3.6V", "qty": 1, "brand": "TOSHIBA", "product_type": "LITHIUM BATTERY"}]'
-    )
-
-    try:
-        user_text = (
-            "Identify every industrial part in THIS customer message only. "
-            "Read only the attached photo and caption below — ignore all prior chat context. "
-            "Transcribe the exact model number printed on the product label/nameplate. "
-            f"Customer caption/text:\n{caption or '(none)'}"
-        )
-        user_content = user_text
-
-        if image_path:
-            with open(image_path, "rb") as image_file:
-                image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-            mime = mimetypes.guess_type(image_path)[0] or "image/png"
-            user_content = [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{image_b64}",
-                        "detail": "high",
-                    },
-                },
-            ]
-
-        response = _copilot_fresh_chat(
-            client,
-            [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
-            ],
-        )
-        raw_content = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT RAW] {raw_content}")
-        if raw_content.startswith("```"):
-            lines = raw_content.splitlines()
-            raw_content = "\n".join(lines[1:-1]).strip()
-
-        parsed = json.loads(raw_content)
-        if not isinstance(parsed, list):
-            raise ValueError("Copilot response must be a JSON array")
-
-        extracted_items = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            part_no = str(item.get("part_no") or "").strip().upper()
-            try:
-                qty = int(item.get("qty"))
-            except (TypeError, ValueError):
-                continue
-            if part_no and qty > 0:
-                brand = str(item.get("brand") or "UNKNOWN").strip().upper()
-                product_type = str(item.get("product_type") or "").strip()
-                if image_path and not product_type:
-                    print(
-                        f"[WARN] Visual extraction missing product_type for {part_no!r} — rejected"
-                    )
-                    continue
-                if image_path and not _visual_part_consistent(part_no, brand, product_type):
-                    continue
-                item_out = {"part_no": part_no, "qty": qty, "brand": brand}
-                if product_type:
-                    item_out["product_type"] = product_type
-                extracted_items.append(item_out)
-        return extracted_items
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[ERROR] Copilot returned invalid JSON data: {exc}")
-    except Exception as exc:
-        print(f"[ERROR] Failed to communicate with local Copilot server: {exc}")
-    return []
+    return list(analysis.get("items") or [])
 
 
 def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
@@ -1383,33 +646,8 @@ def _is_equivalent_support_request(message_text: str) -> bool:
     return True
 
 
-def _is_e2e_family_part(part_no: str) -> bool:
-    return _normalize_part_key(part_no).startswith("E2E")
-
-
-def _is_sensor_family_part(part_no: str) -> bool:
-    """OMRON-style proximity / photoelectric families that are often vision-hallucinated."""
-    part_key = _normalize_part_key(part_no)
-    return (
-        part_key.startswith("E2E")
-        or part_key.startswith("E3Z")
-        or part_key.startswith("E39")
-    )
-
-
-def _is_battery_visual_item(item: dict) -> bool:
-    product_type = str(item.get("product_type") or "").upper()
-    part_key = _normalize_part_key(item.get("part_no"))
-    return (
-        "BATTERY" in product_type
-        or "LITHIUM" in product_type
-        or part_key.startswith("ER")
-        or part_key.startswith("CR")
-    )
-
-
 def build_photo_confirmation_line(items: list) -> str:
-    """One-line visual confirmation for RFQ replies when parts came from a photo."""
+    """One-line visual confirmation using Copilot's product_type — no local part-family rules."""
     if not items:
         return ""
     primary = items[0]
@@ -1418,32 +656,11 @@ def build_photo_confirmation_line(items: list) -> str:
     product_type = str(primary.get("product_type") or "").strip()
     if not part_no:
         return ""
-
-    if _is_battery_visual_item(primary):
-        noun = product_type or "lithium battery"
-        brand_bit = f"{brand} " if brand and brand != "UNKNOWN" else ""
-        return f"From your photo this is a {brand_bit}{part_no} {noun.lower()}."
-
-    if _is_timer_visual_item(primary):
-        brand_bit = brand if brand and brand != "UNKNOWN" else "OMRON"
-        base_match = re.search(r"(H3J[AY]-\d+[A-Z]?)", part_no, re.I)
-        base_model = base_match.group(1).upper() if base_match else part_no.split()[0]
-        return f"From your photo this is an {brand_bit} {base_model} timer relay."
-
     brand_bit = f"{brand} " if brand and brand != "UNKNOWN" else ""
-    type_bit = f" {product_type.lower()}" if product_type else ""
-    return f"From your photo this is a {brand_bit}{part_no}{type_bit}."
+    if product_type:
+        return f"From your photo this is a {brand_bit}{part_no} ({product_type.lower()})."
+    return f"From your photo this is a {brand_bit}{part_no}."
 
-
-def _is_e2e_only_guess(items: list, label_item: dict = None) -> bool:
-    """True when every extracted item is E2E but label OCR did not confirm E2E."""
-    if not items:
-        return False
-    if not all(_is_e2e_family_part(item.get("part_no")) for item in items):
-        return False
-    if label_item and _is_e2e_family_part(label_item.get("part_no")):
-        return False
-    return True
 
 
 def _part_refs_from_copilot_items(copilot_items) -> list:
@@ -1461,416 +678,6 @@ def _part_refs_from_copilot_items(copilot_items) -> list:
     return refs
 
 
-def _is_timer_visual_item(item: dict) -> bool:
-    part_key = _normalize_part_key(item.get("part_no"))
-    product_type = str(item.get("product_type") or "").upper()
-    return "TIMER" in product_type or part_key.startswith("H3J") or part_key.startswith("H3Y")
-
-
-def _filter_conflicting_visual_items(items: list) -> list:
-    """Drop cross-family hallucinations (e.g. E2E when label is a timer)."""
-    items = [item for item in (items or []) if isinstance(item, dict) and item.get("part_no")]
-    if not items:
-        return []
-
-    has_timer = any(_is_timer_visual_item(item) for item in items)
-    if has_timer:
-        filtered = [
-            item for item in items
-            if not _normalize_part_key(item.get("part_no")).startswith("E2E")
-            and not _normalize_part_key(item.get("part_no")).startswith("CDQ")
-            and not _normalize_part_key(item.get("part_no")).startswith("CQ2")
-        ]
-        if filtered:
-            return filtered
-
-    has_battery = any(
-        "BATTERY" in str(item.get("product_type") or "").upper()
-        or "LITHIUM" in str(item.get("product_type") or "").upper()
-        or _normalize_part_key(item.get("part_no")).startswith("ER")
-        for item in items
-    )
-    if has_battery:
-        filtered = [
-            item for item in items
-            if not _is_sensor_family_part(item.get("part_no"))
-            and not _normalize_part_key(item.get("part_no")).startswith("H3J")
-            and not _normalize_part_key(item.get("part_no")).startswith("H3Y")
-        ]
-        if filtered:
-            return filtered
-
-    has_proximity = any(
-        "PROXIMITY" in str(item.get("product_type") or "").upper()
-        or "PHOTOELECTRIC" in str(item.get("product_type") or "").upper()
-        or "SENSOR" in str(item.get("product_type") or "").upper()
-        or _is_sensor_family_part(item.get("part_no"))
-        for item in items
-    )
-    if has_proximity:
-        filtered = [
-            item for item in items
-            if not (
-                _normalize_part_key(item.get("part_no")).startswith("H3J")
-                or _normalize_part_key(item.get("part_no")).startswith("H3Y")
-                or _is_battery_visual_item(item)
-            )
-        ]
-        if filtered:
-            return filtered
-
-    return items
-
-
-def extract_timer_label_from_image(caption: str = "", image_path: str = None) -> dict:
-    """Second-pass OCR focused on OMRON timer nameplates (H3JA/H3Y/H3CR)."""
-    if not image_path or not os.path.exists(image_path):
-        return {}
-
-    print(f"[COPILOT TIMER OCR] Focused timer label read: {image_path}")
-    client = OpenAI(
-        base_url=COPILOT_BASE_URL,
-        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=60.0,
-        max_retries=1,
-    )
-    system_instruction = (
-        "The photo shows an industrial TIMER nameplate (often OMRON H3JA or H3Y). "
-        "Transcribe the exact printed model code character-by-character. "
-        "Common format: H3JA-8A, H3JA-8C, H3Y-2. "
-        "The label also prints TIMER and supply voltage such as 200 to 240VAC. "
-        "Never return E2E proximity sensor models. "
-        "Return one JSON object: part_no, brand, product_type, supply_voltage."
-    )
-    user_text = (
-        "Read the TIMER model number printed on this nameplate only. "
-        "Example correct read: H3JA-8A with TIMER and 200-240VAC. "
-        f"Caption: {caption or '(none)'}"
-    )
-    try:
-        with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
-        response = _copilot_fresh_chat(
-            client,
-            [
-                {"role": "system", "content": system_instruction},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime};base64,{image_b64}",
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                },
-            ],
-        )
-        raw_content = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT TIMER OCR RAW] {raw_content}")
-        if raw_content.startswith("```"):
-            raw_content = "\n".join(raw_content.splitlines()[1:-1]).strip()
-        parsed = json.loads(raw_content)
-        if not isinstance(parsed, dict):
-            return {}
-        part_no = str(parsed.get("part_no") or "").strip().upper()
-        if not part_no:
-            return {}
-        brand = str(parsed.get("brand") or "OMRON").strip().upper()
-        product_type = str(parsed.get("product_type") or "TIMER").strip().upper()
-        if not _is_timer_visual_item({"part_no": part_no, "product_type": product_type}):
-            return {}
-        item = {"part_no": part_no, "qty": 1, "brand": brand, "product_type": product_type}
-        supply_voltage = str(parsed.get("supply_voltage") or "").strip()
-        if supply_voltage:
-            item["supply_voltage"] = supply_voltage
-        print(f"[COPILOT TIMER OCR] Identified {brand} {part_no}")
-        return item
-    except Exception as exc:
-        print(f"[WARN] Timer OCR failed: {exc}")
-    return {}
-
-
-def extract_battery_label_from_image(
-    caption: str = "",
-    image_path: str = None,
-    client=None,
-) -> dict:
-    """Second-pass OCR for cylindrical lithium cells in the foreground (ER6C, CR, etc.)."""
-    if not image_path or not os.path.exists(image_path):
-        return {}
-
-    print(f"[COPILOT BATTERY OCR] Foreground battery label read: {image_path}")
-    if client is None:
-        client = OpenAI(
-            base_url=COPILOT_BASE_URL,
-            api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-            timeout=60.0,
-            max_retries=1,
-        )
-    system_instruction = (
-        "Look for a small cylindrical LITHIUM BATTERY held in hand or in the foreground. "
-        "Common labels: Lithium, ER6C (AA) 3.6V, ER17500, CR123A, BR-2/3A. "
-        "Ignore background control panels, OMRON timers (H3JA/H3Y), terminal blocks, and wiring. "
-        "Transcribe ONLY the battery label character-by-character. "
-        "If no foreground battery is visible, return {\"part_no\":\"\",\"brand\":\"\",\"product_type\":\"\"}. "
-        "Return one JSON object: part_no, brand, product_type."
-    )
-    user_text = (
-        "Is there a lithium battery held in hand or closest to the camera? "
-        "If yes, transcribe its exact model code (e.g. ER6C (AA) 3.6V). "
-        "Do NOT return H3JA or other background panel equipment. "
-        f"Caption: {caption or '(none)'}"
-    )
-    try:
-        with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
-        response = _copilot_fresh_chat(
-            client,
-            [
-                {"role": "system", "content": system_instruction},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime};base64,{image_b64}",
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                },
-            ],
-        )
-        raw_content = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT BATTERY OCR RAW] {raw_content[:400]}")
-        if raw_content.startswith("```"):
-            raw_content = "\n".join(raw_content.splitlines()[1:-1]).strip()
-        parsed = json.loads(raw_content)
-        if not isinstance(parsed, dict):
-            return {}
-        part_no = str(parsed.get("part_no") or "").strip().upper()
-        if not part_no:
-            return {}
-        brand = str(parsed.get("brand") or "UNKNOWN").strip().upper()
-        product_type = str(parsed.get("product_type") or "LITHIUM BATTERY").strip().upper()
-        if not _is_battery_visual_item({"part_no": part_no, "product_type": product_type}):
-            return {}
-        item = {"part_no": part_no, "qty": 1, "brand": brand, "product_type": product_type}
-        print(f"[COPILOT BATTERY OCR] Identified {brand} {part_no}")
-        return item
-    except Exception as exc:
-        print(f"[WARN] Battery OCR failed: {exc}")
-    return {}
-
-
-def extract_label_from_image(caption: str = "", image_path: str = None) -> dict:
-    """OCR-style label read for tech support — one product label per photo."""
-    if not image_path or not os.path.exists(image_path):
-        return {}
-
-    print(f"[COPILOT LABEL OCR] Reading nameplate from: {image_path}")
-    client = OpenAI(
-        base_url=COPILOT_BASE_URL,
-        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=60.0,
-        max_retries=1,
-    )
-    system_instruction = (
-        "You transcribe industrial product labels from photos (sensors, timers, relays, "
-        "batteries, PLC modules, etc.). "
-        "Read the largest printed model/order code character-by-character from the nameplate. "
-        "Do not guess or substitute a different catalog number. "
-        "Never default to OMRON E2E-X5E1 unless those exact characters are printed on the label. "
-        "TIMER/H3JA-/H3Y- = timer relay — never E2E. "
-        "LITHIUM/BATTERY/ER6C/ER17500 = battery — never E2E/E3Z/H3JA. "
-        "PROXIMITY SENSOR/E2E- or PHOTOELECTRIC/E3Z- = sensor — never H3JA/battery/ER6C. "
-        "Return STRICTLY one raw JSON object with keys: "
-        "part_no, brand, product_type, supply_voltage. "
-        "part_no must match the label exactly (include voltage when printed, e.g. ER6C 3.6V). "
-        "product_type is the printed description (TIMER, LITHIUM BATTERY, PROXIMITY SENSOR, etc.). "
-        "supply_voltage is the printed source rating when visible, else empty string. "
-        "No markdown, no array, no extra keys."
-    )
-    user_text = (
-        "Transcribe the product label in THIS photo only. "
-        "Read character-by-character what is printed — do not substitute a different catalog number. "
-        f"Customer caption:\n{caption or '(none)'}"
-    )
-
-    try:
-        with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
-        user_content = [
-            {"type": "text", "text": user_text},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{image_b64}",
-                    "detail": "high",
-                },
-            },
-        ]
-        response = _copilot_fresh_chat(
-            client,
-            [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
-            ],
-        )
-        raw_content = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT LABEL OCR RAW] {raw_content}")
-        if raw_content.startswith("```"):
-            lines = raw_content.splitlines()
-            raw_content = "\n".join(lines[1:-1]).strip()
-
-        parsed = json.loads(raw_content)
-        if not isinstance(parsed, dict):
-            return {}
-
-        part_no = str(parsed.get("part_no") or "").strip().upper()
-        if not part_no:
-            return {}
-
-        brand = str(parsed.get("brand") or "UNKNOWN").strip().upper()
-        product_type = str(parsed.get("product_type") or "").strip().upper()
-        supply_voltage = str(parsed.get("supply_voltage") or "").strip()
-
-        if not _visual_part_consistent(part_no, brand, product_type):
-            return {}
-
-        item = {
-            "part_no": part_no,
-            "qty": 1,
-            "brand": brand,
-            "product_type": product_type,
-        }
-        if supply_voltage:
-            item["supply_voltage"] = supply_voltage
-        print(f"[COPILOT LABEL OCR] Identified {brand} {part_no} ({product_type})")
-        return item
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[WARN] Label OCR returned invalid JSON: {exc}")
-    except Exception as exc:
-        print(f"[WARN] Label OCR failed: {exc}")
-    return {}
-
-
-def _reconcile_visual_items(existing_items: list, label_item: dict) -> list:
-    """Prefer dedicated label OCR over generic RFQ extraction."""
-    label_part = str(label_item.get("part_no") or "").strip().upper()
-    label_key = _normalize_part_key(label_part)
-    if not label_key:
-        return _filter_conflicting_visual_items(existing_items)
-
-    filtered = []
-    for item in existing_items or []:
-        part_key = _normalize_part_key(item.get("part_no"))
-        if label_key.startswith("H3J") and part_key.startswith("E2E"):
-            print(f"[COPILOT TECH SUPPORT] Dropping wrong E2E extraction — label says {label_part}")
-            continue
-        if _is_timer_visual_item(label_item) and part_key.startswith("E2E"):
-            print(f"[COPILOT TECH SUPPORT] Dropping E2E — label OCR says TIMER {label_part}")
-            continue
-        filtered.append(item)
-
-    if not any(_normalize_part_key(item.get("part_no")) == label_key for item in filtered):
-        filtered.insert(0, label_item)
-    return _filter_conflicting_visual_items(filtered)
-
-
-def _is_unconfirmed_e2e_guess(items: list, label_item: dict) -> bool:
-    """True when the only extracted part is E2E but label OCR did not confirm it."""
-    if not items or len(items) != 1:
-        return False
-    part_key = _normalize_part_key(items[0].get("part_no"))
-    if not part_key.startswith("E2E"):
-        return False
-    if label_item:
-        label_key = _normalize_part_key(label_item.get("part_no"))
-        return not label_key.startswith("E2E")
-    return True
-
-
-def finalize_copilot_visual_items(
-    caption: str,
-    image_path: str = None,
-    copilot_items: list = None,
-    unified_analyze_ran: bool = False,
-) -> list:
-    """Return Copilot unified items as-is — no secondary OCR or regex post-filters."""
-    return list(copilot_items or [])
-
-
-def _resolve_visual_items(caption: str, image_path: str = None, copilot_items: list = None) -> list:
-    """Deprecated — kept for imports; returns unified items without re-guessing."""
-    return finalize_copilot_visual_items(
-        caption,
-        image_path=image_path,
-        copilot_items=copilot_items,
-        unified_analyze_ran=True,
-    )
-
-
-def _timer_voltage_note(part_no: str) -> str:
-    part_u = str(part_no or "").upper()
-    if re.search(r"200[\s\-]*(?:TO[\s\-]*)?240|AC200.?240", part_u):
-        return "200-240VAC"
-    if re.search(r"100[\s\-]*(?:TO[\s\-]*)?120|AC100.?120", part_u):
-        return "100-120VAC"
-    if re.search(r"\bDC24\b", part_u):
-        return "DC24V"
-    if re.search(r"\bAC24\b", part_u):
-        return "AC24V"
-    return ""
-
-
-def _build_timer_equivalent_reply(items: list, warehouse_context: str) -> str:
-    """Deterministic reply for OMRON H3JA/H3Y timer equivalent requests."""
-    primary = items[0]
-    part_no = str(primary.get("part_no") or "").strip().upper()
-    brand = str(primary.get("brand") or "OMRON").strip().upper()
-    base_match = re.search(r"(H3J[AY]-\d+[A-Z]?)", part_no, re.I)
-    base_model = base_match.group(1).upper() if base_match else part_no.split()[0]
-    voltage_note = _timer_voltage_note(part_no)
-
-    lines = [
-        "Hi, thank you for reaching out.",
-        "",
-        f"From your photo this is an {brand} {base_model} timer relay"
-        + (
-            f" ({voltage_note}, 8-pin octal base, DPDT contacts, 7A 250VAC resistive)."
-            if voltage_note
-            else " (8-pin octal base, DPDT contacts)."
-        ),
-        "",
-        f"The modern direct equivalent / successor is the {brand} H3CR-A8 series "
-        "(same 8-pin socket, improved accuracy and easier setting).",
-    ]
-
-    if warehouse_context:
-        lines.extend([
-            "",
-            "We currently have matching variants Ex-Stock / available in our warehouse, for example:",
-            warehouse_context,
-        ])
-    else:
-        lines.extend(["", "We can source the matching H3CR-A8 variant for you."])
-
-    lines.extend([
-        "",
-        "If you can share the time range on the dial (e.g. 5S, 30S, 3M) and whether "
-        "you need ON-delay or OFF-delay, I can match the exact H3CR-A8 variant for you.",
-    ])
-    return "\n".join(lines)
 
 
 def _sanitize_whatsapp_reply(text: str) -> str:
@@ -1881,23 +688,6 @@ def _sanitize_whatsapp_reply(text: str) -> str:
     return cleaned.strip()
 
 
-def _reply_mentions_e2e(reply: str) -> bool:
-    return bool(re.search(r"\bE2E[\s\-]?X", str(reply or "").upper()))
-
-
-def _reply_contradicts_visual_items(reply: str, items: list) -> bool:
-    visual_has_e2e = any(_is_e2e_family_part(item.get("part_no")) for item in (items or []))
-    if not visual_has_e2e and _reply_mentions_e2e(reply):
-        print("[COPILOT TECH SUPPORT] Reply mentions E2E but visual extraction did not confirm E2E")
-        return True
-    for item in items or []:
-        if not _is_timer_visual_item(item):
-            continue
-        part_key = _normalize_part_key(item.get("part_no"))
-        if part_key.startswith("H3J") and _reply_mentions_e2e(reply):
-            print("[COPILOT TECH SUPPORT] Reply contradicts timer label — mentions E2E")
-            return True
-    return False
 
 
 def _ask_for_clearer_photo_reply(caption: str = "") -> str:
@@ -1914,7 +704,7 @@ def build_technical_support_reply(
     image_path: str = None,
     copilot_items: list = None,
 ) -> str:
-    """Use unified Copilot analysis + warehouse stock for technical support replies."""
+    """Use unified Copilot analysis items + one Copilot reply call (no local re-OCR)."""
     if os.getenv("OPENCLAW_COPILOT_TECH_SUPPORT", "1").strip().lower() in ("0", "false", "no", "off"):
         return ""
 
@@ -1924,59 +714,15 @@ def build_technical_support_reply(
     if not message_text and not image_path:
         return ""
 
-    visual_items = _filter_conflicting_visual_items(list(copilot_items or []))
+    visual_items = list(copilot_items or [])
     if visual_items:
-        print(f"[COPILOT TECH SUPPORT] Using {len(visual_items)} unified analyze item(s)")
+        print(f"[COPILOT TECH SUPPORT] Using {len(visual_items)} item(s) from unified analyze")
     elif image_path:
-        print("[COPILOT TECH SUPPORT] No unified items — Copilot will read zoomed screenshot directly")
+        print("[COPILOT TECH SUPPORT] No prior items — Copilot will read the attached image")
     else:
         print("[COPILOT TECH SUPPORT] Text-only technical support")
 
-    if (
-        image_path
-        and _is_equivalent_support_request(message_text)
-        and (not visual_items or all(
-            _normalize_part_key(item.get("part_no")).startswith(("CDQ", "CQ2", "E2E", "E3Z"))
-            for item in visual_items
-        ))
-    ):
-        print("[COPILOT TECH SUPPORT] Wrong-family guess on equivalent photo — timer label re-read")
-        timer_item = extract_timer_label_from_image(message_text, image_path)
-        if timer_item:
-            visual_items = [timer_item]
-        else:
-            label_items, _label_prose = _copilot_label_focus_pass(
-                OpenAI(
-                    base_url=COPILOT_BASE_URL,
-                    api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-                    timeout=90.0,
-                    max_retries=1,
-                ),
-                message_text=message_text,
-                image_path=image_path,
-            )
-            if label_items:
-                visual_items = label_items
-
-    timer_items = [item for item in visual_items if _is_timer_visual_item(item)]
-
-    if timer_items:
-        part_refs, warehouse_context = build_warehouse_support_context(
-            message_text,
-            part_refs=_part_refs_from_copilot_items(timer_items),
-        )
-        print("[COPILOT TECH SUPPORT] Timer detected — using deterministic equivalent reply")
-        return _build_timer_equivalent_reply(timer_items, warehouse_context)
-
     part_refs = _part_refs_from_copilot_items(visual_items)
-    if image_path and _is_equivalent_support_request(message_text) and (
-        not part_refs or all(_is_e2e_family_part(part) for part in part_refs)
-    ):
-        print("[COPILOT TECH SUPPORT] Blocking E2E-only guess on equivalent photo request")
-        if not image_path:
-            return _ask_for_clearer_photo_reply(message_text)
-        part_refs = []
-
     part_refs, warehouse_context = build_warehouse_support_context(
         message_text,
         part_refs=part_refs if part_refs else None,
@@ -1985,16 +731,14 @@ def build_technical_support_reply(
     if part_refs:
         parts_label = ", ".join(part_refs)
         identification_note = (
-            f"Model identified from unified analysis: {parts_label}. "
-            "You MUST state this exact model in your reply. "
-            "Do NOT substitute a different part family (e.g. never say E2E if the label is H3JA or ER6C)."
+            f"Unified analysis identified: {parts_label}. "
+            "State this exact model in your reply — do not substitute a different part."
         )
     else:
-        parts_label = "(read from attached zoomed screenshot)"
+        parts_label = "(read from attached image)"
         identification_note = (
-            "Read the attached zoomed WhatsApp product photo. State the exact printed model number "
-            "(e.g. OMRON H3JA-8A timer, or ER6C 3.6V lithium battery). "
-            "Never guess E2E-X5E1 or E3Z-T61 unless those exact codes are printed on the label."
+            "Read the attached product photo. Transcribe the foreground label character-by-character "
+            "and identify what product the customer is asking about."
         )
 
     print(f"[COPILOT TECH SUPPORT] Parts detected: {parts_label}")
@@ -2011,24 +755,19 @@ def build_technical_support_reply(
     system_prompt = (
         "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
         "Answer customer technical support questions clearly and practically on WhatsApp. "
-        "Read the attached zoomed product photo if provided — transcribe the label character-by-character. "
-        "If a message-bubble screenshot is attached, analyze ONLY that single message — "
-        "ignore other products from earlier/later chat media.\n"
-        "Use ONLY the identified model from the label — never invent or substitute a different catalog number. "
-        "NEVER mention E2E-X5E1 or E3Z-T61 unless those exact models are printed on the label. "
-        "ER6C / LITHIUM = battery, not a sensor. H3JA / H3Y = timer, not E2E. "
-        "When the customer asks for an equivalent, replacement, or successor part, recommend the "
-        "best modern replacement and explain briefly why. "
-        "For OMRON H3JA or H3Y timer relays, the usual modern successor is H3CR-A8 (8-pin socket, DPDT). "
-        "ALWAYS prioritise recommending parts listed in the warehouse stock section below. "
-        "If we have Ex-Stock, say Ex-Stock is available — never disclose warehouse quantity numbers. "
-        "Do not recommend external distributors if we stock a suitable item. "
-        "Start with 'From your photo this is...' when a photo is attached and the label is readable. "
+        "Read the attached product photo if provided — transcribe the label character-by-character. "
+        "Focus on the foreground product the customer is asking about; ignore background equipment "
+        "unless the customer is clearly quoting it.\n"
+        "Use only what you can read on the label — never invent or substitute a different catalog number. "
+        "When the customer asks for an equivalent, replacement, or successor, recommend the best "
+        "modern replacement and explain briefly why.\n"
+        "ALWAYS prioritise parts listed in the warehouse stock section below when we have Ex-Stock. "
+        "Never disclose warehouse quantity numbers. "
         "Plain text only. No markdown, no hyperlinks, no asterisks. Friendly professional tone. Under 280 words."
     )
 
     user_prompt = (
-        f"Customer message:\n{message_text or '(see attached zoomed product photo)'}\n\n"
+        f"Customer message:\n{message_text or '(see attached product photo)'}\n\n"
         f"{identification_note}\n\n"
         "Our warehouse stock to PRIORITISE (check these first):\n"
         f"{warehouse_context or '(no matching warehouse stock found — give best technical guidance anyway)'}\n\n"
@@ -2038,7 +777,7 @@ def build_technical_support_reply(
     try:
         user_content = _copilot_user_content_with_image(user_prompt, image_path)
         if image_path and os.path.exists(image_path):
-            print(f"[COPILOT TECH SUPPORT] Attaching exact message-bubble screenshot: {image_path}")
+            print(f"[COPILOT TECH SUPPORT] Attaching product screenshot: {image_path}")
 
         response = _copilot_fresh_chat(
             client,
@@ -2053,22 +792,12 @@ def build_technical_support_reply(
             text = _sanitize_whatsapp_reply("\n".join(lines[1:-1]))
         if not text:
             return _ask_for_clearer_photo_reply(message_text) if image_path else ""
-        if _reply_contradicts_visual_items(text, visual_items):
-            if any(_is_timer_visual_item(item) for item in visual_items):
-                print("[COPILOT TECH SUPPORT] Regenerating with deterministic timer template")
-                return _build_timer_equivalent_reply(
-                    [item for item in visual_items if _is_timer_visual_item(item)] or visual_items,
-                    warehouse_context,
-                )
-            return _ask_for_clearer_photo_reply(message_text)
         if not text.lower().startswith("hi"):
             text = f"Hi, thank you for reaching out.\n\n{text}"
         print(f"[COPILOT TECH SUPPORT] Generated {len(text)} char reply")
         return text
     except Exception as exc:
         print(f"[WARN] Copilot technical support failed: {exc}")
-        if visual_items and any(_is_timer_visual_item(item) for item in visual_items):
-            return _build_timer_equivalent_reply(visual_items, warehouse_context)
         return _ask_for_clearer_photo_reply(message_text) if image_path else ""
 
 
