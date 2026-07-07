@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.22-COPILOT-PARSE-NOT-FAILURE"
+VERSION = "v1.23-FULL-RES-IMAGE-FIX"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -314,7 +314,6 @@ def _copilot_fresh_chat(client, messages, timeout: float = 60.0):
         messages=messages,
         extra_body={"conversation_id": None},
         timeout=timeout,
-        max_retries=1,
     )
 
 

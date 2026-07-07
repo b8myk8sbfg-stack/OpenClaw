@@ -1714,6 +1714,36 @@ def download_document_from_bubble(
             pass
 
 
+def pick_newest_image_download(baseline_mtime: float = 0) -> Optional[str]:
+    """Find a freshly downloaded image in ~/Downloads (Save Image As / viewer download)."""
+    download_dirs = [
+        os.path.expanduser("~/Downloads"),
+        WA_IMAGE_DIR,
+    ]
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+    candidates = []
+    for directory in download_dirs:
+        if not os.path.isdir(directory):
+            continue
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            if not name.lower().endswith(image_exts):
+                continue
+            mtime = os.path.getmtime(path)
+            if baseline_mtime and mtime <= baseline_mtime:
+                continue
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    newest = candidates[0]
+    if time.time() - os.path.getmtime(newest) > 120:
+        return None
+    return newest
+
+
 def _pick_newest_download(preferred_name: str) -> Optional[str]:
     download_dirs = [
         os.path.expanduser("~/Downloads"),
