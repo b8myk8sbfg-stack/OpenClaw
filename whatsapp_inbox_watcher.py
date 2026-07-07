@@ -16,6 +16,15 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options
 
+from openclaw_busy import (
+    clear_busy,
+    flip_channel_turn,
+    get_channel_turn,
+    is_busy,
+    is_channel_turn,
+    set_busy,
+    wait_until_idle,
+)
 from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
     parse_qty_from_caption,
@@ -49,7 +58,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.41-COPILOT-TECH-SUPPORT"
+VERSION = "v3.42-BUSY-FLAG-COPILOT-FIX"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -67,7 +76,7 @@ WHATSAPP_CUSTOMER_REGISTRY_FILE = "/Users/evon/OpenClaw/whatsapp_customer_regist
 CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.txt"
 
 MAX_UNREAD_CHATS_PER_RUN = 1
-CHECK_INTERVAL_SECONDS = int(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "45"))
+CHECK_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "2"))
 INCOMING_LOOKBACK = 6
 MARKUP_DIVISOR = 0.8
 MONITOR_WHATSAPP_PHONE = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONE", "+60167222208")
@@ -3135,10 +3144,18 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         document_text=enrichment.get("document_text") or "",
         voice_transcript=enrichment.get("transcript") or "",
     )
-    if copilot_analysis:
+    if copilot_analysis.get("attempted"):
         if copilot_analysis.get("items"):
             copilot_items = copilot_analysis["items"]
             print(f"   🧠 Unified Copilot analyze: {len(copilot_items)} item(s)")
+        elif copilot_analysis.get("ok"):
+            print("   ⚠️ Unified Copilot analyze OK but returned zero items")
+        else:
+            print(
+                f"   ❌ Unified Copilot analyze failed "
+                f"(HTTP {copilot_analysis.get('http_status')}): "
+                f"{copilot_analysis.get('error')}"
+            )
         if image_path and copilot_items:
             image_analysis = {
                 "items": copilot_items,
@@ -3716,6 +3733,51 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
     return send_reply_in_current_chat(driver, reply_message)
 
 
+def send_copilot_malfunction_alert(
+    driver,
+    operation: str,
+    copilot_analysis: dict,
+    customer_name: str = "",
+    customer_contact: str = "",
+    image_path: str = "",
+    original_message: str = "",
+):
+    """Notify monitor WhatsApp when Copilot API fails (non-200 / connection error)."""
+    status = copilot_analysis.get("http_status")
+    error = str(copilot_analysis.get("error") or "unknown Copilot error").strip()
+    raw = str(copilot_analysis.get("raw_excerpt") or "").strip()
+    lines = [
+        "[OpenClaw Copilot Malfunction]",
+        "Please Check",
+        "",
+        f"Operation: {operation}",
+        f"Customer: {customer_name or '-'}",
+    ]
+    phone_display = format_customer_phone_display(customer_contact)
+    if phone_display:
+        lines.append(f"Customer Contact: {phone_display}")
+    lines.extend([
+        f"HTTP status: {status if status is not None else 'n/a'}",
+        f"Error: {error[:600]}",
+    ])
+    if image_path:
+        lines.append(f"Image: {image_path}")
+    if original_message:
+        lines.append(f"Caption: {original_message[:300]}")
+    if raw:
+        lines.append(f"Copilot raw excerpt: {raw[:400]}")
+    alert = "\n".join(lines)
+    print("")
+    print("=" * 90)
+    print("🚨 COPILOT MALFUNCTION — alerting monitor")
+    print(alert[:500])
+    print("=" * 90)
+    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
+        print("❌ Could not open monitor chat for Copilot malfunction alert.")
+        return False
+    return send_reply_in_current_chat(driver, alert)
+
+
 def send_classification_alert(driver, contact_name, customer_contact, message_text, classification):
     """Always notify monitor during development so every message is classified and visible."""
     alert = build_classification_monitor_message(
@@ -3958,12 +4020,41 @@ def process_customer_inquiry(
     driver, contact_name, latest_message, image_analysis=None, customer_contact=None,
     classification=None, document_items=None, pre_extracted_copilot_items=None,
     voice_enrichment=None, image_path=None, copilot_technical_summary=None,
-    unified_analyze_ran=False,
+    unified_analyze_ran=False, copilot_analysis=None,
 ):
     customer_contact = customer_contact or contact_name
     classification_summary = classification.summary() if classification else None
     document_items = document_items or []
+    copilot_analysis = copilot_analysis or {}
     image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
+
+    if copilot_analysis.get("attempted") and copilot_analysis.get("ok") is False:
+        send_copilot_malfunction_alert(
+            driver,
+            operation="unified_analyze",
+            copilot_analysis=copilot_analysis,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            image_path=image_path or "",
+            original_message=latest_message,
+        )
+        reply = (
+            "Hi, thank you for your inquiry.\n\n"
+            "We received your message and our team is processing it now. "
+            "We will send the quotation shortly."
+        )
+        send_customer_reply(
+            driver,
+            reply,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            original_message=latest_message,
+            context="COPILOT_MALFUNCTION_HOLD",
+            customer_chat_is_open=True,
+            classification_summary=classification_summary,
+        )
+        append_log(contact_name, latest_message, [], [], "COPILOT_MALFUNCTION_HOLD")
+        return
 
     if unified_analyze_ran or pre_extracted_copilot_items is not None:
         copilot_items = list(pre_extracted_copilot_items or [])
@@ -4079,10 +4170,19 @@ def process_customer_inquiry(
                 "ER6C 3.6V Qty:1"
             )
         elif image_path and unified_analyze_ran:
+            send_copilot_malfunction_alert(
+                driver,
+                operation="rfq_no_items_after_analyze",
+                copilot_analysis=copilot_analysis or {"error": "Copilot returned zero items", "http_status": 200},
+                customer_name=contact_name,
+                customer_contact=customer_contact,
+                image_path=image_path,
+                original_message=latest_message,
+            )
             reply = (
-                "Hi, I received your photo but could not read the product label clearly enough to quote.\n\n"
+                "Hi, I received your photo but could not read the product details clearly enough to quote.\n\n"
                 "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
-                "ER6C 3.6V Qty:1"
+                "150-C25NBD Qty:3"
             )
         elif image_analysis:
             reply = (
@@ -4290,9 +4390,12 @@ def process_open_chat(driver):
     if not acquire_chat_processing_lock(raw_contact_name or "open-chat"):
         return
 
+    set_busy("whatsapp", "processing_chat", raw_contact_name or "")
     try:
         _process_open_chat_body(driver, raw_contact_name)
     finally:
+        clear_busy()
+        flip_channel_turn()
         release_chat_processing_lock()
 
 
@@ -4406,11 +4509,14 @@ def _process_open_chat_body(driver, raw_contact_name):
         print(repr(inquiry_text))
         print("=" * 90)
 
-        if copilot_analysis:
+        if copilot_analysis.get("attempted"):
             classification = classification_from_copilot_analysis(copilot_analysis, media_info=media_info)
             if copilot_analysis.get("items"):
                 copilot_items = copilot_analysis["items"]
-            print(f"🧠 Using Copilot-first classification: {classification.intent} ({classification.confidence:.0%})")
+            print(
+                f"🧠 Using Copilot-first classification: {classification.intent} "
+                f"({classification.confidence:.0%}) | ok={copilot_analysis.get('ok')}"
+            )
         else:
             classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
             if is_equivalent_support_request(inquiry_text):
@@ -4427,7 +4533,7 @@ def _process_open_chat_body(driver, raw_contact_name):
                 classification.media_info.media_type = "voice"
                 classification.media_info.has_voice = True
                 classification.media_info.has_image = False
-        if not copilot_analysis:
+        if not copilot_analysis.get("attempted"):
             if (
                 classification.intent in ("unknown", "greeting", "general_chat")
                 and (document_items or enrichment.get("document_text") or media_info.media_type == "pdf")
@@ -4514,7 +4620,8 @@ def _process_open_chat_body(driver, raw_contact_name):
                 voice_enrichment=enrichment,
                 image_path=image_path,
                 copilot_technical_summary=copilot_analysis.get("technical_summary") or "",
-                unified_analyze_ran=bool(copilot_analysis),
+                unified_analyze_ran=bool(copilot_analysis.get("attempted")),
+                copilot_analysis=copilot_analysis,
             )
             return
 
@@ -5085,9 +5192,17 @@ def run_persistent_watcher():
 
         while True:
             try:
+                if is_busy():
+                    wait_until_idle(poll_seconds=CHECK_INTERVAL_SECONDS, label="whatsapp-watcher")
+                    continue
+                if not is_channel_turn("whatsapp"):
+                    print(f"⏸️ Not WhatsApp turn (current={get_channel_turn()}) — waiting...")
+                    time.sleep(CHECK_INTERVAL_SECONDS)
+                    continue
+
                 print("")
                 print("=" * 90)
-                print(f"🔁 New WhatsApp scan cycle @ {now_iso()}")
+                print(f"🔁 WhatsApp scan cycle @ {now_iso()}")
 
                 watch_unread_with_existing_driver(driver)
 
@@ -5112,7 +5227,6 @@ def run_persistent_watcher():
 
                     driver = init_driver()
 
-            print(f"⏳ Sleeping {CHECK_INTERVAL_SECONDS} seconds...")
             time.sleep(CHECK_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:

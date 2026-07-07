@@ -8,9 +8,9 @@ import mimetypes
 import signal
 import re
 
-from openai import OpenAI
+from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.15-WA-IMAGE-FILES-WORKSPACE"
+VERSION = "v1.16-BUSY-FLAG-COPILOT-FIX"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -175,16 +175,28 @@ def analyze_incoming_inquiry_with_copilot(
 ) -> dict:
     """Copilot-first unified analysis: classify intent + extract parts from text/image/voice/doc together."""
     if os.getenv("OPENCLAW_COPILOT_FIRST", "1").strip().lower() in ("0", "false", "no", "off"):
-        return {}
+        return {"attempted": False, "ok": False, "items": []}
 
     message_text = str(message_text or "").strip()
     document_text = str(document_text or "").strip()
     voice_transcript = str(voice_transcript or "").strip()
 
     if not any([message_text, image_path, document_text, voice_transcript]):
-        return {}
+        return {"attempted": False, "ok": False, "items": []}
 
     print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
+    if image_path:
+        if os.path.exists(image_path):
+            print(f"[COPILOT ANALYZE] Image file size: {os.path.getsize(image_path)} bytes")
+        else:
+            print(f"[COPILOT ANALYZE] WARN image_path missing on disk: {image_path}")
+            return {
+                "attempted": True,
+                "ok": False,
+                "error": f"image file not found: {image_path}",
+                "http_status": None,
+                "items": [],
+            }
 
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
@@ -207,7 +219,11 @@ def analyze_incoming_inquiry_with_copilot(
         "- technical_support: equivalent/replacement, specs, wiring, fault, how-to\n"
         "- purchase_order: formal PO/PR document or order placement\n"
         "- delivery_tracking, payment_invoice, complaint, greeting, junk_ad, general_chat, unknown\n\n"
-        "Extract every distinct part visible on a label/photo or stated in text.\n"
+        "Extract every distinct part visible on a label/photo, RFQ table, or stated in text.\n"
+        "If the image shows an RFQ table with columns (No, Item, Picture, Qty), read the Item column "
+        "and label photo together — extract model/part_no and qty from the Qty column.\n"
+        "Example table row: Allen-Bradley Soft Starter Model 150-C25NBD, Qty 3 → "
+        "part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER.\n"
         "Read model codes character-by-character from the label in the photo.\n"
         "NEVER default to OMRON E2E-X5E1 or E3Z-T61 unless those exact characters are printed on the label.\n"
         "Examples: ER6C 3.6V = lithium battery (NOT E2E/E3Z); H3JA-8A = timer (NOT E2E); "
@@ -242,6 +258,7 @@ def analyze_incoming_inquiry_with_copilot(
     if image_path and os.path.exists(image_path):
         print(f"[COPILOT ANALYZE] Attaching exact message-bubble screenshot: {image_path}")
 
+    raw = ""
     try:
         response = client.chat.completions.create(
             model=COPILOT_MODEL,
@@ -285,6 +302,9 @@ def analyze_incoming_inquiry_with_copilot(
             if image_path and product_type and not _visual_part_consistent(part_no, brand, product_type):
                 print(f"[COPILOT ANALYZE] Rejected inconsistent item {part_no!r} ({product_type})")
                 continue
+            # Keep items even when product_type missing (table RFQs often omit it).
+            if image_path and not product_type:
+                print(f"[COPILOT ANALYZE] Accepting item without product_type: {part_no!r}")
             item_out = {"part_no": part_no, "qty": qty, "brand": brand, "source": "COPILOT_UNIFIED"}
             if product_type:
                 item_out["product_type"] = product_type
@@ -294,6 +314,8 @@ def analyze_incoming_inquiry_with_copilot(
             items_out = _filter_conflicting_visual_items(items_out)
 
         result = {
+            "attempted": True,
+            "ok": True,
             "intent": intent,
             "confidence": max(0.0, min(confidence, 1.0)),
             "reasoning": reasoning,
@@ -301,17 +323,52 @@ def analyze_incoming_inquiry_with_copilot(
             "technical_summary": technical_summary,
             "is_industrial_automation": is_ia,
             "compatible_brands": compatible_brands,
+            "raw_excerpt": raw[:800],
         }
         print(
             f"[COPILOT ANALYZE] intent={intent} ({confidence:.0%}) | "
             f"items={len(items_out)} | {reasoning[:80]}"
         )
+        if not items_out and image_path:
+            print(f"[COPILOT ANALYZE] WARN zero items after parse — raw excerpt: {raw[:300]!r}")
         return result
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[WARN] Copilot analyze returned invalid JSON: {exc}")
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": f"invalid JSON from Copilot: {exc}",
+            "http_status": 200,
+            "items": [],
+            "raw_excerpt": raw[:800],
+        }
+    except APIStatusError as exc:
+        print(f"[WARN] Copilot analyze HTTP {exc.status_code}: {exc}")
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "http_status": exc.status_code,
+            "items": [],
+        }
+    except (APIConnectionError, APITimeoutError) as exc:
+        print(f"[WARN] Copilot analyze connection/timeout: {exc}")
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "http_status": None,
+            "items": [],
+        }
     except Exception as exc:
         print(f"[WARN] Copilot unified analyze failed: {exc}")
-    return {}
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "http_status": None,
+            "items": [],
+        }
 
 
 def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -> list:
@@ -1143,7 +1200,8 @@ def stop_process(proc, name):
 def main():
     print("=" * 90)
     print(f"🤖 OpenClaw Unified Runner {VERSION}")
-    print("   Running Email + WhatsApp Automation")
+    print("   Running Email + WhatsApp Automation (busy-flag / turn coordination)")
+    print("   Flags: openclaw_busy.flag | openclaw_channel_turn.flag")
     print("=" * 90)
 
     email_proc = run_process("Email Engine (auto_claw)", EMAIL_SCRIPT)

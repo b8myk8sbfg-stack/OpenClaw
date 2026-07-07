@@ -221,6 +221,9 @@ def infer_brand_from_part(part_no):
     if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("E2E") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y") or part_norm.startswith("H3J") or part_norm.startswith("H3CR") or part_norm.startswith("E5CC") or part_norm.startswith("E5CN"):
         return "OMRON"
 
+    if part_norm.startswith("150C") or part_norm.startswith("150-C"):
+        return "ALLEN-BRADLEY"
+
     return "UNKNOWN"
 
 
