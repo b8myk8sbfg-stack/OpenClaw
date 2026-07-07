@@ -4249,9 +4249,17 @@ def process_customer_inquiry(
     if image_path and copilot_items:
         photo_confirmation = build_photo_confirmation_line(copilot_items)
 
+    if unified_analyze_ran:
+        ai_research = (
+            copilot_technical_summary
+            or str((copilot_analysis or {}).get("analysis_text") or "").strip()
+        )
+    else:
+        ai_research = copilot_technical_summary or build_ai_research_summary(formatted_rows)
+
     customer_reply = build_plain_quotation_reply(
         formatted_rows,
-        ai_research=(copilot_technical_summary or build_ai_research_summary(formatted_rows)),
+        ai_research=ai_research,
         photo_confirmation=photo_confirmation,
     )
     sent = send_customer_reply(

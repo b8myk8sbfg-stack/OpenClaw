@@ -679,7 +679,7 @@ def capture_document_preview_image(driver, bubble, contact_name: str) -> Optiona
         )
         time.sleep(0.5)
         bubble.screenshot(out_path)
-        print(f"📄 [DOC] Saved document preview screenshot: {out_path}")
+        print(f"📄 [DOC] Saved document preview screenshot → {WA_IMAGE_DIR}/{os.path.basename(out_path)}")
         return out_path
     except Exception as exc:
         print(f"⚠️ [DOC] Preview screenshot failed: {exc}")
@@ -1657,7 +1657,7 @@ def download_document_from_bubble(
             downloaded = _pick_newest_download(safe_name)
             if downloaded:
                 os.replace(downloaded, out_path)
-                print(f"📄 [DOC] Saved document (inline download): {out_path}")
+                print(f"📄 [DOC] Saved document (inline download) → {out_path}")
                 return out_path
 
         element.click()

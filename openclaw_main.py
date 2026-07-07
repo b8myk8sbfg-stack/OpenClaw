@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.18-COPILOT-CONFIDENCE-PARSE"
+VERSION = "v1.20-FRESH-COPILOT-PROMPT"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -188,6 +188,73 @@ def _normalize_copilot_intent(intent: str) -> str:
     return "unknown"
 
 
+OPENCLAW_UNIFIED_PROMPT = """Please analyze this incoming message and classify the message as:
+- request for quotation (RFQ)
+- request for technical support
+- customer purchase order
+- junk advertisement message or promotion pamphlets
+
+If a voice transcript is included below, it was already transcribed from the WAV file — use it together with the attached image.
+
+After analyzing, extract important details and return your analysis in clear text.
+Check whether this item is used in industrial automation.
+I carry OMRON, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, and many more industrial automation brands — note if it matches brands I carry.
+Please give the technical specification for the item.
+
+CRITICAL: This is one brand-new incoming message only. Do not use prior chats, earlier photos, or other products from this customer. Read only what is in THIS message and THIS attached image.
+
+At the very end, on the last line only, output valid JSON (no markdown fences) with keys:
+intent, confidence, items, technical_summary, is_industrial_automation, compatible_brands, reasoning
+
+intent must be one of: rfq_inquiry, technical_support, purchase_order, junk_ad, greeting, general_chat, unknown
+confidence must be a number from 0.0 to 1.0
+items must be an array of objects: {part_no, qty, brand, product_type}
+"""
+
+
+def _copilot_fresh_chat(client, messages, timeout: float = 60.0):
+    """Every Copilot call starts a new upstream conversation — no thread history."""
+    return client.chat.completions.create(
+        model=COPILOT_MODEL,
+        messages=messages,
+        extra_body={"conversation_id": None},
+        timeout=timeout,
+        max_retries=1,
+    )
+
+
+def _extract_json_from_copilot_text(raw: str):
+    """Split Copilot prose from trailing JSON line."""
+    text = str(raw or "").strip()
+    if not text:
+        return "", {}
+
+    if text.startswith("```"):
+        text = "\n".join(text.splitlines()[1:-1]).strip()
+
+    lines = text.splitlines()
+    for start in range(len(lines) - 1, -1, -1):
+        tail = "\n".join(lines[start:]).strip()
+        if not tail.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(tail)
+            if isinstance(parsed, dict):
+                prose = "\n".join(lines[:start]).strip()
+                return prose, parsed
+        except json.JSONDecodeError:
+            continue
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return "", parsed
+    except json.JSONDecodeError:
+        pass
+
+    return text, {}
+
+
 def _copilot_user_content_with_image(user_text: str, image_path: str = None):
     """Build OpenAI user content with optional high-detail image attachment."""
     if image_path and os.path.exists(image_path):
@@ -245,82 +312,48 @@ def analyze_incoming_inquiry_with_copilot(
         max_retries=1,
     )
 
-    system_instruction = (
-        "You analyze incoming WhatsApp messages for Robomatics, an industrial automation distributor "
-        "in Malaysia (brands: OMRON, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, "
-        "Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, and more).\n\n"
-        "Read ALL provided inputs together — customer text, photo label, document text, and voice "
-        "transcript. Treat this as a brand-new message; do not reuse parts from other conversations.\n\n"
-        "When a message-bubble screenshot is attached, analyze ONLY that single WhatsApp message bubble. "
-        "Ignore any other products, thumbnails, or media from earlier/later chat messages. "
-        "The customer caption text belongs to THIS message only.\n\n"
-        "Classify the message intent as one of:\n"
-        "- rfq_inquiry: customer asks price/availability/quote (e.g. 'quote me 1 pc', 'pls quote')\n"
-        "  If the caption asks for a quote/price, intent MUST be rfq_inquiry (never unknown).\n"
-        "- technical_support: equivalent/replacement, specs, wiring, fault, how-to\n"
-        "- purchase_order: formal PO/PR document or order placement\n"
-        "- delivery_tracking, payment_invoice, complaint, greeting, junk_ad, general_chat, unknown\n\n"
-        "Extract every distinct part visible on a label/photo, RFQ table, or stated in text.\n"
-        "If the image shows an RFQ table with columns (No, Item, Picture, Qty), read the Item column "
-        "and label photo together — extract model/part_no and qty from the Qty column.\n"
-        "Example table row: Allen-Bradley Soft Starter Model 150-C25NBD, Qty 3 → "
-        "part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER.\n"
-        "Read model codes character-by-character from the label in the photo.\n"
-        "NEVER default to OMRON E2E-X5E1 or E3Z-T61 unless those exact characters are printed on the label.\n"
-        "Examples: ER6C 3.6V = lithium battery (NOT E2E/E3Z); H3JA-8A = timer (NOT E2E); "
-        "E2E-X5E1 = proximity sensor only if label says E2E; E3Z-T61 = photoelectric sensor only if label says E3Z.\n"
-        "If the label says LITHIUM or ER6C, product_type must be LITHIUM BATTERY and part_no must be ER6C (include 3.6V when printed).\n"
-        "Use customer text for quantity ('quote 1 pce' → qty 1). "
-        "If a table or document in the image shows Qty, use that quantity. Default qty 1 if not stated.\n\n"
-        "Return STRICTLY one raw JSON object with keys:\n"
-        "intent, confidence, reasoning, items, technical_summary, is_industrial_automation, compatible_brands\n"
-        "confidence must be a number from 0.0 to 1.0 (example 0.9) — not words like high/medium.\n"
-        "items = array of {part_no, qty, brand, product_type}\n"
-        "technical_summary = concise specs suitable for a sales reply (plain text, no markdown links)\n"
-        "compatible_brands = array of automation brands this item is commonly used with\n"
-        "No markdown fences, no extra keys."
-    )
-
-    parts = []
+    prompt_parts = [OPENCLAW_UNIFIED_PROMPT]
     if voice_transcript:
-        parts.append(f"Voice transcript:\n{voice_transcript}")
+        prompt_parts.append(f"Voice transcript:\n{voice_transcript}")
     if message_text:
-        parts.append(f"Customer WhatsApp text/caption:\n{message_text}")
+        prompt_parts.append(f"Customer message/caption:\n{message_text}")
     if document_text:
-        parts.append(f"Attached document text:\n{document_text[:4000]}")
-    if not parts:
-        parts.append("Customer WhatsApp text/caption:\n(see attached photo only)")
+        prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
+    if not image_path and not message_text and not voice_transcript and not document_text:
+        prompt_parts.append("(No text — analyze the attached image only.)")
 
-    user_text = (
-        "Analyze this incoming customer message. Read the photo AND text together.\n\n"
-        + "\n\n".join(parts)
-    )
-
+    user_text = "\n\n".join(prompt_parts)
     user_content = _copilot_user_content_with_image(user_text, image_path)
     if image_path and os.path.exists(image_path):
-        print(f"[COPILOT ANALYZE] Attaching exact message-bubble screenshot: {image_path}")
+        print(f"[COPILOT ANALYZE] Fresh chat — bubble screenshot only: {image_path}")
 
     raw = ""
     try:
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
-            ],
+        response = _copilot_fresh_chat(
+            client,
+            [{"role": "user", "content": user_content}],
+            timeout=90.0 if image_path else 60.0,
         )
         raw = (response.choices[0].message.content or "").strip()
         print(f"[COPILOT ANALYZE RAW] {raw[:500]}")
-        if raw.startswith("```"):
-            raw = "\n".join(raw.splitlines()[1:-1]).strip()
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            return {}
+        analysis_text, parsed = _extract_json_from_copilot_text(raw)
+        if not isinstance(parsed, dict) or not parsed:
+            return {
+                "attempted": True,
+                "ok": False,
+                "error": "no JSON object in Copilot response",
+                "http_status": 200,
+                "items": [],
+                "analysis_text": analysis_text,
+                "raw_excerpt": raw[:800],
+            }
 
         intent = _normalize_copilot_intent(parsed.get("intent"))
         confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
         reasoning = str(parsed.get("reasoning") or "").strip()
-        technical_summary = _sanitize_whatsapp_reply(str(parsed.get("technical_summary") or "").strip())
+        technical_summary = _sanitize_whatsapp_reply(
+            str(parsed.get("technical_summary") or analysis_text or "").strip()
+        )
         is_ia = bool(parsed.get("is_industrial_automation", True))
         compatible_brands = parsed.get("compatible_brands") or []
 
@@ -341,19 +374,10 @@ def analyze_incoming_inquiry_with_copilot(
             qty = max(1, qty)
             brand = str(item.get("brand") or "UNKNOWN").strip().upper()
             product_type = str(item.get("product_type") or "").strip()
-            if image_path and product_type and not _visual_part_consistent(part_no, brand, product_type):
-                print(f"[COPILOT ANALYZE] Rejected inconsistent item {part_no!r} ({product_type})")
-                continue
-            # Keep items even when product_type missing (table RFQs often omit it).
-            if image_path and not product_type:
-                print(f"[COPILOT ANALYZE] Accepting item without product_type: {part_no!r}")
             item_out = {"part_no": part_no, "qty": qty, "brand": brand, "source": "COPILOT_UNIFIED"}
             if product_type:
                 item_out["product_type"] = product_type
             items_out.append(item_out)
-
-        if image_path:
-            items_out = _filter_conflicting_visual_items(items_out)
 
         result = {
             "attempted": True,
@@ -363,6 +387,7 @@ def analyze_incoming_inquiry_with_copilot(
             "reasoning": reasoning,
             "items": items_out,
             "technical_summary": technical_summary,
+            "analysis_text": analysis_text,
             "is_industrial_automation": is_ia,
             "compatible_brands": compatible_brands,
             "raw_excerpt": raw[:800],
@@ -495,9 +520,9 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
                 },
             ]
 
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
+        response = _copilot_fresh_chat(
+            client,
+            [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_content},
             ],
@@ -571,9 +596,9 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
         "Keep the answer under 180 words. Plain text only. No markdown, no headers, no hyperlinks."
     )
     try:
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
+        response = _copilot_fresh_chat(
+            client,
+            [
                 {
                     "role": "system",
                     "content": (
@@ -792,9 +817,9 @@ def extract_timer_label_from_image(caption: str = "", image_path: str = None) ->
         with open(image_path, "rb") as image_file:
             image_b64 = base64.b64encode(image_file.read()).decode("ascii")
         mime = mimetypes.guess_type(image_path)[0] or "image/png"
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
+        response = _copilot_fresh_chat(
+            client,
+            [
                 {"role": "system", "content": system_instruction},
                 {
                     "role": "user",
@@ -884,9 +909,9 @@ def extract_label_from_image(caption: str = "", image_path: str = None) -> dict:
                 },
             },
         ]
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
+        response = _copilot_fresh_chat(
+            client,
+            [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_content},
             ],
@@ -971,11 +996,8 @@ def finalize_copilot_visual_items(
     copilot_items: list = None,
     unified_analyze_ran: bool = False,
 ) -> list:
-    """Return Copilot unified items only — no secondary OCR or RFQ re-extraction."""
-    items = list(copilot_items or [])
-    if unified_analyze_ran:
-        return _filter_conflicting_visual_items(items)
-    return _filter_conflicting_visual_items(items)
+    """Return Copilot unified items as-is — no secondary OCR or regex post-filters."""
+    return list(copilot_items or [])
 
 
 def _resolve_visual_items(caption: str, image_path: str = None, copilot_items: list = None) -> list:
@@ -1092,7 +1114,7 @@ def build_technical_support_reply(
     if not message_text and not image_path:
         return ""
 
-    visual_items = _filter_conflicting_visual_items(list(copilot_items or []))
+    visual_items = list(copilot_items or [])
     if visual_items:
         print(f"[COPILOT TECH SUPPORT] Using {len(visual_items)} unified analyze item(s)")
     elif image_path:
@@ -1182,9 +1204,9 @@ def build_technical_support_reply(
         if image_path and os.path.exists(image_path):
             print(f"[COPILOT TECH SUPPORT] Attaching exact message-bubble screenshot: {image_path}")
 
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
+        response = _copilot_fresh_chat(
+            client,
+            [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
