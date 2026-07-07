@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.26-LABEL-FOCUS-MONITOR-PHOTO"
+VERSION = "v1.27-LABEL-FOCUS-OVERRIDE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -254,14 +254,18 @@ Analyze ONLY the attached product label/nameplate image.
 Do NOT use information from previous conversations.
 
 The customer is quoting ONE product shown in this photo (e.g. "quote me 1 pce").
-Read the exact model/code printed on the label character-by-character.
+Focus on the MAIN product in the foreground (battery, timer, sensor, relay held in hand).
+Ignore background PLC wiring, terminal blocks, and unrelated equipment.
+
+Read the exact model/code printed on the product label character-by-character.
 
 Examples:
-- Lithium battery label ER6C 3.6V → part_no=ER6C 3.6V, product_type=LITHIUM BATTERY
-- Timer H3JA-8A → part_no=H3JA-8A, product_type=TIMER
-- Sensor E3Z-T61 only if those exact characters are printed on the label
+- Red label with "Lithium" and ER6C (AA) 3.6V → part_no=ER6C 3.6V, brand=TOSHIBA or OMRON, product_type=LITHIUM BATTERY
+- Timer H3JA-8A on nameplate → part_no=H3JA-8A, product_type=TIMER
+- Sensor E2E-X5E1 or E3Z-T61 ONLY if those exact characters are printed on the foreground label
 
-Do NOT guess E3Z, E2E, or E3Z-T61-L unless those exact characters appear on THIS label.
+NEVER return E2E-X5E1, E3Z-T61, or E3Z-T61-L unless those exact codes are printed on the foreground product label.
+A lithium battery label with ER6C is NOT an E2E sensor.
 
 Return plain-text analysis, then on the last line only append JSON (no markdown):
 {"items":[{"part_no":"ER6C 3.6V","qty":1,"brand":"TOSHIBA","product_type":"LITHIUM BATTERY"}],"technical_summary":"..."}
@@ -285,6 +289,10 @@ def _should_run_rfq_table_focus(message_text: str = "", analysis_text: str = "")
         return False
     blob = f"{message_text}\n{analysis_text}".upper()
     return bool(re.search(r"\b(PLS QUOTE|KINDLY QUOTE|MORNING MS|RFQ|QTY\s*3)\b", blob))
+
+
+def _normalize_part_key(part_no: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
 
 
 def _items_need_label_reverify(items: list, message_text: str) -> bool:
@@ -740,7 +748,27 @@ def analyze_incoming_inquiry_with_copilot(
         )
 
         if image_path and os.path.exists(image_path):
-            if _items_need_label_reverify(items_out, message_text):
+            if _is_single_product_photo_inquiry(message_text):
+                label_items = _copilot_label_focus_pass(
+                    client,
+                    message_text=message_text,
+                    image_path=image_path,
+                    voice_transcript=voice_transcript,
+                )
+                if label_items:
+                    first_key = _normalize_part_key((items_out[0] or {}).get("part_no"))
+                    label_key = _normalize_part_key(label_items[0].get("part_no"))
+                    if items_out and first_key != label_key:
+                        print(
+                            f"[COPILOT ANALYZE] Label focus overrides first pass: "
+                            f"{items_out[0].get('part_no')} → {label_items[0].get('part_no')}"
+                        )
+                    items_out = label_items
+                    for item in items_out:
+                        item["source"] = "COPILOT_LABEL"
+                elif not items_out:
+                    print("[COPILOT ANALYZE] Label focus returned no items — keeping first pass")
+            elif _items_need_label_reverify(items_out, message_text):
                 print(
                     "[COPILOT ANALYZE] Sensor-like guess on single-product photo — "
                     "re-reading label"
@@ -757,7 +785,7 @@ def analyze_incoming_inquiry_with_copilot(
                     )
                     for item in items_out:
                         item["source"] = "COPILOT_RFQ_TABLE"
-                else:
+                elif not _is_single_product_photo_inquiry(message_text):
                     items_out = _copilot_label_focus_pass(
                         client,
                         message_text=message_text,

@@ -71,7 +71,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.48-MONITOR-PHOTO-ATTACH"
+VERSION = "v3.49-MONITOR-IMAGE-SEND-FIX"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3893,7 +3893,7 @@ def find_message_box(driver):
     return None
 
 
-def click_send_button(driver, timeout=15):
+def click_send_button(driver, timeout=15, include_preview: bool = False):
     end = time.time() + timeout
 
     send_selectors = [
@@ -3907,11 +3907,21 @@ def click_send_button(driver, timeout=15):
         '//*[@data-icon="send"]/ancestor::div[@role="button"]',
         '//*[@data-icon="send"]',
     ]
+    if include_preview:
+        send_selectors = [
+            '[data-testid="media-preview-send"]',
+            'span[data-icon="send"]',
+            'div[role="button"][aria-label="Send"]',
+            'button[aria-label="Send"]',
+        ] + send_selectors
 
     while time.time() < end:
         for selector in send_selectors:
             try:
-                elements = driver.find_elements(By.XPATH, selector)
+                if selector.startswith("/") or selector.startswith("("):
+                    elements = driver.find_elements(By.XPATH, selector)
+                else:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
 
                 for el in elements:
                     if el.is_displayed():
@@ -4050,12 +4060,13 @@ def send_image_attachment_in_current_chat(driver, image_path: str, caption: str 
             print("⚠️ Could not find WhatsApp file input for image attach.")
             return False
 
-        time.sleep(3)
+        time.sleep(4)
 
         if caption:
             for selector in (
                 'div[contenteditable="true"][data-tab="10"]',
                 'div[contenteditable="true"][role="textbox"]',
+                'footer div[contenteditable="true"]',
             ):
                 try:
                     boxes = driver.find_elements(By.CSS_SELECTOR, selector)
@@ -4068,9 +4079,17 @@ def send_image_attachment_in_current_chat(driver, image_path: str, caption: str 
                 except Exception:
                     continue
 
-        if click_send_button(driver, timeout=20):
+        if click_send_button(driver, timeout=25, include_preview=True):
             print("✅ Image attachment sent.")
             return True
+
+        try:
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+            time.sleep(1)
+            print("✅ Image attachment sent via ENTER.")
+            return True
+        except Exception:
+            pass
 
         print("⚠️ Image attached but send button not found.")
         return False
@@ -4085,13 +4104,16 @@ def send_monitor_notification(
     image_path: str = None,
     image_caption: str = "OpenClaw analyzed image",
 ) -> bool:
-    """Send text + optional analyzed image to the monitor WhatsApp chat."""
+    """Send analyzed image first, then text — so monitor sees photo before long reply."""
+    ok = True
+    if image_path and os.path.exists(image_path):
+        if not send_image_attachment_in_current_chat(driver, image_path, caption=image_caption):
+            print("⚠️ Monitor image attach failed — continuing with text only.")
+            ok = False
+        time.sleep(2)
     if not send_reply_in_current_chat(driver, message):
         return False
-    if image_path and os.path.exists(image_path):
-        time.sleep(1.5)
-        return send_image_attachment_in_current_chat(driver, image_path, caption=image_caption)
-    return True
+    return ok
 
 
 def build_monitor_reply(context, customer_name, customer_contact, original_message, reply_message,
