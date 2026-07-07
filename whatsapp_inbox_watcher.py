@@ -71,7 +71,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.47-RFQ-TABLE-VISION"
+VERSION = "v3.48-MONITOR-PHOTO-ATTACH"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -4008,8 +4008,94 @@ def customer_replies_go_to_monitor():
     return get_customer_reply_mode() in ("monitor", "debug", "test")
 
 
+def send_image_attachment_in_current_chat(driver, image_path: str, caption: str = "") -> bool:
+    """Attach and send an image in the open WhatsApp chat (for monitor verification)."""
+    if not image_path or not os.path.exists(image_path):
+        return False
+
+    abs_path = os.path.abspath(image_path)
+    print(f"📷 Attaching image to WhatsApp chat: {abs_path}")
+
+    try:
+        attach_selectors = [
+            'span[data-icon="plus"]',
+            'span[data-icon="clip"]',
+            'div[title="Attach"]',
+            '[data-testid="attach-menu"]',
+        ]
+        for selector in attach_selectors:
+            try:
+                for btn in driver.find_elements(By.CSS_SELECTOR, selector):
+                    if btn.is_displayed():
+                        btn.click()
+                        time.sleep(0.8)
+                        break
+            except Exception:
+                continue
+
+        file_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
+        sent = False
+        for file_input in file_inputs:
+            try:
+                accept = (file_input.get_attribute("accept") or "").lower()
+                if accept and "image" not in accept and "video" not in accept:
+                    continue
+                file_input.send_keys(abs_path)
+                sent = True
+                break
+            except Exception:
+                continue
+
+        if not sent:
+            print("⚠️ Could not find WhatsApp file input for image attach.")
+            return False
+
+        time.sleep(3)
+
+        if caption:
+            for selector in (
+                'div[contenteditable="true"][data-tab="10"]',
+                'div[contenteditable="true"][role="textbox"]',
+            ):
+                try:
+                    boxes = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for box in boxes:
+                        if box.is_displayed():
+                            box.click()
+                            time.sleep(0.3)
+                            box.send_keys(caption[:900])
+                            break
+                except Exception:
+                    continue
+
+        if click_send_button(driver, timeout=20):
+            print("✅ Image attachment sent.")
+            return True
+
+        print("⚠️ Image attached but send button not found.")
+        return False
+    except Exception as exc:
+        print(f"⚠️ Image attach failed: {exc}")
+        return False
+
+
+def send_monitor_notification(
+    driver,
+    message: str,
+    image_path: str = None,
+    image_caption: str = "OpenClaw analyzed image",
+) -> bool:
+    """Send text + optional analyzed image to the monitor WhatsApp chat."""
+    if not send_reply_in_current_chat(driver, message):
+        return False
+    if image_path and os.path.exists(image_path):
+        time.sleep(1.5)
+        return send_image_attachment_in_current_chat(driver, image_path, caption=image_caption)
+    return True
+
+
 def build_monitor_reply(context, customer_name, customer_contact, original_message, reply_message,
-                        classification_summary=None):
+                        classification_summary=None, image_path=None, copilot_items=None):
     lines = [
         "[OpenClaw Monitor Mode]",
         f"Context: {context or 'Customer reply'}",
@@ -4025,6 +4111,20 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
         lines.append("Classification:")
         lines.append(classification_summary)
 
+    if copilot_items:
+        lines.append("")
+        lines.append("Copilot extracted parts:")
+        for item in copilot_items:
+            lines.append(
+                f"  - {item.get('part_no')} | Qty: {item.get('qty')} | "
+                f"Brand: {item.get('brand')} | Source: {item.get('source')}"
+            )
+
+    if image_path:
+        lines.append("")
+        lines.append(f"Analyzed image file: {image_path}")
+        lines.append("(Photo attached below for verification)")
+
     lines.extend([
         "",
         "Original Message:",
@@ -4039,7 +4139,8 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
 
 def send_customer_reply(driver, reply_message, customer_name=None, customer_contact=None,
                         original_message=None, context="CUSTOMER_REPLY",
-                        customer_chat_is_open=True, classification_summary=None):
+                        customer_chat_is_open=True, classification_summary=None,
+                        image_path=None, copilot_items=None):
     if customer_replies_go_to_monitor():
         print(
             "🧪 Monitor mode active. Redirecting alert to your monitor number "
@@ -4057,8 +4158,15 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
             original_message=original_message,
             reply_message=reply_message,
             classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_items,
         )
-        return send_reply_in_current_chat(driver, monitor_message)
+        return send_monitor_notification(
+            driver,
+            monitor_message,
+            image_path=image_path,
+            image_caption=f"OpenClaw: {context or 'analyzed image'}",
+        )
 
     if not customer_chat_is_open:
         if not open_whatsapp_chat_by_phone(driver, customer_contact, chat_label="customer"):
@@ -4109,10 +4217,18 @@ def send_copilot_malfunction_alert(
     if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
         print("❌ Could not open monitor chat for Copilot malfunction alert.")
         return False
-    return send_reply_in_current_chat(driver, alert)
+    return send_monitor_notification(
+        driver,
+        alert,
+        image_path=image_path if image_path and os.path.exists(image_path) else None,
+        image_caption=f"OpenClaw malfunction: {operation}",
+    )
 
 
-def send_classification_alert(driver, contact_name, customer_contact, message_text, classification):
+def send_classification_alert(
+    driver, contact_name, customer_contact, message_text, classification,
+    image_path: str = None, copilot_items=None,
+):
     """Always notify monitor during development so every message is classified and visible."""
     alert = build_classification_monitor_message(
         contact_name, customer_contact, message_text, classification
@@ -4127,7 +4243,12 @@ def send_classification_alert(driver, contact_name, customer_contact, message_te
         print("❌ Could not open monitor chat for classification alert.")
         return False
 
-    return send_reply_in_current_chat(driver, alert)
+    return send_monitor_notification(
+        driver,
+        alert,
+        image_path=image_path if image_path and os.path.exists(image_path) else None,
+        image_caption="OpenClaw classification image",
+    )
 
 
 def process_monitor_feedback(driver):
@@ -4386,6 +4507,8 @@ def process_customer_inquiry(
             context="COPILOT_MALFUNCTION_HOLD",
             customer_chat_is_open=True,
             classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_analysis.get("items") or [],
         )
         append_log(contact_name, latest_message, [], [], "COPILOT_MALFUNCTION_HOLD")
         return
@@ -4572,6 +4695,8 @@ def process_customer_inquiry(
             context=f"{image_prefix}NO_ITEMS",
             customer_chat_is_open=True,
             classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_items,
         )
         append_log(
             contact_name,
@@ -4615,6 +4740,8 @@ def process_customer_inquiry(
         context=f"{image_prefix}QUOTATION_REPLY",
         customer_chat_is_open=True,
         classification_summary=classification_summary,
+        image_path=image_path,
+        copilot_items=copilot_items,
     )
 
     if tbc_by_brand:
@@ -4901,17 +5028,26 @@ def _process_open_chat_body(driver, raw_contact_name):
         log_classification(contact_name, customer_contact, inquiry_text, classification)
 
         if re.search(r"WA-\d{8}-[A-Z0-9]+-[A-Z0-9]+", inquiry_text, re.I):
-            send_classification_alert(driver, contact_name, customer_contact, inquiry_text, classification)
+            send_classification_alert(
+                driver, contact_name, customer_contact, inquiry_text, classification,
+                image_path=image_path, copilot_items=copilot_items,
+            )
             process_supplier_reply(driver, contact_name, inquiry_text)
             return
 
         if classification.handler == "supplier_reply":
-            send_classification_alert(driver, contact_name, customer_contact, inquiry_text, classification)
+            send_classification_alert(
+                driver, contact_name, customer_contact, inquiry_text, classification,
+                image_path=image_path, copilot_items=copilot_items,
+            )
             process_supplier_reply(driver, contact_name, inquiry_text)
             return
 
         if classification.handler == "skip":
-            send_classification_alert(driver, contact_name, customer_contact, inquiry_text, classification)
+            send_classification_alert(
+                driver, contact_name, customer_contact, inquiry_text, classification,
+                image_path=image_path, copilot_items=copilot_items,
+            )
             process_classified_non_inquiry(
                 driver, contact_name, inquiry_text, classification,
                 customer_contact=customer_contact, image_analysis=image_analysis,

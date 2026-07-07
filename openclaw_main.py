@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.25-RFQ-TABLE-VISION"
+VERSION = "v1.26-LABEL-FOCUS-MONITOR-PHOTO"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -248,6 +248,57 @@ Return plain-text analysis, then on the last line only append JSON (no markdown)
 {"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
 """
 
+LABEL_FOCUS_PROMPT = """NEW INQUIRY
+
+Analyze ONLY the attached product label/nameplate image.
+Do NOT use information from previous conversations.
+
+The customer is quoting ONE product shown in this photo (e.g. "quote me 1 pce").
+Read the exact model/code printed on the label character-by-character.
+
+Examples:
+- Lithium battery label ER6C 3.6V → part_no=ER6C 3.6V, product_type=LITHIUM BATTERY
+- Timer H3JA-8A → part_no=H3JA-8A, product_type=TIMER
+- Sensor E3Z-T61 only if those exact characters are printed on the label
+
+Do NOT guess E3Z, E2E, or E3Z-T61-L unless those exact characters appear on THIS label.
+
+Return plain-text analysis, then on the last line only append JSON (no markdown):
+{"items":[{"part_no":"ER6C 3.6V","qty":1,"brand":"TOSHIBA","product_type":"LITHIUM BATTERY"}],"technical_summary":"..."}
+"""
+
+
+def _is_single_product_photo_inquiry(message_text: str) -> bool:
+    """True for 'quote me 1 pce' style — one product label photo, not an RFQ table."""
+    text = str(message_text or "").upper()
+    return bool(
+        re.search(
+            r"\b(QUOTE ME|(?:^|\s)1\s*(?:PCE|PC|PCS|PIECE|PIECES)|ONE PCE|ONE PC)\b",
+            text,
+        )
+    )
+
+
+def _should_run_rfq_table_focus(message_text: str = "", analysis_text: str = "") -> bool:
+    """RFQ table focus only for table-style quote requests — not single label photos."""
+    if _is_single_product_photo_inquiry(message_text):
+        return False
+    blob = f"{message_text}\n{analysis_text}".upper()
+    return bool(re.search(r"\b(PLS QUOTE|KINDLY QUOTE|MORNING MS|RFQ|QTY\s*3)\b", blob))
+
+
+def _items_need_label_reverify(items: list, message_text: str) -> bool:
+    """Re-read label when Copilot returns a sensor part on a single-product photo."""
+    if not _is_single_product_photo_inquiry(message_text) or not items:
+        return False
+    for item in items:
+        part_key = re.sub(r"[^A-Z0-9]", "", str(item.get("part_no") or "").upper())
+        ptype = str(item.get("product_type") or "").upper()
+        if part_key.startswith(("E3Z", "E2E", "E39")):
+            if "SENSOR" not in ptype and "PHOTO" not in ptype and "PROXIMITY" not in ptype:
+                return True
+    return False
+
 
 def _parse_caption_qty(text: str, default: int = 1) -> int:
     """Parse qty from caption without loading the warehouse engine."""
@@ -481,6 +532,49 @@ def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_t
     return items_out
 
 
+def _copilot_label_focus_pass(
+    client,
+    message_text: str = "",
+    image_path: str = None,
+    voice_transcript: str = "",
+) -> list:
+    """Fresh Copilot call to read a single product label/nameplate (battery, timer, etc.)."""
+    if not image_path or not os.path.exists(image_path):
+        return []
+
+    from whatsapp_attachment_processor import validate_image_file
+
+    ok_img, reason = validate_image_file(image_path)
+    if not ok_img:
+        print(f"[COPILOT LABEL] Skipping focus pass — invalid image: {reason}")
+        return []
+
+    parts = [LABEL_FOCUS_PROMPT]
+    if message_text:
+        parts.append(f"Customer caption:\n{message_text}")
+    user_content = _copilot_user_content_with_image("\n\n".join(parts), image_path)
+
+    print("[COPILOT LABEL] Focus pass — read product label/nameplate from image...")
+    try:
+        response = _copilot_fresh_chat(
+            client,
+            [{"role": "user", "content": user_content}],
+            timeout=120.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT LABEL RAW] {raw[:400]}")
+        _prose, parsed = _extract_json_from_copilot_text(raw)
+        if not isinstance(parsed, dict):
+            return []
+        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
+        if items:
+            print(f"[COPILOT LABEL] Extracted {len(items)} item(s) from label focus pass")
+        return items
+    except Exception as exc:
+        print(f"[WARN] Copilot label focus pass failed: {exc}")
+        return []
+
+
 def _copilot_rfq_table_focus_pass(
     client,
     message_text: str = "",
@@ -645,16 +739,33 @@ def analyze_incoming_inquiry_with_copilot(
             parsed, message_text=message_text, voice_transcript=voice_transcript
         )
 
-        if not items_out and image_path and os.path.exists(image_path):
-            items_out = _copilot_rfq_table_focus_pass(
-                client,
-                message_text=message_text,
-                image_path=image_path,
-                voice_transcript=voice_transcript,
-            )
-            if items_out:
-                for item in items_out:
-                    item["source"] = "COPILOT_RFQ_TABLE"
+        if image_path and os.path.exists(image_path):
+            if _items_need_label_reverify(items_out, message_text):
+                print(
+                    "[COPILOT ANALYZE] Sensor-like guess on single-product photo — "
+                    "re-reading label"
+                )
+                items_out = []
+
+            if not items_out:
+                if _should_run_rfq_table_focus(message_text, analysis_text):
+                    items_out = _copilot_rfq_table_focus_pass(
+                        client,
+                        message_text=message_text,
+                        image_path=image_path,
+                        voice_transcript=voice_transcript,
+                    )
+                    for item in items_out:
+                        item["source"] = "COPILOT_RFQ_TABLE"
+                else:
+                    items_out = _copilot_label_focus_pass(
+                        client,
+                        message_text=message_text,
+                        image_path=image_path,
+                        voice_transcript=voice_transcript,
+                    )
+                    for item in items_out:
+                        item["source"] = "COPILOT_LABEL"
 
         result = {
             "attempted": True,
