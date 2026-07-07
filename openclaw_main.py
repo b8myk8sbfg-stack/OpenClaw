@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.39-STRICT-JSON"
+VERSION = "v1.40-STRICT-JSON"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -159,6 +159,8 @@ single_product_photo / handheld (A):
 rfq_table (B):
 - If the image shows a grid/table with column headers (No, Item, Picture, Qty, Description, Model) → input_type MUST be rfq_table, NOT single_product_photo
 - Wide landscape screenshots of spreadsheet rows are almost always rfq_table
+- Count visible rows — if only ONE row is visible, return exactly ONE item in items[]
+- Never invent extra rows that are not visible in the image
 - Every visible row = one item in items[]
 - qty: from Qty column — never default to 1 if Qty column shows another number
 - part_no: from Item/Model/Catalog column; use Picture column nameplate to confirm
@@ -200,19 +202,23 @@ If no products found: status="no_products", items=[]. If label unreadable: statu
 One product = one item. One RFQ row = one item. One PO line = one item.
 """
 
-OPENCLAW_TABLE_RETRY_PROMPT = """CRITICAL RE-ANALYSIS — your previous classification was likely wrong.
+OPENCLAW_TABLE_RETRY_PROMPT = """CRITICAL RE-ANALYSIS — your previous classification was wrong.
 
 The attached image is a WIDE landscape RFQ / quotation TABLE (columns such as No, Item, Picture, Qty).
 You must NOT classify this as single_product_photo or a handheld battery.
 
 Rules:
 - input_type MUST be rfq_table
-- Read EVERY visible row
-- part_no from Item/Model column and/or nameplate in Picture column (literal transcription)
-- qty from Qty column (do not default to 1 if Qty shows 3)
-- Never substitute ER6C, E3Z-D61, H3JA-8A or any catalog number unless literally visible
+- Count visible rows — if only ONE row is visible, return exactly ONE item
+- Never invent extra rows that are not visible in the image
+- part_no: literal transcription from Item/Model column and/or nameplate in Picture column
+- qty: from Qty column for that row
+- brand: from Item text or nameplate (e.g. Allen-Bradley)
+- Read only what is visible — never substitute from memory or examples
 
-Return ONLY valid JSON. No markdown. No prose. Same schema as before with status, intent, input_type, items, ignored.
+Required JSON fields: status, intent, input_type, items (array), ignored (array).
+
+Return ONLY valid JSON. No markdown. No prose.
 """
 
 OPENCLAW_JSON_RETRY_PROMPT = """CRITICAL: Your previous response was NOT valid JSON or failed validation.
@@ -407,6 +413,34 @@ def parse_copilot_json_response(raw: str):
     return None, "JSON_INVALID", "no parseable JSON object found"
 
 
+def _normalize_copilot_extraction_json(parsed: dict) -> dict:
+    """Fill missing contract fields so valid extractions are not discarded."""
+    if not isinstance(parsed, dict):
+        return {}
+    out = dict(parsed)
+    items = out.get("items")
+    if not isinstance(items, list):
+        items = []
+        out["items"] = items
+    if not str(out.get("status") or "").strip():
+        out["status"] = "success" if items else "no_products"
+    if not str(out.get("intent") or "").strip():
+        out["intent"] = "rfq_inquiry"
+    if not str(out.get("input_type") or "").strip():
+        out["input_type"] = "unknown"
+    if "ignored" not in out or not isinstance(out.get("ignored"), list):
+        out["ignored"] = list(out.get("ignored") or []) if out.get("ignored") else []
+    if out.get("confidence") is None:
+        out["confidence"] = 0.75
+    if "primary_subject" not in out:
+        out["primary_subject"] = ""
+    if "technical_summary" not in out:
+        out["technical_summary"] = ""
+    if "reasoning" not in out:
+        out["reasoning"] = ""
+    return out
+
+
 def _validate_copilot_extraction_json(parsed: dict):
     """Validate required contract fields. Returns (ok, missing_fields)."""
     if not isinstance(parsed, dict):
@@ -504,6 +538,26 @@ def _suspect_table_misread(
     )
     handheld = input_type in ("single_product_photo", "multiple_product_photo", "", "unknown")
     return handheld and (quote_caption or primary == "battery" or battery_item)
+
+
+def _should_adopt_table_retry(parsed_handheld: dict, parsed_table: dict) -> bool:
+    """Prefer rfq_table retry over a misread handheld/battery pass1."""
+    if str(parsed_table.get("input_type") or "").strip().lower() != "rfq_table":
+        return False
+    items = [
+        item for item in (parsed_table.get("items") or [])
+        if isinstance(item, dict) and str(item.get("part_no") or "").strip()
+    ]
+    if not items:
+        return False
+    handheld_part = ""
+    handheld_items = parsed_handheld.get("items") or []
+    if handheld_items and isinstance(handheld_items[0], dict):
+        handheld_part = str(handheld_items[0].get("part_no") or "").strip().upper()
+    table_parts = {str(i.get("part_no") or "").strip().upper() for i in items}
+    if handheld_part and handheld_part not in table_parts:
+        return True
+    return len(items) >= 1
 
 
 def _append_copilot_extraction_log(
@@ -851,6 +905,8 @@ def analyze_incoming_inquiry_with_copilot(
         response_raw = (response.choices[0].message.content or "").strip()
         print(f"[COPILOT ANALYZE RAW/{label}] {response_raw[:500]}")
         parsed_obj, parse_err, parse_detail = parse_copilot_json_response(response_raw)
+        if parsed_obj is not None:
+            parsed_obj = _normalize_copilot_extraction_json(parsed_obj)
         _append_copilot_extraction_log(
             pass_label=label,
             message_text=message_text,
@@ -947,8 +1003,39 @@ def analyze_incoming_inquiry_with_copilot(
                 + f"\n\nYour incorrect prior classification: input_type={prev_type}, part_no={prev_part}"
             )
             raw2, parsed2, err2, det2 = _call_and_parse(table_prompt, "pass3-table-retry")
-            if parsed2 is not None and _validate_copilot_extraction_json(parsed2)[0]:
+            if parsed2 is not None and _should_adopt_table_retry(parsed, parsed2):
+                print(
+                    f"[COPILOT ANALYZE] Adopting pass3-table-retry: "
+                    f"rfq_table with {len(parsed2.get('items') or [])} item(s)"
+                )
                 raw, parsed = raw2, parsed2
+            elif parsed2 is not None:
+                print(
+                    "[COPILOT ANALYZE] pass3-table-retry not adopted — "
+                    f"input_type={parsed2.get('input_type')}, items={len(parsed2.get('items') or [])}"
+                )
+
+        valid, missing = _validate_copilot_extraction_json(parsed)
+        if not valid:
+            print(f"[COPILOT ANALYZE] JSON_INVALID after retries — missing/invalid fields: {missing}")
+            fail = _minimal_copilot_analysis_result(
+                message_text=message_text,
+                raw=raw,
+                parse_warning=f"JSON validation failed: {', '.join(missing)}",
+                http_status=200,
+                extraction_error="JSON_INVALID",
+            )
+            _append_copilot_extraction_log(
+                pass_label="final",
+                message_text=message_text,
+                image_path=image_path,
+                image_dims=image_dims,
+                raw=raw,
+                parsed=parsed,
+                result=fail,
+                note=f"JSON_INVALID: {missing}",
+            )
+            return fail
 
         result = _copilot_extraction_result_from_parsed(
             parsed,
