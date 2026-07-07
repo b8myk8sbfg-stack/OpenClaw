@@ -9,6 +9,7 @@ import datetime
 import random
 import string
 import socket
+from typing import Optional
 
 import sys
 
@@ -60,12 +61,16 @@ from whatsapp_attachment_processor import (
     ensure_voice_transcript,
     pick_newest_image_download,
     save_wa_image_manifest,
+    save_validated_image_bytes,
+    validate_image_file,
+    MIN_WA_IMAGE_DISPLAY_PX,
+    MIN_WA_IMAGE_NATURAL_PX,
     BLOB_TO_BASE64_JS,
     _execute_async_js,
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.45-FULL-RES-IMAGE-DOWNLOAD"
+VERSION = "v3.46-WA-IMAGE-VALIDATION"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3432,36 +3437,168 @@ def capture_bubble_media_crop(driver, bubble, image_path):
         return None
 
 
-def _find_main_viewer_image(driver):
-    """Return the largest main image in the WhatsApp media viewer (not thumbnail strip)."""
-    viewer_selectors = [
-        '[data-testid="media-viewer-panel"] img[src]',
-        'div[data-animate-media-viewer="true"] img[src]',
-        'img[src*="blob:"]',
-        'img[src*="mmg"]',
-    ]
-    best = None
-    best_area = 0
-    for selector in viewer_selectors:
-        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+BEST_VIEWER_IMAGE_INFO_JS = """
+var callback = arguments[arguments.length - 1];
+function isThumb(el) {
+  var p = el;
+  for (var i = 0; i < 12 && p; i++) {
+    var tid = (p.getAttribute && p.getAttribute('data-testid')) || '';
+    if (/thumb|thumbnail|filmstrip/i.test(tid)) return true;
+    p = p.parentElement;
+  }
+  return false;
+}
+function isUiIcon(src) {
+  src = (src || '').toLowerCase();
+  return !src || src.indexOf('emoji') >= 0 || src.indexOf('profile') >= 0
+    || src.indexOf('avatar') >= 0 || src.indexOf('data:image/gif') === 0;
+}
+var panel = document.querySelector('[data-testid="media-viewer-panel"]')
+  || document.querySelector('div[data-animate-media-viewer="true"]')
+  || document.body;
+var imgs = Array.from(panel.querySelectorAll('img[src]')).filter(function(img) {
+  if (!img.offsetParent) return false;
+  var src = img.currentSrc || img.src || '';
+  if (isUiIcon(src)) return false;
+  if (isThumb(img)) return false;
+  return true;
+});
+var best = null, bestScore = 0;
+imgs.forEach(function(img) {
+  var nw = img.naturalWidth || 0;
+  var nh = img.naturalHeight || 0;
+  var dw = img.clientWidth || 0;
+  var dh = img.clientHeight || 0;
+  var score = Math.max(nw * nh, dw * dh);
+  if (score > bestScore) {
+    best = img;
+    bestScore = score;
+  }
+});
+if (!best) {
+  callback(null);
+  return;
+}
+callback({
+  src: best.currentSrc || best.src || '',
+  naturalW: best.naturalWidth || 0,
+  naturalH: best.naturalHeight || 0,
+  displayW: best.clientWidth || 0,
+  displayH: best.clientHeight || 0
+});
+"""
+
+
+def _viewer_image_info(driver):
+    try:
+        return _execute_async_js(driver, BEST_VIEWER_IMAGE_INFO_JS, timeout=10)
+    except Exception:
+        return None
+
+
+def _find_main_viewer_image(driver, src_hint: str = ""):
+    """Return the main viewer <img> element (largest natural/display size)."""
+    hint = str(src_hint or "").strip()
+    if hint:
+        for element in driver.find_elements(By.CSS_SELECTOR, "img[src]"):
             try:
                 if not element.is_displayed():
                     continue
-                src = (element.get_attribute("src") or "").lower()
-                if is_profile_or_ui_image_src(src):
-                    continue
-                el_size = element.size or {}
-                el_width = int(el_size.get("width") or 0)
-                el_height = int(el_size.get("height") or 0)
-                if el_height < 120 and el_width < 220:
-                    continue
-                area = el_width * el_height
-                if area > best_area:
-                    best = element
-                    best_area = area
+                src = element.get_attribute("src") or ""
+                current = element.get_attribute("currentSrc") or ""
+                if hint in src or hint in current:
+                    return element
             except Exception:
                 continue
+
+    info = _viewer_image_info(driver)
+    if info and info.get("src"):
+        return _find_main_viewer_image(driver, info["src"])
+
+    best = None
+    best_score = 0
+    for element in driver.find_elements(By.CSS_SELECTOR, "img[src]"):
+        try:
+            if not element.is_displayed():
+                continue
+            src = (element.get_attribute("src") or "").lower()
+            if is_profile_or_ui_image_src(src):
+                continue
+            dims = driver.execute_script(
+                "return {"
+                "nw: arguments[0].naturalWidth||0, nh: arguments[0].naturalHeight||0,"
+                "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0"
+                "};",
+                element,
+            ) or {}
+            score = max(
+                int(dims.get("nw") or 0) * int(dims.get("nh") or 0),
+                int(dims.get("dw") or 0) * int(dims.get("dh") or 0),
+            )
+            if score > best_score:
+                best = element
+                best_score = score
+        except Exception:
+            continue
     return best
+
+
+def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
+    """Wait until viewer shows a real image (not 72x32 placeholder)."""
+    end = time.time() + timeout
+    best_info = None
+    while time.time() < end:
+        info = _viewer_image_info(driver)
+        if info:
+            nw = int(info.get("naturalW") or 0)
+            nh = int(info.get("naturalH") or 0)
+            dw = int(info.get("displayW") or 0)
+            dh = int(info.get("displayH") or 0)
+            best_info = info
+            if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+                return info
+            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+                return info
+        time.sleep(0.75)
+    return best_info
+
+
+def _save_downloaded_image(downloaded: str, dest_path: str) -> Optional[str]:
+    if not downloaded:
+        return None
+    try:
+        with open(downloaded, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    saved = save_validated_image_bytes(data, dest_path)
+    if saved:
+        print(
+            f"🖼️ Saved full-resolution image → {saved} "
+            f"({os.path.getsize(saved)} bytes)"
+        )
+    return saved
+
+
+def _save_element_screenshot(element, dest_path: str) -> Optional[str]:
+    try:
+        tmp_path = dest_path if dest_path.endswith(".png") else f"{dest_path}.png"
+        element.screenshot(tmp_path)
+        ok, reason = validate_image_file(tmp_path)
+        if ok:
+            print(
+                f"🖼️ Saved viewer screenshot → {tmp_path} "
+                f"({os.path.getsize(tmp_path)} bytes)"
+            )
+            return tmp_path
+        print(f"⚠️ Viewer screenshot rejected: {reason}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    except Exception as exc:
+        print(f"⚠️ Viewer screenshot failed: {exc}")
+    return None
 
 
 IMAGE_CANVAS_EXPORT_JS = """
@@ -3489,8 +3626,8 @@ try {
 
 def download_full_resolution_image(driver, bubble, image_path):
     """
-    Open the WhatsApp image viewer and save the full-resolution source image
-    to WA_Image (blob fetch, viewer download, or canvas export — not bubble screenshot).
+    Open the WhatsApp image viewer and save a readable product image to WA_Image.
+    Rejects tiny placeholders (e.g. 72x32 / 898 bytes) that break Copilot vision.
     """
     thumb = find_media_image_in_bubble(bubble)
     if thumb is None:
@@ -3505,38 +3642,23 @@ def download_full_resolution_image(driver, bubble, image_path):
         )
         time.sleep(1.0)
         driver.execute_script("arguments[0].click();", thumb)
-        time.sleep(2.5)
+        time.sleep(3.0)
 
-        main_img = _find_main_viewer_image(driver)
+        info = wait_for_viewer_high_resolution(driver, timeout=22.0)
+        main_img = _find_main_viewer_image(driver, (info or {}).get("src", ""))
         if main_img is None:
             print("⚠️ Media viewer opened but main image element not found.")
             return None
 
-        if not wait_for_media_image_ready(driver, main_img, timeout=12):
-            print("⚠️ Viewer main image not fully loaded — trying anyway.")
-
         natural = driver.execute_script(
-            "return {w: arguments[0].naturalWidth||0, h: arguments[0].naturalHeight||0};",
+            "return {w: arguments[0].naturalWidth||0, h: arguments[0].naturalHeight||0,"
+            "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0};",
             main_img,
         ) or {}
         print(
-            f"🖼️ Viewer image ready — display "
-            f"{(main_img.size or {}).get('width', 0)}x{(main_img.size or {}).get('height', 0)}, "
+            f"🖼️ Viewer image — display {natural.get('dw', 0)}x{natural.get('dh', 0)}, "
             f"natural {natural.get('w', 0)}x{natural.get('h', 0)}"
         )
-
-        try:
-            b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
-            if b64:
-                with open(image_path, "wb") as handle:
-                    handle.write(base64.b64decode(b64))
-                print(
-                    f"🖼️ Saved full-resolution image (blob fetch) → {image_path} "
-                    f"({os.path.getsize(image_path)} bytes)"
-                )
-                return image_path
-        except Exception as exc:
-            print(f"⚠️ Blob fetch failed: {exc}")
 
         download_selectors = [
             '[data-testid="media-viewer-download"]',
@@ -3551,28 +3673,50 @@ def download_full_resolution_image(driver, bubble, image_path):
                 for btn in driver.find_elements(By.CSS_SELECTOR, selector):
                     if btn.is_displayed():
                         btn.click()
-                        time.sleep(3)
+                        time.sleep(4)
                         downloaded = pick_newest_image_download(baseline_mtime)
-                        if downloaded:
-                            shutil.copy2(downloaded, image_path)
-                            print(
-                                f"🖼️ Saved full-resolution image (viewer download) → {image_path} "
-                                f"({os.path.getsize(image_path)} bytes)"
-                            )
-                            return image_path
+                        saved = _save_downloaded_image(downloaded, image_path)
+                        if saved:
+                            return saved
             except Exception:
                 continue
+
+        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX:
+            saved = _save_element_screenshot(main_img, image_path)
+            if saved:
+                return saved
+
+        nw = int(natural.get("w") or 0)
+        nh = int(natural.get("h") or 0)
+        if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+            try:
+                b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
+                if b64:
+                    saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+                    if saved:
+                        print(f"🖼️ Saved full-resolution image (blob fetch) → {saved}")
+                        return saved
+            except Exception as exc:
+                print(f"⚠️ Blob fetch failed: {exc}")
+
+            try:
+                b64 = _execute_async_js(driver, IMAGE_CANVAS_EXPORT_JS, main_img, timeout=20)
+                if b64:
+                    saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+                    if saved:
+                        print(f"🖼️ Saved full-resolution image (canvas export) → {saved}")
+                        return saved
+            except Exception as exc:
+                print(f"⚠️ Canvas export failed: {exc}")
+        else:
+            print(
+                f"⚠️ Skipping blob/canvas — natural {nw}x{nh} looks like a loading placeholder."
+            )
 
         try:
             ActionChains(driver).context_click(main_img).perform()
             time.sleep(0.8)
-            save_menu_labels = (
-                "Save image as",
-                "Save Image As",
-                "Save image",
-                "Save picture as",
-            )
-            for label in save_menu_labels:
+            for label in ("Save image as", "Save Image As", "Save image", "Save picture as"):
                 try:
                     items = driver.find_elements(
                         By.XPATH,
@@ -3583,14 +3727,11 @@ def download_full_resolution_image(driver, bubble, image_path):
                     for item in items:
                         if item.is_displayed():
                             item.click()
-                            time.sleep(3)
+                            time.sleep(4)
                             downloaded = pick_newest_image_download(baseline_mtime)
-                            if downloaded:
-                                shutil.copy2(downloaded, image_path)
-                                print(
-                                    f"🖼️ Saved full-resolution image (Save Image As) → {image_path}"
-                                )
-                                return image_path
+                            saved = _save_downloaded_image(downloaded, image_path)
+                            if saved:
+                                return saved
                 except Exception:
                     continue
             ActionChains(driver).send_keys(Keys.ESCAPE).perform()
@@ -3598,23 +3739,9 @@ def download_full_resolution_image(driver, bubble, image_path):
         except Exception as exc:
             print(f"⚠️ Save Image As menu failed: {exc}")
 
-        try:
-            b64 = _execute_async_js(driver, IMAGE_CANVAS_EXPORT_JS, main_img, timeout=20)
-            if b64:
-                with open(image_path, "wb") as handle:
-                    handle.write(base64.b64decode(b64))
-                print(
-                    f"🖼️ Saved full-resolution image (canvas export) → {image_path} "
-                    f"({os.path.getsize(image_path)} bytes)"
-                )
-                return image_path
-        except Exception as exc:
-            print(f"⚠️ Canvas export failed: {exc}")
-
-        if wait_for_media_image_ready(driver, main_img, timeout=5):
-            main_img.screenshot(image_path)
-            print(f"🖼️ Saved viewer element screenshot (fallback) → {image_path}")
-            return image_path
+        saved = _save_element_screenshot(main_img, image_path)
+        if saved:
+            return saved
     except Exception as exc:
         print(f"⚠️ Full-resolution image download failed: {exc}")
     finally:
@@ -3623,7 +3750,7 @@ def download_full_resolution_image(driver, bubble, image_path):
 
 
 def capture_image_via_media_viewer(driver, bubble, image_path):
-    """Open viewer and screenshot the main image (fallback when blob/download fails)."""
+    """Open viewer and screenshot the main image (fallback when download fails)."""
     thumb = find_media_image_in_bubble(bubble)
     if thumb is None:
         return None
@@ -3635,14 +3762,15 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
         )
         time.sleep(1.0)
         driver.execute_script("arguments[0].click();", thumb)
-        time.sleep(2.5)
+        time.sleep(3.0)
 
+        wait_for_viewer_high_resolution(driver, timeout=15.0)
         best = _find_main_viewer_image(driver)
-        if best is not None and wait_for_media_image_ready(driver, best, timeout=10):
-            best.screenshot(image_path)
-            print(f"🖼️ Saved main viewer image screenshot: {image_path}")
-            return image_path
-        print("⚠️ Media viewer opened but main image was not ready in time.")
+        if best is not None:
+            saved = _save_element_screenshot(best, image_path)
+            if saved:
+                return saved
+        print("⚠️ Media viewer opened but no valid screenshot produced.")
     except Exception as exc:
         print(f"⚠️ Media viewer capture failed: {exc}")
     finally:
@@ -3677,14 +3805,20 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     crop_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_media.png")
     crop_result = capture_bubble_media_crop(driver, bubble, crop_path)
     if crop_result:
-        save_wa_image_manifest(crop_result, message_data_id=message_data_id)
-        return crop_result
+        ok, _reason = validate_image_file(crop_result)
+        if ok:
+            save_wa_image_manifest(crop_result, message_data_id=message_data_id)
+            return crop_result
+        print(f"⚠️ In-bubble media crop rejected: {_reason}")
 
     bubble_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_bubble.png")
     bubble_result = capture_message_bubble_screenshot(driver, bubble, bubble_path)
     if bubble_result:
-        save_wa_image_manifest(bubble_result, message_data_id=message_data_id)
-        return bubble_result
+        ok, _reason = validate_image_file(bubble_result, min_bytes=4000)
+        if ok:
+            save_wa_image_manifest(bubble_result, message_data_id=message_data_id)
+            return bubble_result
+        print(f"⚠️ Bubble screenshot rejected: {_reason}")
 
     print(f"❌ Could not save image for Copilot ({WA_IMAGE_DIR}).")
     return None

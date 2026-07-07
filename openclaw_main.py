@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.23-FULL-RES-IMAGE-FIX"
+VERSION = "v1.24-VALIDATE-WA-IMAGE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -261,9 +261,14 @@ def is_copilot_transport_failure(analysis: dict) -> bool:
     if status is None:
         return True
     try:
-        return int(status) >= 400
+        code = int(status)
     except (TypeError, ValueError):
         return True
+    if code == 400:
+        error = str(analysis.get("error") or "").lower()
+        if "image data" in error or "invalid_request" in error:
+            return False
+    return code >= 400
 
 
 def _minimal_copilot_analysis_result(
@@ -374,12 +379,26 @@ def _extract_json_from_copilot_text(raw: str):
     return text, {}
 
 
+def _detect_image_mime_from_bytes(data: bytes) -> str:
+    """Detect real image MIME from magic bytes (not file extension)."""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
 def _copilot_user_content_with_image(user_text: str, image_path: str = None):
     """Build OpenAI user content with optional high-detail image attachment."""
     if image_path and os.path.exists(image_path):
         with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+            raw = image_file.read()
+        mime = _detect_image_mime_from_bytes(raw)
+        if not mime:
+            mime = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+        image_b64 = base64.b64encode(raw).decode("ascii")
         return [
             {"type": "text", "text": user_text},
             {
@@ -413,7 +432,16 @@ def analyze_incoming_inquiry_with_copilot(
     print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
     if image_path:
         if os.path.exists(image_path):
-            print(f"[COPILOT ANALYZE] Image file size: {os.path.getsize(image_path)} bytes")
+            from whatsapp_attachment_processor import validate_image_file
+
+            img_ok, img_reason = validate_image_file(image_path)
+            print(
+                f"[COPILOT ANALYZE] Image file size: {os.path.getsize(image_path)} bytes "
+                f"({'valid' if img_ok else 'INVALID: ' + img_reason})"
+            )
+            if not img_ok:
+                print("[COPILOT ANALYZE] Skipping corrupt/thumbnail image — analyzing caption/text only.")
+                image_path = None
         else:
             print(f"[COPILOT ANALYZE] WARN image_path missing on disk: {image_path}")
             return _minimal_copilot_analysis_result(

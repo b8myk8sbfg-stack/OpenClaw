@@ -31,7 +31,7 @@ IMAGE_LATEST_PATH = os.path.join(WA_IMAGE_DIR, "latest.png")
 DOC_CAPTURE_DIR = WA_FILES_DIR
 DOC_PREVIEW_DIR = WA_IMAGE_DIR
 
-VERSION = "v1.21-WA-IMAGE-FILES-WORKSPACE"
+VERSION = "v1.22-WA-IMAGE-VALIDATION"
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
@@ -1714,7 +1714,63 @@ def download_document_from_bubble(
             pass
 
 
-def pick_newest_image_download(baseline_mtime: float = 0) -> Optional[str]:
+MIN_WA_IMAGE_BYTES = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_BYTES", "8000"))
+MIN_WA_IMAGE_DISPLAY_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_DISPLAY_PX", "400"))
+MIN_WA_IMAGE_NATURAL_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_NATURAL_PX", "250"))
+
+
+def detect_image_format(data: bytes) -> Tuple[Optional[str], str]:
+    """Return (mime_type, file_extension) from image bytes."""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", ".png"
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        return "image/jpeg", ".jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None, ""
+
+
+def validate_image_file(path: str, min_bytes: int = None) -> Tuple[bool, str]:
+    """Reject corrupt placeholders / tiny thumbnails before Copilot vision."""
+    min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
+    if not path or not os.path.exists(path):
+        return False, "file missing"
+    size = os.path.getsize(path)
+    if size < min_bytes:
+        return False, f"too small ({size} bytes, need >= {min_bytes})"
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+    except OSError as exc:
+        return False, str(exc)
+    mime, _ext = detect_image_format(head)
+    if not mime:
+        return False, "not a valid PNG/JPEG/WebP image"
+    return True, mime
+
+
+def save_validated_image_bytes(data: bytes, dest_path: str, min_bytes: int = None) -> Optional[str]:
+    """Write image bytes with correct extension; return path or None if invalid."""
+    min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
+    mime, ext = detect_image_format(data)
+    if not mime or len(data) < min_bytes:
+        return None
+    base, _ = os.path.splitext(dest_path)
+    final_path = f"{base}{ext}"
+    with open(final_path, "wb") as handle:
+        handle.write(data)
+    ok, reason = validate_image_file(final_path, min_bytes=min_bytes)
+    if not ok:
+        try:
+            os.remove(final_path)
+        except OSError:
+            pass
+        print(f"⚠️ [IMAGE] Rejected saved image: {reason}")
+        return None
+    return final_path
+
+
+def pick_newest_image_download(baseline_mtime: float = 0, min_bytes: int = None) -> Optional[str]:
     """Find a freshly downloaded image in ~/Downloads (Save Image As / viewer download)."""
     download_dirs = [
         os.path.expanduser("~/Downloads"),
@@ -1738,10 +1794,14 @@ def pick_newest_image_download(baseline_mtime: float = 0) -> Optional[str]:
     if not candidates:
         return None
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    newest = candidates[0]
-    if time.time() - os.path.getmtime(newest) > 120:
-        return None
-    return newest
+    min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
+    for path in candidates:
+        if time.time() - os.path.getmtime(path) > 120:
+            continue
+        ok, _reason = validate_image_file(path, min_bytes=min_bytes)
+        if ok:
+            return path
+    return None
 
 
 def _pick_newest_download(preferred_name: str) -> Optional[str]:
