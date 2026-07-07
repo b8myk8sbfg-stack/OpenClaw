@@ -55,7 +55,98 @@ def is_equivalent_support_request(message_text: str) -> bool:
         return False
     return True
 
-VERSION = "v1.03-EQUIVALENT-TECH-SUPPORT"
+VERSION = "v1.04-RFQ-ROUTING-OVERRIDES"
+
+
+def is_rfq_quote_caption(message_text: str) -> bool:
+    """True when caption explicitly asks for a quote/price."""
+    text_u = str(message_text or "").upper()
+    return bool(
+        re.search(
+            r"\b(QUOTE|QUOTATION|RFQ|ENQ|PRICE|PLS QUOTE|KINDLY QUOTE|QUOTE ME|HOW MUCH)\b",
+            text_u,
+        )
+    )
+
+
+def apply_rfq_routing_overrides(
+    classification: "ClassificationResult",
+    message_text: str = "",
+    media_info: Optional["MediaInfo"] = None,
+    image_path: str = None,
+    copilot_items: list = None,
+    copilot_analysis: dict = None,
+    transcript: str = "",
+    document_items: list = None,
+    document_text: str = "",
+) -> "ClassificationResult":
+    """Force rfq_inquiry / purchase_order after Copilot or heuristic classification."""
+    if is_equivalent_support_request(message_text):
+        return classification
+
+    media_info = media_info or MediaInfo()
+    items = list(copilot_items or [])
+    if copilot_analysis and copilot_analysis.get("items"):
+        items = copilot_analysis["items"]
+
+    has_image = bool(image_path) or getattr(media_info, "has_image", False)
+    quote_caption = is_rfq_quote_caption(message_text)
+    has_document = bool(document_items) or bool(document_text) or media_info.media_type == "pdf"
+
+    if (
+        classification.intent in ("unknown", "greeting", "general_chat")
+        and has_document
+    ):
+        classification.intent = "purchase_order"
+        classification.handler = "purchase_order"
+        classification.confidence = max(classification.confidence, 0.9)
+        classification.reasoning = "Document/PO attachment detected."
+        return classification
+
+    if items and classification.intent in ("unknown", "general_chat", "greeting"):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.9)
+        classification.reasoning = "Copilot extracted parts — routing as RFQ."
+        return classification
+
+    if quote_caption and has_image and classification.handler in (
+        "monitor_only", "unknown", "general_chat", "greeting"
+    ):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.93)
+        classification.reasoning = "Quote request with product photo — RFQ inquiry."
+        return classification
+
+    if transcript and classification.handler in (
+        "monitor_only", "voice_note", "unknown", "general_chat"
+    ):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.85)
+        classification.reasoning = "Voice note transcribed — processing as inquiry."
+        return classification
+
+    if (
+        has_image
+        and classification.intent in ("unknown", "general_chat", "greeting")
+        and getattr(media_info, "media_type", "") != "voice"
+    ):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.85)
+        classification.reasoning = "Customer photo inquiry detected."
+        return classification
+
+    if quote_caption and classification.handler in ("monitor_only", "unknown", "general_chat"):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.88)
+        classification.reasoning = "Explicit quote request in caption."
+        return classification
+
+    return classification
 
 MEDIA_TYPES = (
     "text",

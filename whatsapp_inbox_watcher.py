@@ -41,6 +41,7 @@ from openclaw_main import (
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
+    apply_rfq_routing_overrides,
     build_classification_monitor_message,
     classify_whatsapp_message,
     classification_from_copilot_analysis,
@@ -58,7 +59,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.42-BUSY-FLAG-COPILOT-FIX"
+VERSION = "v3.43-RFQ-ROUTING-OVERRIDE"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -4527,54 +4528,24 @@ def _process_open_chat_body(driver, raw_contact_name):
                     "Equivalent/replacement request — technical support, not RFQ quotation."
                 )
                 print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
+
+        classification = apply_rfq_routing_overrides(
+            classification,
+            message_text=inquiry_text,
+            media_info=media_info,
+            image_path=image_path,
+            copilot_items=copilot_items,
+            copilot_analysis=copilot_analysis,
+            transcript=enrichment.get("transcript") or "",
+            document_items=document_items,
+            document_text=enrichment.get("document_text") or "",
+        )
         if media_info.media_type == "voice":
             classification.media_type = "voice"
             if classification.media_info is not None:
                 classification.media_info.media_type = "voice"
                 classification.media_info.has_voice = True
                 classification.media_info.has_image = False
-        if not copilot_analysis.get("attempted"):
-            if (
-                classification.intent in ("unknown", "greeting", "general_chat")
-                and (document_items or enrichment.get("document_text") or media_info.media_type == "pdf")
-            ):
-                classification.intent = "purchase_order"
-                classification.confidence = max(classification.confidence, 0.9)
-                classification.handler = "purchase_order"
-                classification.reasoning = "PDF/PO document content detected after attachment extraction."
-                classification.suggested_reply = (
-                    "Hi, thank you for sending your purchase order.\n\n"
-                    "Our team is reviewing the document and will confirm shortly."
-                )
-            if copilot_items and classification.intent in ("unknown", "general_chat"):
-                if not is_equivalent_support_request(inquiry_text):
-                    classification.intent = "rfq_inquiry"
-                    classification.handler = "rfq_inquiry"
-                    classification.confidence = max(classification.confidence, 0.85)
-                    if enrichment.get("transcript"):
-                        classification.reasoning = "Parts extracted from voice transcript."
-                    elif image_path:
-                        classification.reasoning = "Parts extracted from customer photo."
-                    else:
-                        classification.reasoning = "Parts extracted from customer message."
-            if enrichment.get("transcript") and classification.handler in (
-                "monitor_only", "voice_note", "unknown", "general_chat"
-            ):
-                if not is_equivalent_support_request(inquiry_text):
-                    classification.intent = "rfq_inquiry"
-                    classification.handler = "rfq_inquiry"
-                    classification.confidence = max(classification.confidence, 0.85)
-                    classification.reasoning = "Voice note transcribed — processing as inquiry."
-            if (
-                (image_path or getattr(media_info, "has_image", False))
-                and classification.intent in ("unknown", "general_chat", "greeting")
-                and getattr(media_info, "media_type", "") != "voice"
-                and not is_equivalent_support_request(inquiry_text)
-            ):
-                classification.intent = "rfq_inquiry"
-                classification.handler = "rfq_inquiry"
-                classification.confidence = max(classification.confidence, 0.85)
-                classification.reasoning = "Customer photo inquiry detected."
         log_classification(contact_name, customer_contact, inquiry_text, classification)
 
         if re.search(r"WA-\d{8}-[A-Z0-9]+-[A-Z0-9]+", inquiry_text, re.I):

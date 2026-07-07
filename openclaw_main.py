@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.16-BUSY-FLAG-COPILOT-FIX"
+VERSION = "v1.17-RFQ-ROUTING-OVERRIDE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -215,7 +215,8 @@ def analyze_incoming_inquiry_with_copilot(
         "Ignore any other products, thumbnails, or media from earlier/later chat messages. "
         "The customer caption text belongs to THIS message only.\n\n"
         "Classify the message intent as one of:\n"
-        "- rfq_inquiry: customer asks price/availability/quote (e.g. 'quote me 1 pc')\n"
+        "- rfq_inquiry: customer asks price/availability/quote (e.g. 'quote me 1 pc', 'pls quote')\n"
+        "  If the caption asks for a quote/price, intent MUST be rfq_inquiry (never unknown).\n"
         "- technical_support: equivalent/replacement, specs, wiring, fault, how-to\n"
         "- purchase_order: formal PO/PR document or order placement\n"
         "- delivery_tracking, payment_invoice, complaint, greeting, junk_ad, general_chat, unknown\n\n"
