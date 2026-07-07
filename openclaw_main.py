@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.21-NEW-INQUIRY-TEMPLATE"
+VERSION = "v1.22-COPILOT-PARSE-NOT-FAILURE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -251,6 +251,48 @@ def _extract_balanced_json_object(text: str) -> str:
     return ""
 
 
+def is_copilot_transport_failure(analysis: dict) -> bool:
+    """True only when the Copilot proxy/API is down — not JSON/parse gaps on HTTP 200."""
+    if not isinstance(analysis, dict) or not analysis.get("attempted"):
+        return False
+    if analysis.get("ok") is not False:
+        return False
+    status = analysis.get("http_status")
+    if status is None:
+        return True
+    try:
+        return int(status) >= 400
+    except (TypeError, ValueError):
+        return True
+
+
+def _minimal_copilot_analysis_result(
+    message_text: str = "",
+    analysis_text: str = "",
+    raw: str = "",
+    parse_warning: str = "",
+    http_status: int = 200,
+) -> dict:
+    """Best-effort analyze result so RFQ routing can continue after HTTP 200."""
+    prose = str(analysis_text or raw or "").strip()
+    inferred_intent = _infer_intent_from_prose(prose, message_text)
+    return {
+        "attempted": True,
+        "ok": True,
+        "intent": inferred_intent,
+        "confidence": 0.7,
+        "reasoning": parse_warning or "Copilot response could not be fully parsed.",
+        "items": [],
+        "technical_summary": _sanitize_whatsapp_reply(prose),
+        "analysis_text": prose,
+        "is_industrial_automation": True,
+        "compatible_brands": [],
+        "raw_excerpt": str(raw or prose)[:800],
+        "http_status": http_status,
+        "parse_warning": parse_warning or None,
+    }
+
+
 def _infer_intent_from_prose(prose: str, message_text: str = "") -> str:
     """Best-effort intent when Copilot returns plain text without JSON."""
     blob = f"{prose}\n{message_text}".upper()
@@ -375,13 +417,11 @@ def analyze_incoming_inquiry_with_copilot(
             print(f"[COPILOT ANALYZE] Image file size: {os.path.getsize(image_path)} bytes")
         else:
             print(f"[COPILOT ANALYZE] WARN image_path missing on disk: {image_path}")
-            return {
-                "attempted": True,
-                "ok": False,
-                "error": f"image file not found: {image_path}",
-                "http_status": None,
-                "items": [],
-            }
+            return _minimal_copilot_analysis_result(
+                message_text=message_text,
+                parse_warning=f"image file not found: {image_path}",
+                http_status=200,
+            )
 
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
@@ -437,15 +477,16 @@ def analyze_incoming_inquiry_with_copilot(
                     "reasoning": "Parsed from plain-text Copilot analysis (no JSON footer).",
                 }
             else:
-                return {
-                    "attempted": True,
-                    "ok": False,
-                    "error": "no JSON object in Copilot response",
-                    "http_status": 200,
-                    "items": [],
-                    "analysis_text": analysis_text,
-                    "raw_excerpt": raw[:800],
-                }
+                print(
+                    "[COPILOT ANALYZE] No JSON footer — continuing with best-effort prose/caption parse"
+                )
+                return _minimal_copilot_analysis_result(
+                    message_text=message_text,
+                    analysis_text=analysis_text,
+                    raw=raw,
+                    parse_warning="no JSON object in Copilot response",
+                    http_status=200,
+                )
 
         intent = _normalize_copilot_intent(parsed.get("intent"))
         confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
@@ -499,15 +540,14 @@ def analyze_incoming_inquiry_with_copilot(
             print(f"[COPILOT ANALYZE] WARN zero items after parse — raw excerpt: {raw[:300]!r}")
         return result
     except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[WARN] Copilot analyze returned invalid JSON: {exc}")
-        return {
-            "attempted": True,
-            "ok": False,
-            "error": f"invalid JSON from Copilot: {exc}",
-            "http_status": 200,
-            "items": [],
-            "raw_excerpt": raw[:800],
-        }
+        print(f"[WARN] Copilot analyze parse issue (HTTP 200): {exc}")
+        return _minimal_copilot_analysis_result(
+            message_text=message_text,
+            analysis_text=raw,
+            raw=raw,
+            parse_warning=f"invalid JSON from Copilot: {exc}",
+            http_status=200,
+        )
     except APIStatusError as exc:
         print(f"[WARN] Copilot analyze HTTP {exc.status_code}: {exc}")
         return {

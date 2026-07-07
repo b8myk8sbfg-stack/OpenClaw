@@ -38,6 +38,7 @@ from openclaw_main import (
     build_ai_research_summary,
     build_photo_confirmation_line,
     build_technical_support_reply,
+    is_copilot_transport_failure,
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
@@ -59,7 +60,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.43-RFQ-ROUTING-OVERRIDE"
+VERSION = "v3.44-COPILOT-PARSE-NOT-FAILURE"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -4029,7 +4030,7 @@ def process_customer_inquiry(
     copilot_analysis = copilot_analysis or {}
     image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
 
-    if copilot_analysis.get("attempted") and copilot_analysis.get("ok") is False:
+    if is_copilot_transport_failure(copilot_analysis):
         send_copilot_malfunction_alert(
             driver,
             operation="unified_analyze",
@@ -4171,15 +4172,26 @@ def process_customer_inquiry(
                 "ER6C 3.6V Qty:1"
             )
         elif image_path and unified_analyze_ran:
-            send_copilot_malfunction_alert(
-                driver,
-                operation="rfq_no_items_after_analyze",
-                copilot_analysis=copilot_analysis or {"error": "Copilot returned zero items", "http_status": 200},
-                customer_name=contact_name,
-                customer_contact=customer_contact,
-                image_path=image_path,
-                original_message=latest_message,
-            )
+            if is_copilot_transport_failure(copilot_analysis):
+                send_copilot_malfunction_alert(
+                    driver,
+                    operation="rfq_no_items_after_analyze",
+                    copilot_analysis=copilot_analysis or {
+                        "error": "Copilot transport failure",
+                        "http_status": None,
+                        "attempted": True,
+                        "ok": False,
+                    },
+                    customer_name=contact_name,
+                    customer_contact=customer_contact,
+                    image_path=image_path,
+                    original_message=latest_message,
+                )
+            elif copilot_analysis.get("parse_warning"):
+                print(
+                    f"⚠️ Copilot parse warning (continuing RFQ): "
+                    f"{copilot_analysis.get('parse_warning')}"
+                )
             reply = (
                 "Hi, I received your photo but could not read the product details clearly enough to quote.\n\n"
                 "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
