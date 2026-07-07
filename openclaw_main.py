@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.35-COPILOT-SINGLE-PASS"
+VERSION = "v1.36-COPILOT-SINGLE-PASS"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -110,39 +110,41 @@ Analyze ONLY this attached message and/or image. Do not use prior conversations,
 
 You are the vision expert. Read the image literally — transcribe printed text; never guess a familiar catalog part number.
 
-Tasks:
-1. Classify intent: rfq_inquiry | technical_support | purchase_order | junk_ad | greeting | general_chat | unknown
-2. Identify the foreground product the customer is holding or pointing at (closest to camera / in hand).
-3. Describe its physical shape first (cylinder, rectangle, relay block, sensor housing, etc.).
-4. Transcribe ONLY characters printed on that foreground label — letter by letter, digit by digit.
-5. Extract quantity from caption or image (default 1).
-6. Summarize technical details for the identified product.
+STEP 1 — Detect image type (choose ONE):
+A) RFQ / QUOTATION TABLE — spreadsheet or form with rows and columns (e.g. No, Item, Picture, Qty, Description, Model).
+B) SINGLE PRODUCT PHOTO — one object held in hand, on a bench, or a close-up nameplate/label (no table grid).
 
-Critical anti-hallucination rules:
-- items[].part_no MUST be copied exactly from visual_analysis.label_transcription. If they differ, fix part_no before returning JSON.
-- NEVER substitute a well-known catalog number (e.g. Omron E3Z-D61, E2E-X5, H3JA-8A) unless those exact characters are printed on the foreground label.
-- Background control panels, terminal blocks, relays, and sensors are NOT the inquiry — ignore their labels even if larger or clearer.
-- If the foreground object is a cylindrical cell with "Lithium" text, it is a battery (e.g. ER6C, CR123, BR-2/3A) — not a photoelectric sensor or timer relay.
-- If any character is unreadable, use "?" for that character in label_transcription. Do NOT invent missing characters.
-- product_type must match the physical object (battery, sensor, relay, valve, etc.) — not a guess from background equipment.
+STEP 2 — Extract parts using the rules for that type:
 
-Image guidance:
-- Photo + short caption (e.g. "quote me 1 pc") = ONE product: the item held in hand or closest to the camera.
-- If someone holds a small labelled item in front of a control panel, quote ONLY the held item's label.
-- RFQ/enquiry tables: read only rows visible in the image; count rows; do not invent extra line items.
+=== A) RFQ / QUOTATION TABLE ===
+- The entire visible table IS the inquiry — not background.
+- Read EACH visible row as a separate line item in items[].
+- part_no: use Model / Catalog / Part number from the Item/Description column; if a label photo appears in Picture column, transcribe that nameplate too and prefer the clearest catalog number (e.g. 150-C25NBD).
+- qty: use the number in the Qty column for that row (do NOT default to 1 if the table shows 3).
+- brand: from Item text or nameplate (e.g. Allen-Bradley, Omron, SMC).
+- product_type: from Item description (e.g. soft starter, sensor, relay).
+- Do NOT apply handheld-foreground or battery rules to tables.
+
+=== B) SINGLE PRODUCT PHOTO ===
+- The inquiry is the item held in hand or closest to the camera — NOT equipment mounted behind it.
+- Describe physical shape first (cylinder, rectangle, relay block, sensor housing, etc.).
+- Transcribe ONLY characters printed on that item's label — letter by letter.
+- Ignore background wiring, terminal blocks, and panel equipment unless the customer is clearly quoting those.
+- Apply battery rule ONLY when you actually see a cylindrical cell with "Lithium" or similar battery label (e.g. ER6C, CR123) — do not assume battery for other shapes.
+
+Common rules (both types):
+- items[].part_no MUST match what you transcribed for that item. If they differ, fix part_no before returning JSON.
+- NEVER substitute a well-known catalog number (e.g. Omron E3Z-D61, E2E-X5, H3JA-8A) unless those exact characters are printed on the label or in the table row.
+- If any character is unreadable, use "?" — do NOT invent missing characters.
+- Classify intent: rfq_inquiry | technical_support | purchase_order | junk_ad | greeting | general_chat | unknown
 - Equivalent/replacement requests: intent=technical_support unless they also ask for price/quote.
 
-In reasoning, state: (1) foreground shape, (2) exact label transcription, (3) background labels you ignored.
+In reasoning, state: (1) image type A or B, (2) what you read per row or foreground label, (3) anything ignored.
 
-Return plain-text analysis first. Include:
-- Foreground physical shape and product type
-- Exact label transcription (character by character)
-- Background items you are ignoring
+Return plain-text analysis first, then on the very last line only append one JSON object (no markdown fences):
+{"intent":"rfq_inquiry","confidence":0.9,"visual_analysis":{"image_type":"table|photo","foreground_subject":"...","label_transcription":"...","background_ignored":"..."},"items":[{"part_no":"EXACT-CODE","qty":1,"brand":"BRAND","product_type":"TYPE"}],"technical_summary":"...","is_industrial_automation":true,"compatible_brands":[],"reasoning":"..."}
 
-On the very last line only, append one JSON object (no markdown fences):
-{"intent":"rfq_inquiry","confidence":0.9,"visual_analysis":{"foreground_subject":"...","label_transcription":"...","background_ignored":"..."},"items":[{"part_no":"EXACT-CODE","qty":1,"brand":"BRAND","product_type":"TYPE"}],"technical_summary":"...","is_industrial_automation":true,"compatible_brands":[],"reasoning":"..."}
-
-items: one entry per distinct part the customer is inquiring about. part_no must equal label_transcription (same characters, ignoring spaces).
+items: one entry per distinct part/row the customer is inquiring about. For tables with 3 rows, return 3 items. part_no must match your transcription for that item.
 """
 
 def _parse_caption_qty(text: str, default: int = 1) -> int:
@@ -387,6 +389,14 @@ def _primary_code_from_transcription(transcription: str) -> str:
     if not text:
         return ""
     head = re.split(r"[\(\[,;]", text, maxsplit=1)[0].strip()
+    for pattern in (
+        r"\b\d{2,}-[A-Z0-9][A-Z0-9\-]*\b",
+        r"\b[A-Z]{1,5}-\d{1,5}[A-Z0-9\-]*\b",
+        r"\b[A-Z]{1,5}\d{1,5}[A-Z0-9\-]*\b",
+    ):
+        match = re.search(pattern, head)
+        if match:
+            return match.group(0)
     tokens = re.findall(r"[A-Z0-9][A-Z0-9\-/]{2,}", head)
     if tokens:
         return tokens[0]
@@ -394,9 +404,11 @@ def _primary_code_from_transcription(transcription: str) -> str:
 
 
 def _align_items_with_label_transcription(parsed: dict, items_out: list) -> list:
-    """Enforce Copilot JSON contract: items.part_no must match label_transcription."""
+    """Enforce Copilot JSON contract: single-item part_no must match label_transcription."""
+    if len(items_out) != 1:
+        return items_out
     visual = parsed.get("visual_analysis") or {}
-    if not isinstance(visual, dict) or not items_out:
+    if not isinstance(visual, dict):
         return items_out
     trans = str(visual.get("label_transcription") or "").strip()
     code = _primary_code_from_transcription(trans)
@@ -445,6 +457,11 @@ def analyze_incoming_inquiry_with_copilot(
                 f"dimensions: {dim_label} "
                 f"({'valid' if img_ok else 'INVALID: ' + img_reason})"
             )
+            if dims and (dims[0] < 400 or dims[1] < 400):
+                print(
+                    f"[COPILOT ANALYZE] WARN low resolution {dim_label} — "
+                    "label/table text may be hard to read"
+                )
             if not img_ok:
                 print("[COPILOT ANALYZE] Skipping corrupt/thumbnail image — analyzing caption/text only.")
                 image_path = None
@@ -475,9 +492,10 @@ def analyze_incoming_inquiry_with_copilot(
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
     if image_path and os.path.exists(image_path):
         prompt_parts.append(
-            "Attached image: identify the foreground product the customer is quoting. "
-            "Transcribe its label exactly. Ignore background panels and wiring unless "
-            "the customer is clearly quoting background equipment."
+            "Attached image: FIRST decide if this is (A) an RFQ/quotation table with rows "
+            "and columns, or (B) a single product photo. Apply the matching extraction rules. "
+            "For tables, read every visible row and Qty column. For photos, transcribe the "
+            "foreground label only."
         )
     elif not message_text and not voice_transcript and not document_text:
         prompt_parts.append("Attached image: see screenshot (analyze this message only).")
@@ -541,16 +559,21 @@ def analyze_incoming_inquiry_with_copilot(
 
         visual = parsed.get("visual_analysis") or {}
         if isinstance(visual, dict):
+            image_type = str(visual.get("image_type") or "").strip().lower()
             fg = str(visual.get("foreground_subject") or "").strip()
             trans = str(visual.get("label_transcription") or "").strip()
             ignored = str(visual.get("background_ignored") or "").strip()
-            if trans:
+            if image_type == "table":
+                reasoning = f"Copilot RFQ table read: {len(items_out)} row(s)"
+                if trans:
+                    reasoning = f"{reasoning} | {trans[:60]}"
+            elif trans:
                 reasoning = f"Copilot label read: {trans}"
             elif fg:
                 reasoning = f"Copilot foreground: {fg}"
-            if ignored and reasoning:
+            if ignored and reasoning and image_type != "table":
                 reasoning = f"{reasoning} (ignored background: {ignored})"
-            elif ignored:
+            elif ignored and image_type != "table":
                 reasoning = f"Copilot ignored background: {ignored}"
 
         if _is_equivalent_support_request(message_text):

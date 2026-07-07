@@ -3840,13 +3840,19 @@ def download_full_resolution_image(driver, bubble, image_path):
             except Exception:
                 continue
 
-        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX and nw >= 80 and nh >= 80:
+        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX and int(natural.get("dh") or 0) >= 150:
+            if nw < 120 or nh < 80:
+                print(
+                    f"⚠️ Natural {nw}x{nh} still placeholder — "
+                    f"using viewer panel screenshot at display size"
+                )
             saved = _save_viewer_panel_screenshot(driver, image_path)
             if saved:
                 return saved
-            saved = _save_element_screenshot(main_img, image_path)
-            if saved:
-                return saved
+            if nw >= 80 and nh >= 80:
+                saved = _save_element_screenshot(main_img, image_path)
+                if saved:
+                    return saved
 
         nw = int(natural.get("w") or 0)
         nh = int(natural.get("h") or 0)
