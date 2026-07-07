@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.31-LABEL-AI-VERIFY"
+VERSION = "v1.32-BATTERY-FOREGROUND-FIX"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -283,7 +283,10 @@ This is a brand-new product label photo. Analyze ONLY this attached image.
 Do NOT use prior conversations, chat history, or catalog memory.
 
 The customer shows ONE product in the foreground (any industrial part: battery, timer, sensor, cylinder, relay, starter, etc.).
-Ignore background PLC wiring, terminal blocks, and unrelated equipment.
+The quoted product is usually HELD IN HAND or closest to the camera — read THAT label only.
+Ignore background PLC wiring, terminal blocks, control panels, timers, and unrelated equipment behind the subject.
+
+A small cylindrical cell with "Lithium" text (e.g. ER6C (AA) 3.6V) is a BATTERY — not an OMRON H3JA timer in the background.
 
 Read the exact model/code printed on the product label character-by-character.
 Extract brand from the label when visible. Default qty 1 unless caption states otherwise.
@@ -303,7 +306,8 @@ Step 3: State brand and product type from what is printed on the label.
 
 Rules:
 - Return ONLY what you can read in this image — never invent or substitute a catalog part.
-- Background wiring/equipment is not the product.
+- Background wiring/equipment/panel timers are NOT the product — read the foreground label only.
+- A cylindrical "Lithium" cell (ER6C, ER17500, CR123A, etc.) held in hand is a battery, not H3JA.
 - If the caption asks for a quote, qty defaults to 1 unless printed on the label.
 
 Return plain-text (include your character-by-character transcription), then JSON on the last line only:
@@ -358,6 +362,13 @@ def _items_need_label_reverify(items: list, message_text: str) -> bool:
             if "SENSOR" not in ptype and "PHOTO" not in ptype and "PROXIMITY" not in ptype:
                 return True
     return False
+
+
+def _items_need_battery_challenger(items: list, message_text: str) -> bool:
+    """Timer on a single-product quote photo is often a background panel misread (e.g. H3JA vs ER6C)."""
+    if not _is_single_product_photo_inquiry(message_text) or not items:
+        return False
+    return _is_timer_visual_item(items[0])
 
 
 def _parse_caption_qty(text: str, default: int = 1) -> int:
@@ -651,10 +662,50 @@ def _copilot_label_focus_pass(
                 prose = verify_prose or prose
             else:
                 print("[COPILOT LABEL] Verify confirms focus pass part number")
+        items, prose = _apply_battery_challenger(
+            items,
+            message_text=message_text,
+            image_path=image_path,
+            client=client,
+            prose=prose,
+        )
         return items, prose
     except Exception as exc:
         print(f"[WARN] Copilot label focus pass failed: {exc}")
         return [], ""
+
+
+def _apply_battery_challenger(
+    items: list,
+    message_text: str = "",
+    image_path: str = None,
+    client=None,
+    prose: str = "",
+) -> tuple:
+    """When label focus returns a timer on a single-product photo, check for foreground battery."""
+    if not _items_need_battery_challenger(items, message_text):
+        return items, prose
+
+    battery_item = extract_battery_label_from_image(
+        message_text,
+        image_path,
+        client=client,
+    )
+    if not battery_item or not _is_battery_visual_item(battery_item):
+        return items, prose
+
+    timer_part = str(items[0].get("part_no") or "").strip().upper()
+    battery_part = str(battery_item.get("part_no") or "").strip().upper()
+    if _normalize_part_key(timer_part) == _normalize_part_key(battery_part):
+        return items, prose
+
+    print(
+        f"[COPILOT LABEL] Battery challenger overrides timer misread: "
+        f"{timer_part} → {battery_part}"
+    )
+    battery_item["qty"] = items[0].get("qty") or _parse_caption_qty(message_text)
+    battery_item["source"] = "COPILOT_BATTERY"
+    return [battery_item], prose
 
 
 def _copilot_label_verify_pass(
@@ -1541,6 +1592,82 @@ def extract_timer_label_from_image(caption: str = "", image_path: str = None) ->
         return item
     except Exception as exc:
         print(f"[WARN] Timer OCR failed: {exc}")
+    return {}
+
+
+def extract_battery_label_from_image(
+    caption: str = "",
+    image_path: str = None,
+    client=None,
+) -> dict:
+    """Second-pass OCR for cylindrical lithium cells in the foreground (ER6C, CR, etc.)."""
+    if not image_path or not os.path.exists(image_path):
+        return {}
+
+    print(f"[COPILOT BATTERY OCR] Foreground battery label read: {image_path}")
+    if client is None:
+        client = OpenAI(
+            base_url=COPILOT_BASE_URL,
+            api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
+            timeout=60.0,
+            max_retries=1,
+        )
+    system_instruction = (
+        "Look for a small cylindrical LITHIUM BATTERY held in hand or in the foreground. "
+        "Common labels: Lithium, ER6C (AA) 3.6V, ER17500, CR123A, BR-2/3A. "
+        "Ignore background control panels, OMRON timers (H3JA/H3Y), terminal blocks, and wiring. "
+        "Transcribe ONLY the battery label character-by-character. "
+        "If no foreground battery is visible, return {\"part_no\":\"\",\"brand\":\"\",\"product_type\":\"\"}. "
+        "Return one JSON object: part_no, brand, product_type."
+    )
+    user_text = (
+        "Is there a lithium battery held in hand or closest to the camera? "
+        "If yes, transcribe its exact model code (e.g. ER6C (AA) 3.6V). "
+        "Do NOT return H3JA or other background panel equipment. "
+        f"Caption: {caption or '(none)'}"
+    )
+    try:
+        with open(image_path, "rb") as image_file:
+            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+        response = _copilot_fresh_chat(
+            client,
+            [
+                {"role": "system", "content": system_instruction},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime};base64,{image_b64}",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+        )
+        raw_content = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT BATTERY OCR RAW] {raw_content[:400]}")
+        if raw_content.startswith("```"):
+            raw_content = "\n".join(raw_content.splitlines()[1:-1]).strip()
+        parsed = json.loads(raw_content)
+        if not isinstance(parsed, dict):
+            return {}
+        part_no = str(parsed.get("part_no") or "").strip().upper()
+        if not part_no:
+            return {}
+        brand = str(parsed.get("brand") or "UNKNOWN").strip().upper()
+        product_type = str(parsed.get("product_type") or "LITHIUM BATTERY").strip().upper()
+        if not _is_battery_visual_item({"part_no": part_no, "product_type": product_type}):
+            return {}
+        item = {"part_no": part_no, "qty": 1, "brand": brand, "product_type": product_type}
+        print(f"[COPILOT BATTERY OCR] Identified {brand} {part_no}")
+        return item
+    except Exception as exc:
+        print(f"[WARN] Battery OCR failed: {exc}")
     return {}
 
 
