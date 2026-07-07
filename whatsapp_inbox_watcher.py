@@ -71,7 +71,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.50-IMAGE-BEATS-VOICE-FIX"
+VERSION = "v3.51-EQUIVALENT-TECH-SUPPORT"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -5035,6 +5035,14 @@ def _process_open_chat_body(driver, raw_contact_name):
                 f"🧠 Using Copilot-first classification: {classification.intent} "
                 f"({classification.confidence:.0%}) | ok={copilot_analysis.get('ok')}"
             )
+            if is_equivalent_support_request(inquiry_text):
+                classification.intent = "technical_support"
+                classification.handler = "technical_support"
+                classification.confidence = max(classification.confidence, 0.93)
+                classification.reasoning = (
+                    "Equivalent/replacement request — technical support, not RFQ quotation."
+                )
+                print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
         else:
             classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
             if is_equivalent_support_request(inquiry_text):

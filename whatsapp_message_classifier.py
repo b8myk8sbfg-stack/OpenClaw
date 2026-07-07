@@ -55,7 +55,7 @@ def is_equivalent_support_request(message_text: str) -> bool:
         return False
     return True
 
-VERSION = "v1.04-RFQ-ROUTING-OVERRIDES"
+VERSION = "v1.05-EQUIVALENT-TECH-SUPPORT"
 
 
 def is_rfq_quote_caption(message_text: str) -> bool:
@@ -82,6 +82,12 @@ def apply_rfq_routing_overrides(
 ) -> "ClassificationResult":
     """Force rfq_inquiry / purchase_order after Copilot or heuristic classification."""
     if is_equivalent_support_request(message_text):
+        classification.intent = "technical_support"
+        classification.handler = "technical_support"
+        classification.confidence = max(classification.confidence, 0.93)
+        classification.reasoning = (
+            "Equivalent/replacement request — technical support, not RFQ quotation."
+        )
         return classification
 
     media_info = media_info or MediaInfo()

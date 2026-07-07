@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.28-RFQ-TABLE-FOCUS-OVERRIDE"
+VERSION = "v1.29-EQUIVALENT-TECH-SUPPORT"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -219,6 +219,10 @@ If the attached image shows an RFQ / enquiry table (columns such as No, Item, Pi
   → part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
 - Transcribe model codes character-by-character from labels (e.g. CAT 150-C25NBD).
 
+If the caption says "find equivalent", "replacement", "substitute", or "successor":
+- intent MUST be technical_support (NOT rfq_inquiry) unless they also ask for price/quote.
+- Still read the exact model printed on the product label in the image (e.g. H3JA-8A timer).
+
 Return the result in plain text.
 
 On the very last line only (after your plain-text analysis), append one JSON object with no markdown fences:
@@ -256,22 +260,23 @@ LABEL_FOCUS_PROMPT = """NEW INQUIRY
 Analyze ONLY the attached product label/nameplate image.
 Do NOT use information from previous conversations.
 
-The customer is quoting ONE product shown in this photo (e.g. "quote me 1 pce").
-Focus on the MAIN product in the foreground (battery, timer, sensor, relay held in hand).
+The customer photo may ask to quote OR find an equivalent/replacement for ONE product.
+Focus on the MAIN product in the foreground (battery, timer, sensor, relay).
 Ignore background PLC wiring, terminal blocks, and unrelated equipment.
 
 Read the exact model/code printed on the product label character-by-character.
 
 Examples:
+- OMRON TIMER nameplate H3JA-8A, 200-240VAC → part_no=H3JA-8A, brand=OMRON, product_type=TIMER
 - Red label with "Lithium" and ER6C (AA) 3.6V → part_no=ER6C 3.6V, brand=TOSHIBA or OMRON, product_type=LITHIUM BATTERY
-- Timer H3JA-8A on nameplate → part_no=H3JA-8A, product_type=TIMER
 - Sensor E2E-X5E1 or E3Z-T61 ONLY if those exact characters are printed on the foreground label
 
+NEVER return SMC CDQ2B32, CDQ2B, or pneumatic cylinder models unless those exact codes are printed on the label.
 NEVER return E2E-X5E1, E3Z-T61, or E3Z-T61-L unless those exact codes are printed on the foreground product label.
-A lithium battery label with ER6C is NOT an E2E sensor.
+A TIMER label with H3JA-8A is NOT an SMC cylinder or E2E sensor.
 
 Return plain-text analysis, then on the last line only append JSON (no markdown):
-{"items":[{"part_no":"ER6C 3.6V","qty":1,"brand":"TOSHIBA","product_type":"LITHIUM BATTERY"}],"technical_summary":"..."}
+{"items":[{"part_no":"H3JA-8A","qty":1,"brand":"OMRON","product_type":"TIMER"}],"technical_summary":"..."}
 """
 
 
@@ -807,6 +812,27 @@ def analyze_incoming_inquiry_with_copilot(
                         item["source"] = "COPILOT_RFQ_TABLE"
                 elif not items_out:
                     print("[COPILOT ANALYZE] RFQ table focus returned no items — keeping first pass")
+            elif _is_equivalent_support_request(message_text):
+                label_items, label_prose = _copilot_label_focus_pass(
+                    client,
+                    message_text=message_text,
+                    image_path=image_path,
+                    voice_transcript=voice_transcript,
+                )
+                if label_items:
+                    first_key = _normalize_part_key((items_out[0] or {}).get("part_no"))
+                    label_key = _normalize_part_key(label_items[0].get("part_no"))
+                    if items_out and first_key != label_key:
+                        print(
+                            f"[COPILOT ANALYZE] Label focus overrides first pass: "
+                            f"{items_out[0].get('part_no')} → {label_items[0].get('part_no')}"
+                        )
+                    items_out = label_items
+                    focus_prose = label_prose
+                    for item in items_out:
+                        item["source"] = "COPILOT_LABEL"
+                elif not items_out:
+                    print("[COPILOT ANALYZE] Label focus returned no items — keeping first pass")
             elif _items_need_label_reverify(items_out, message_text):
                 print(
                     "[COPILOT ANALYZE] Sensor-like guess on single-product photo — "
@@ -845,6 +871,14 @@ def analyze_incoming_inquiry_with_copilot(
             )
             if part_list:
                 reasoning = f"Focus pass read from image: {part_list}"
+
+        if _is_equivalent_support_request(message_text):
+            intent = "technical_support"
+            if not reasoning or re.search(r"\brfq\b", reasoning, re.I):
+                reasoning = (
+                    "Equivalent/replacement request — technical support, "
+                    "reading product label from photo."
+                )
 
         result = {
             "attempted": True,
@@ -1212,6 +1246,8 @@ def _filter_conflicting_visual_items(items: list) -> list:
         filtered = [
             item for item in items
             if not _normalize_part_key(item.get("part_no")).startswith("E2E")
+            and not _normalize_part_key(item.get("part_no")).startswith("CDQ")
+            and not _normalize_part_key(item.get("part_no")).startswith("CQ2")
         ]
         if filtered:
             return filtered
@@ -1580,13 +1616,39 @@ def build_technical_support_reply(
     if not message_text and not image_path:
         return ""
 
-    visual_items = list(copilot_items or [])
+    visual_items = _filter_conflicting_visual_items(list(copilot_items or []))
     if visual_items:
         print(f"[COPILOT TECH SUPPORT] Using {len(visual_items)} unified analyze item(s)")
     elif image_path:
         print("[COPILOT TECH SUPPORT] No unified items — Copilot will read zoomed screenshot directly")
     else:
         print("[COPILOT TECH SUPPORT] Text-only technical support")
+
+    if (
+        image_path
+        and _is_equivalent_support_request(message_text)
+        and (not visual_items or all(
+            _normalize_part_key(item.get("part_no")).startswith(("CDQ", "CQ2", "E2E", "E3Z"))
+            for item in visual_items
+        ))
+    ):
+        print("[COPILOT TECH SUPPORT] Wrong-family guess on equivalent photo — timer label re-read")
+        timer_item = extract_timer_label_from_image(message_text, image_path)
+        if timer_item:
+            visual_items = [timer_item]
+        else:
+            label_items, _label_prose = _copilot_label_focus_pass(
+                OpenAI(
+                    base_url=COPILOT_BASE_URL,
+                    api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
+                    timeout=90.0,
+                    max_retries=1,
+                ),
+                message_text=message_text,
+                image_path=image_path,
+            )
+            if label_items:
+                visual_items = label_items
 
     timer_items = [item for item in visual_items if _is_timer_visual_item(item)]
 
