@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.20-FRESH-COPILOT-PROMPT"
+VERSION = "v1.21-NEW-INQUIRY-TEMPLATE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -188,28 +188,81 @@ def _normalize_copilot_intent(intent: str) -> str:
     return "unknown"
 
 
-OPENCLAW_UNIFIED_PROMPT = """Please analyze this incoming message and classify the message as:
-- request for quotation (RFQ)
-- request for technical support
-- customer purchase order
-- junk advertisement message or promotion pamphlets
+OPENCLAW_UNIFIED_PROMPT = """NEW INQUIRY
 
-If a voice transcript is included below, it was already transcribed from the WAV file — use it together with the attached image.
+Analyze ONLY the attached message/image.
+Do NOT use information from previous conversations.
 
-After analyzing, extract important details and return your analysis in clear text.
-Check whether this item is used in industrial automation.
-I carry OMRON, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, and many more industrial automation brands — note if it matches brands I carry.
-Please give the technical specification for the item.
+Tasks:
+1. Classify the message:
+   - Request for Quotation (RFQ)
+   - Technical Support
+   - Purchase Order
+   - Voice Message (transcribe first if WAV)
+   - Junk Advertisement
+   - Promotion Pamphlet
 
-CRITICAL: This is one brand-new incoming message only. Do not use prior chats, earlier photos, or other products from this customer. Read only what is in THIS message and THIS attached image.
+2. Extract all important details.
 
-At the very end, on the last line only, output valid JSON (no markdown fences) with keys:
-intent, confidence, items, technical_summary, is_industrial_automation, compatible_brands, reasoning
+3. Determine whether the item is used in Industrial Automation.
+
+4. Check whether it belongs to or is commonly associated with these brands:
+Omron, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, etc.
+
+5. Provide technical specifications.
+
+Return the result in plain text.
+
+On the very last line only (after your plain-text analysis), append one JSON object with no markdown fences:
+{"intent":"rfq_inquiry","confidence":0.9,"items":[{"part_no":"MODEL","qty":1,"brand":"BRAND","product_type":"TYPE"}],"technical_summary":"...","is_industrial_automation":true,"compatible_brands":[],"reasoning":"..."}
 
 intent must be one of: rfq_inquiry, technical_support, purchase_order, junk_ad, greeting, general_chat, unknown
 confidence must be a number from 0.0 to 1.0
-items must be an array of objects: {part_no, qty, brand, product_type}
+items must be an array of objects with keys part_no, qty, brand, product_type
 """
+
+
+def _extract_balanced_json_object(text: str) -> str:
+    """Return the first complete {...} substring using brace balancing."""
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+    return ""
+
+
+def _infer_intent_from_prose(prose: str, message_text: str = "") -> str:
+    """Best-effort intent when Copilot returns plain text without JSON."""
+    blob = f"{prose}\n{message_text}".upper()
+    if re.search(r"\b(REQUEST FOR QUOTATION|RFQ|QUOTATION|QUOTE|PLS QUOTE|QUOTE ME)\b", blob):
+        return "rfq_inquiry"
+    if re.search(r"\b(TECHNICAL SUPPORT|EQUIVALENT|REPLACEMENT|SUBSTITUTE|WIRING|FAULT)\b", blob):
+        return "technical_support"
+    if re.search(r"\b(PURCHASE ORDER|\bPO\b|ORDER PLACEMENT)\b", blob):
+        return "purchase_order"
+    if re.search(r"\b(JUNK|ADVERTISEMENT|SPAM|PROMOTION|PAMPHLET)\b", blob):
+        return "junk_ad"
+    return "unknown"
 
 
 def _copilot_fresh_chat(client, messages, timeout: float = 60.0):
@@ -224,7 +277,7 @@ def _copilot_fresh_chat(client, messages, timeout: float = 60.0):
 
 
 def _extract_json_from_copilot_text(raw: str):
-    """Split Copilot prose from trailing JSON line."""
+    """Split Copilot prose from trailing (or embedded) JSON object."""
     text = str(raw or "").strip()
     if not text:
         return "", {}
@@ -243,7 +296,32 @@ def _extract_json_from_copilot_text(raw: str):
                 prose = "\n".join(lines[:start]).strip()
                 return prose, parsed
         except json.JSONDecodeError:
+            candidate = _extract_balanced_json_object(tail)
+            if candidate:
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        prose = "\n".join(lines[:start]).strip()
+                        remainder = tail[len(candidate):].strip()
+                        if remainder:
+                            prose = f"{prose}\n{remainder}".strip() if prose else remainder
+                        return prose, parsed
+                except json.JSONDecodeError:
+                    continue
+
+    for match in re.finditer(r"\{", text):
+        candidate = _extract_balanced_json_object(text[match.start():])
+        if not candidate:
             continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and (
+            "intent" in parsed or "items" in parsed or "technical_summary" in parsed
+        ):
+            prose = (text[:match.start()] + text[match.start() + len(candidate):]).strip()
+            return prose, parsed
 
     try:
         parsed = json.loads(text)
@@ -314,13 +392,18 @@ def analyze_incoming_inquiry_with_copilot(
 
     prompt_parts = [OPENCLAW_UNIFIED_PROMPT]
     if voice_transcript:
-        prompt_parts.append(f"Voice transcript:\n{voice_transcript}")
+        prompt_parts.append(
+            "Attached voice message (already transcribed from WAV):\n"
+            f"{voice_transcript}"
+        )
     if message_text:
-        prompt_parts.append(f"Customer message/caption:\n{message_text}")
+        prompt_parts.append(f"Attached customer message/caption:\n{message_text}")
     if document_text:
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
-    if not image_path and not message_text and not voice_transcript and not document_text:
-        prompt_parts.append("(No text — analyze the attached image only.)")
+    if image_path and os.path.exists(image_path):
+        prompt_parts.append("Attached image: see screenshot above (this message bubble only).")
+    elif not message_text and not voice_transcript and not document_text:
+        prompt_parts.append("Attached image: see screenshot (analyze this message only).")
 
     user_text = "\n\n".join(prompt_parts)
     user_content = _copilot_user_content_with_image(user_text, image_path)
@@ -338,15 +421,31 @@ def analyze_incoming_inquiry_with_copilot(
         print(f"[COPILOT ANALYZE RAW] {raw[:500]}")
         analysis_text, parsed = _extract_json_from_copilot_text(raw)
         if not isinstance(parsed, dict) or not parsed:
-            return {
-                "attempted": True,
-                "ok": False,
-                "error": "no JSON object in Copilot response",
-                "http_status": 200,
-                "items": [],
-                "analysis_text": analysis_text,
-                "raw_excerpt": raw[:800],
-            }
+            if analysis_text and len(analysis_text.strip()) >= 40:
+                inferred_intent = _infer_intent_from_prose(analysis_text, message_text)
+                print(
+                    "[COPILOT ANALYZE] Plain-text response without JSON — "
+                    f"using prose fallback intent={inferred_intent}"
+                )
+                parsed = {
+                    "intent": inferred_intent,
+                    "confidence": 0.7,
+                    "items": [],
+                    "technical_summary": analysis_text,
+                    "is_industrial_automation": True,
+                    "compatible_brands": [],
+                    "reasoning": "Parsed from plain-text Copilot analysis (no JSON footer).",
+                }
+            else:
+                return {
+                    "attempted": True,
+                    "ok": False,
+                    "error": "no JSON object in Copilot response",
+                    "http_status": 200,
+                    "items": [],
+                    "analysis_text": analysis_text,
+                    "raw_excerpt": raw[:800],
+                }
 
         intent = _normalize_copilot_intent(parsed.get("intent"))
         confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
