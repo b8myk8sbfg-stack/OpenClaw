@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.30-RFQ-TABLE-ROW-VERIFY"
+VERSION = "v1.31-LABEL-AI-VERIFY"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -279,26 +279,35 @@ Return plain-text (state visible row count first), then JSON on the last line on
 
 LABEL_FOCUS_PROMPT = """NEW INQUIRY
 
-Analyze ONLY the attached product label/nameplate image.
-Do NOT use information from previous conversations.
+This is a brand-new product label photo. Analyze ONLY this attached image.
+Do NOT use prior conversations, chat history, or catalog memory.
 
-The customer photo may ask to quote OR find an equivalent/replacement for ONE product.
-Focus on the MAIN product in the foreground (battery, timer, sensor, relay).
+The customer shows ONE product in the foreground (any industrial part: battery, timer, sensor, cylinder, relay, starter, etc.).
 Ignore background PLC wiring, terminal blocks, and unrelated equipment.
 
 Read the exact model/code printed on the product label character-by-character.
+Extract brand from the label when visible. Default qty 1 unless caption states otherwise.
 
-Examples:
-- OMRON TIMER nameplate H3JA-8A, 200-240VAC → part_no=H3JA-8A, brand=OMRON, product_type=TIMER
-- Red label with "Lithium" and ER6C (AA) 3.6V → part_no=ER6C 3.6V, brand=TOSHIBA or OMRON, product_type=LITHIUM BATTERY
-- Sensor E2E-X5E1 or E3Z-T61 ONLY if those exact characters are printed on the foreground label
+Return plain-text analysis of what you read on the label, then on the last line only append JSON (no markdown):
+{"items":[{"part_no":"EXACT-CODE-FROM-LABEL","qty":1,"brand":"BRAND","product_type":"PRODUCT TYPE"}],"technical_summary":"..."}
+"""
 
-NEVER return SMC CDQ2B32, CDQ2B, or pneumatic cylinder models unless those exact codes are printed on the label.
-NEVER return E2E-X5E1, E3Z-T61, or E3Z-T61-L unless those exact codes are printed on the foreground product label.
-A TIMER label with H3JA-8A is NOT an SMC cylinder or E2E sensor.
+LABEL_VERIFY_PROMPT = """NEW INQUIRY
 
-Return plain-text analysis, then on the last line only append JSON (no markdown):
-{"items":[{"part_no":"H3JA-8A","qty":1,"brand":"OMRON","product_type":"TIMER"}],"technical_summary":"..."}
+Independent verification — re-read ONLY the attached product label photo.
+Ignore all prior analysis, guesses, and conversation history.
+
+Step 1: What ONE product is in the foreground? (any type — battery, timer, sensor, valve, relay, etc.)
+Step 2: Transcribe the exact part/model code printed on the label character-by-character.
+Step 3: State brand and product type from what is printed on the label.
+
+Rules:
+- Return ONLY what you can read in this image — never invent or substitute a catalog part.
+- Background wiring/equipment is not the product.
+- If the caption asks for a quote, qty defaults to 1 unless printed on the label.
+
+Return plain-text (include your character-by-character transcription), then JSON on the last line only:
+{"items":[{"part_no":"EXACT-CODE-FROM-LABEL","qty":1,"brand":"BRAND","product_type":"PRODUCT TYPE"}],"technical_summary":"..."}
 """
 
 
@@ -620,9 +629,73 @@ def _copilot_label_focus_pass(
         items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
         if items:
             print(f"[COPILOT LABEL] Extracted {len(items)} item(s) from label focus pass")
+
+        verify_items, verify_prose = _copilot_label_verify_pass(
+            client,
+            message_text=message_text,
+            image_path=image_path,
+            voice_transcript=voice_transcript,
+        )
+        if verify_items:
+            if not items:
+                items = verify_items
+                prose = verify_prose or prose
+            elif _normalize_part_key(items[0].get("part_no")) != _normalize_part_key(
+                verify_items[0].get("part_no")
+            ):
+                print(
+                    f"[COPILOT LABEL] Verify overrides focus pass: "
+                    f"{items[0].get('part_no')} → {verify_items[0].get('part_no')}"
+                )
+                items = verify_items
+                prose = verify_prose or prose
+            else:
+                print("[COPILOT LABEL] Verify confirms focus pass part number")
         return items, prose
     except Exception as exc:
         print(f"[WARN] Copilot label focus pass failed: {exc}")
+        return [], ""
+
+
+def _copilot_label_verify_pass(
+    client,
+    message_text: str = "",
+    image_path: str = None,
+    voice_transcript: str = "",
+) -> tuple:
+    """Second fresh Copilot call — independent label re-read (any product type)."""
+    if not image_path or not os.path.exists(image_path):
+        return [], ""
+
+    from whatsapp_attachment_processor import validate_image_file
+
+    ok_img, reason = validate_image_file(image_path)
+    if not ok_img:
+        return [], ""
+
+    parts = [LABEL_VERIFY_PROMPT]
+    if message_text:
+        parts.append(f"Customer caption:\n{message_text}")
+    user_content = _copilot_user_content_with_image("\n\n".join(parts), image_path)
+
+    print("[COPILOT LABEL] Verify pass — independent AI re-read of product label...")
+    try:
+        response = _copilot_fresh_chat(
+            client,
+            [{"role": "user", "content": user_content}],
+            timeout=120.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT LABEL VERIFY RAW] {raw[:400]}")
+        prose, parsed = _extract_json_from_copilot_text(raw)
+        if not isinstance(parsed, dict):
+            return [], prose
+        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
+        if items:
+            print(f"[COPILOT LABEL] Verify pass extracted {len(items)} item(s)")
+        return items, prose
+    except Exception as exc:
+        print(f"[WARN] Copilot label verify pass failed: {exc}")
         return [], ""
 
 
