@@ -200,7 +200,7 @@ def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source="")
     if exact:
         return exact
 
-    if source == "COPILOT_VISUAL":
+    if source in ("COPILOT_VISUAL", "COPILOT_UNIFIED", "COPILOT_LABEL_OCR"):
         partial = find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
         if partial and warehouse_match_trusted(part_no, partial):
             return partial
@@ -971,8 +971,10 @@ def process_inquiry_text(inquiry_text):
     }
 
 
-def build_plain_quotation_reply(rows, ai_research=None):
+def build_plain_quotation_reply(rows, ai_research=None, photo_confirmation=None):
     msg = "Hi, thank you for your inquiry.\n\n"
+    if photo_confirmation:
+        msg += f"{str(photo_confirmation).strip()}\n\n"
     msg += "Here is the initial status:\n\n"
 
     total = 0.0

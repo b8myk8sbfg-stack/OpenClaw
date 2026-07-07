@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.11-COPILOT-FIRST-ANALYZE"
+VERSION = "v1.13-COPILOT-ONLY-NO-FALLBACK"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -148,6 +148,25 @@ def _normalize_copilot_intent(intent: str) -> str:
     return "unknown"
 
 
+def _copilot_user_content_with_image(user_text: str, image_path: str = None):
+    """Build OpenAI user content with optional high-detail image attachment."""
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as image_file:
+            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+        return [
+            {"type": "text", "text": user_text},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{image_b64}",
+                    "detail": "high",
+                },
+            },
+        ]
+    return user_text
+
+
 def analyze_incoming_inquiry_with_copilot(
     message_text: str = "",
     image_path: str = None,
@@ -187,8 +206,10 @@ def analyze_incoming_inquiry_with_copilot(
         "- delivery_tracking, payment_invoice, complaint, greeting, junk_ad, general_chat, unknown\n\n"
         "Extract every distinct part visible on a label/photo or stated in text.\n"
         "Read model codes character-by-character from the label in the photo.\n"
-        "NEVER default to OMRON E2E-X5E1 unless those exact characters are printed on the label.\n"
-        "Examples: ER6C 3.6V = lithium battery (NOT E2E); H3JA-8A = timer (NOT E2E); E2E-X5E1 = proximity sensor only if label says E2E.\n"
+        "NEVER default to OMRON E2E-X5E1 or E3Z-T61 unless those exact characters are printed on the label.\n"
+        "Examples: ER6C 3.6V = lithium battery (NOT E2E/E3Z); H3JA-8A = timer (NOT E2E); "
+        "E2E-X5E1 = proximity sensor only if label says E2E; E3Z-T61 = photoelectric sensor only if label says E3Z.\n"
+        "If the label says LITHIUM or ER6C, product_type must be LITHIUM BATTERY and part_no must be ER6C (include 3.6V when printed).\n"
         "Use customer text for quantity ('quote 1 pce' → qty 1). Default qty 1 if not stated.\n\n"
         "Return STRICTLY one raw JSON object with keys:\n"
         "intent, confidence, reasoning, items, technical_summary, is_industrial_automation, compatible_brands\n"
@@ -213,22 +234,9 @@ def analyze_incoming_inquiry_with_copilot(
         + "\n\n".join(parts)
     )
 
-    user_content = user_text
+    user_content = _copilot_user_content_with_image(user_text, image_path)
     if image_path and os.path.exists(image_path):
-        print(f"[COPILOT ANALYZE] Attaching image: {image_path}")
-        with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
-        user_content = [
-            {"type": "text", "text": user_text},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{image_b64}",
-                    "detail": "high",
-                },
-            },
-        ]
+        print(f"[COPILOT ANALYZE] Attaching zoomed message screenshot: {image_path}")
 
     try:
         response = client.chat.completions.create(
@@ -519,6 +527,54 @@ def _is_e2e_family_part(part_no: str) -> bool:
     return _normalize_part_key(part_no).startswith("E2E")
 
 
+def _is_sensor_family_part(part_no: str) -> bool:
+    """OMRON-style proximity / photoelectric families that are often vision-hallucinated."""
+    part_key = _normalize_part_key(part_no)
+    return (
+        part_key.startswith("E2E")
+        or part_key.startswith("E3Z")
+        or part_key.startswith("E39")
+    )
+
+
+def _is_battery_visual_item(item: dict) -> bool:
+    product_type = str(item.get("product_type") or "").upper()
+    part_key = _normalize_part_key(item.get("part_no"))
+    return (
+        "BATTERY" in product_type
+        or "LITHIUM" in product_type
+        or part_key.startswith("ER")
+        or part_key.startswith("CR")
+    )
+
+
+def build_photo_confirmation_line(items: list) -> str:
+    """One-line visual confirmation for RFQ replies when parts came from a photo."""
+    if not items:
+        return ""
+    primary = items[0]
+    part_no = str(primary.get("part_no") or "").strip().upper()
+    brand = str(primary.get("brand") or "").strip().upper()
+    product_type = str(primary.get("product_type") or "").strip()
+    if not part_no:
+        return ""
+
+    if _is_battery_visual_item(primary):
+        noun = product_type or "lithium battery"
+        brand_bit = f"{brand} " if brand and brand != "UNKNOWN" else ""
+        return f"From your photo this is a {brand_bit}{part_no} {noun.lower()}."
+
+    if _is_timer_visual_item(primary):
+        brand_bit = brand if brand and brand != "UNKNOWN" else "OMRON"
+        base_match = re.search(r"(H3J[AY]-\d+[A-Z]?)", part_no, re.I)
+        base_model = base_match.group(1).upper() if base_match else part_no.split()[0]
+        return f"From your photo this is an {brand_bit} {base_model} timer relay."
+
+    brand_bit = f"{brand} " if brand and brand != "UNKNOWN" else ""
+    type_bit = f" {product_type.lower()}" if product_type else ""
+    return f"From your photo this is a {brand_bit}{part_no}{type_bit}."
+
+
 def _is_e2e_only_guess(items: list, label_item: dict = None) -> bool:
     """True when every extracted item is E2E but label OCR did not confirm E2E."""
     if not items:
@@ -575,15 +631,18 @@ def _filter_conflicting_visual_items(items: list) -> list:
     if has_battery:
         filtered = [
             item for item in items
-            if not _normalize_part_key(item.get("part_no")).startswith("E2E")
+            if not _is_sensor_family_part(item.get("part_no"))
+            and not _normalize_part_key(item.get("part_no")).startswith("H3J")
+            and not _normalize_part_key(item.get("part_no")).startswith("H3Y")
         ]
         if filtered:
             return filtered
 
     has_proximity = any(
         "PROXIMITY" in str(item.get("product_type") or "").upper()
+        or "PHOTOELECTRIC" in str(item.get("product_type") or "").upper()
         or "SENSOR" in str(item.get("product_type") or "").upper()
-        or _normalize_part_key(item.get("part_no")).startswith("E2E")
+        or _is_sensor_family_part(item.get("part_no"))
         for item in items
     )
     if has_proximity:
@@ -592,6 +651,7 @@ def _filter_conflicting_visual_items(items: list) -> list:
             if not (
                 _normalize_part_key(item.get("part_no")).startswith("H3J")
                 or _normalize_part_key(item.get("part_no")).startswith("H3Y")
+                or _is_battery_visual_item(item)
             )
         ]
         if filtered:
@@ -692,8 +752,8 @@ def extract_label_from_image(caption: str = "", image_path: str = None) -> dict:
         "Do not guess or substitute a different catalog number. "
         "Never default to OMRON E2E-X5E1 unless those exact characters are printed on the label. "
         "TIMER/H3JA-/H3Y- = timer relay — never E2E. "
-        "LITHIUM/BATTERY/ER6C/ER17500 = battery — never E2E/H3JA. "
-        "PROXIMITY SENSOR/E2E- = proximity sensor — never H3JA/battery. "
+        "LITHIUM/BATTERY/ER6C/ER17500 = battery — never E2E/E3Z/H3JA. "
+        "PROXIMITY SENSOR/E2E- or PHOTOELECTRIC/E3Z- = sensor — never H3JA/battery/ER6C. "
         "Return STRICTLY one raw JSON object with keys: "
         "part_no, brand, product_type, supply_voltage. "
         "part_no must match the label exactly (include voltage when printed, e.g. ER6C 3.6V). "
@@ -802,44 +862,27 @@ def _is_unconfirmed_e2e_guess(items: list, label_item: dict) -> bool:
     return True
 
 
-def _resolve_visual_items(caption: str, image_path: str = None, copilot_items: list = None) -> list:
-    """Merge prior extraction, label OCR, and RFQ visual extraction."""
+def finalize_copilot_visual_items(
+    caption: str,
+    image_path: str = None,
+    copilot_items: list = None,
+    unified_analyze_ran: bool = False,
+) -> list:
+    """Return Copilot unified items only — no secondary OCR or RFQ re-extraction."""
     items = list(copilot_items or [])
-    label_item = {}
+    if unified_analyze_ran:
+        return _filter_conflicting_visual_items(items)
+    return _filter_conflicting_visual_items(items)
 
-    if image_path and os.path.exists(image_path):
-        label_item = extract_label_from_image(caption, image_path=image_path)
-        if not label_item and _is_equivalent_support_request(caption):
-            label_item = extract_timer_label_from_image(caption, image_path=image_path)
-        if label_item:
-            items = _reconcile_visual_items(items, label_item)
-        elif not items:
-            print("[COPILOT VISUAL] Label OCR empty — trying structured RFQ visual extraction...")
-            items = extract_rfq_with_copilot(caption, image_path=image_path)
 
-    items = _filter_conflicting_visual_items(items)
-
-    if _is_e2e_only_guess(items, label_item):
-        if label_item:
-            print("[COPILOT VISUAL] Using label OCR over unconfirmed E2E guess(es).")
-            items = [label_item]
-        elif _is_quote_without_part_text(caption) or _is_equivalent_support_request(caption):
-            timer_label = extract_timer_label_from_image(caption, image_path) if image_path else {}
-            if timer_label:
-                print("[COPILOT VISUAL] Timer OCR recovered label after rejecting E2E guess.")
-                items = [timer_label]
-            else:
-                print("[COPILOT VISUAL] Rejecting unconfirmed E2E guess on photo caption.")
-                items = []
-    elif _is_unconfirmed_e2e_guess(items, label_item):
-        if label_item:
-            print("[COPILOT VISUAL] Using label OCR over unconfirmed E2E guess.")
-            items = [label_item]
-        elif _is_quote_without_part_text(caption):
-            print("[COPILOT VISUAL] Rejecting unconfirmed E2E guess on quote caption + photo.")
-            items = []
-
-    return items
+def _resolve_visual_items(caption: str, image_path: str = None, copilot_items: list = None) -> list:
+    """Deprecated — kept for imports; returns unified items without re-guessing."""
+    return finalize_copilot_visual_items(
+        caption,
+        image_path=image_path,
+        copilot_items=copilot_items,
+        unified_analyze_ran=True,
+    )
 
 
 def _timer_voltage_note(part_no: str) -> str:
@@ -922,14 +965,12 @@ def _reply_contradicts_visual_items(reply: str, items: list) -> bool:
     return False
 
 
-def _fallback_equivalent_photo_reply() -> str:
+def _ask_for_clearer_photo_reply(caption: str = "") -> str:
     return (
-        "Hi, thank you for reaching out.\n\n"
-        "I received your product photo and I am reading the label to recommend the correct "
-        "equivalent / successor part.\n\n"
-        "If you can, please also type the exact model number printed on the nameplate "
-        "(for example OMRON H3JA-8A) and the time range on the dial (5S, 30S, 3M) so I can "
-        "match the right replacement quickly."
+        "Hi, thank you for your message.\n\n"
+        "I received your photo but could not read the product label clearly enough to quote accurately.\n\n"
+        "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
+        "ER6C 3.6V Qty:1"
     )
 
 
@@ -938,7 +979,7 @@ def build_technical_support_reply(
     image_path: str = None,
     copilot_items: list = None,
 ) -> str:
-    """Use Copilot + warehouse stock to answer technical support / equivalent-part questions."""
+    """Use unified Copilot analysis + warehouse stock for technical support replies."""
     if os.getenv("OPENCLAW_COPILOT_TECH_SUPPORT", "1").strip().lower() in ("0", "false", "no", "off"):
         return ""
 
@@ -948,17 +989,14 @@ def build_technical_support_reply(
     if not message_text and not image_path:
         return ""
 
-    # Always re-read the photo for tech support — unless unified Copilot analyze already ran.
-    unified_items = [
-        item for item in (copilot_items or [])
-        if str(item.get("source") or "") == "COPILOT_UNIFIED"
-    ]
-    if unified_items:
-        visual_items = _filter_conflicting_visual_items(unified_items)
-        print("[COPILOT TECH SUPPORT] Using unified Copilot analyze items (image + caption together)")
+    visual_items = _filter_conflicting_visual_items(list(copilot_items or []))
+    if visual_items:
+        print(f"[COPILOT TECH SUPPORT] Using {len(visual_items)} unified analyze item(s)")
+    elif image_path:
+        print("[COPILOT TECH SUPPORT] No unified items — Copilot will read zoomed screenshot directly")
     else:
-        fresh_items = None if image_path else copilot_items
-        visual_items = _resolve_visual_items(message_text, image_path=image_path, copilot_items=fresh_items)
+        print("[COPILOT TECH SUPPORT] Text-only technical support")
+
     timer_items = [item for item in visual_items if _is_timer_visual_item(item)]
 
     if timer_items:
@@ -969,29 +1007,14 @@ def build_technical_support_reply(
         print("[COPILOT TECH SUPPORT] Timer detected — using deterministic equivalent reply")
         return _build_timer_equivalent_reply(timer_items, warehouse_context)
 
-    if image_path and _is_equivalent_support_request(message_text):
-        if _is_e2e_only_guess(visual_items):
-            print("[COPILOT TECH SUPPORT] Rejecting E2E-only guess on equivalent photo request")
-            visual_items = []
-        if not visual_items:
-            label_item = extract_label_from_image(message_text, image_path=image_path)
-            if not label_item:
-                label_item = extract_timer_label_from_image(message_text, image_path=image_path)
-            if label_item and _is_timer_visual_item(label_item):
-                part_refs, warehouse_context = build_warehouse_support_context(
-                    message_text,
-                    part_refs=_part_refs_from_copilot_items([label_item]),
-                )
-                return _build_timer_equivalent_reply([label_item], warehouse_context)
-            print("[COPILOT TECH SUPPORT] Equivalent photo — no reliable label read, using safe fallback")
-            return _fallback_equivalent_photo_reply()
-
     part_refs = _part_refs_from_copilot_items(visual_items)
     if image_path and _is_equivalent_support_request(message_text) and (
         not part_refs or all(_is_e2e_family_part(part) for part in part_refs)
     ):
-        print("[COPILOT TECH SUPPORT] Blocking E2E warehouse reply on equivalent photo")
-        return _fallback_equivalent_photo_reply()
+        print("[COPILOT TECH SUPPORT] Blocking E2E-only guess on equivalent photo request")
+        if not image_path:
+            return _ask_for_clearer_photo_reply(message_text)
+        part_refs = []
 
     part_refs, warehouse_context = build_warehouse_support_context(
         message_text,
@@ -1001,17 +1024,16 @@ def build_technical_support_reply(
     if part_refs:
         parts_label = ", ".join(part_refs)
         identification_note = (
-            f"Model identified from customer text/label: {parts_label}. "
+            f"Model identified from unified analysis: {parts_label}. "
             "You MUST state this exact model in your reply. "
-            "Do NOT substitute a different part family (e.g. never say E2E if the label is H3JA)."
+            "Do NOT substitute a different part family (e.g. never say E2E if the label is H3JA or ER6C)."
         )
     else:
-        parts_label = "(not yet identified from text)"
+        parts_label = "(read from attached zoomed screenshot)"
         identification_note = (
-            "No part number in the customer text. You MUST read the attached product "
-            "label/nameplate and state the exact printed model number (e.g. OMRON H3JA-8A). "
-            "Do not ask the customer to re-send the model if it is clearly visible on the label. "
-            "Never guess E2E-X5E1 unless that exact code is printed on the label."
+            "Read the attached zoomed WhatsApp product photo. State the exact printed model number "
+            "(e.g. OMRON H3JA-8A timer, or ER6C 3.6V lithium battery). "
+            "Never guess E2E-X5E1 or E3Z-T61 unless those exact codes are printed on the label."
         )
 
     print(f"[COPILOT TECH SUPPORT] Parts detected: {parts_label}")
@@ -1021,27 +1043,29 @@ def build_technical_support_reply(
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
         api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=60.0,
+        timeout=90.0 if image_path else 60.0,
         max_retries=1,
     )
 
     system_prompt = (
         "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
         "Answer customer technical support questions clearly and practically on WhatsApp. "
+        "Read the attached zoomed product photo if provided — transcribe the label character-by-character. "
         "Use ONLY the identified model from the label — never invent or substitute a different catalog number. "
-        "NEVER mention E2E-X5E1 or E2E-X5ME1 unless those exact models were identified from the label. "
+        "NEVER mention E2E-X5E1 or E3Z-T61 unless those exact models are printed on the label. "
+        "ER6C / LITHIUM = battery, not a sensor. H3JA / H3Y = timer, not E2E. "
         "When the customer asks for an equivalent, replacement, or successor part, recommend the "
         "best modern replacement and explain briefly why. "
         "For OMRON H3JA or H3Y timer relays, the usual modern successor is H3CR-A8 (8-pin socket, DPDT). "
         "ALWAYS prioritise recommending parts listed in the warehouse stock section below. "
         "If we have Ex-Stock, say Ex-Stock is available — never disclose warehouse quantity numbers. "
         "Do not recommend external distributors if we stock a suitable item. "
-        "Only if the time range on the dial or timing mode is not visible on the label, ask 1-2 short clarifying questions. "
+        "Start with 'From your photo this is...' when a photo is attached and the label is readable. "
         "Plain text only. No markdown, no hyperlinks, no asterisks. Friendly professional tone. Under 280 words."
     )
 
     user_prompt = (
-        f"Customer message:\n{message_text or '(see attached photo)'}\n\n"
+        f"Customer message:\n{message_text or '(see attached zoomed product photo)'}\n\n"
         f"{identification_note}\n\n"
         "Our warehouse stock to PRIORITISE (check these first):\n"
         f"{warehouse_context or '(no matching warehouse stock found — give best technical guidance anyway)'}\n\n"
@@ -1049,11 +1073,15 @@ def build_technical_support_reply(
     )
 
     try:
+        user_content = _copilot_user_content_with_image(user_prompt, image_path)
+        if image_path and os.path.exists(image_path):
+            print(f"[COPILOT TECH SUPPORT] Attaching zoomed screenshot: {image_path}")
+
         response = client.chat.completions.create(
             model=COPILOT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
         )
         text = _sanitize_whatsapp_reply(response.choices[0].message.content or "")
@@ -1061,7 +1089,7 @@ def build_technical_support_reply(
             lines = text.splitlines()
             text = _sanitize_whatsapp_reply("\n".join(lines[1:-1]))
         if not text:
-            return ""
+            return _ask_for_clearer_photo_reply(message_text) if image_path else ""
         if _reply_contradicts_visual_items(text, visual_items):
             if any(_is_timer_visual_item(item) for item in visual_items):
                 print("[COPILOT TECH SUPPORT] Regenerating with deterministic timer template")
@@ -1069,9 +1097,7 @@ def build_technical_support_reply(
                     [item for item in visual_items if _is_timer_visual_item(item)] or visual_items,
                     warehouse_context,
                 )
-            if image_path and _is_equivalent_support_request(message_text):
-                return _fallback_equivalent_photo_reply()
-            return ""
+            return _ask_for_clearer_photo_reply(message_text)
         if not text.lower().startswith("hi"):
             text = f"Hi, thank you for reaching out.\n\n{text}"
         print(f"[COPILOT TECH SUPPORT] Generated {len(text)} char reply")
@@ -1080,7 +1106,7 @@ def build_technical_support_reply(
         print(f"[WARN] Copilot technical support failed: {exc}")
         if visual_items and any(_is_timer_visual_item(item) for item in visual_items):
             return _build_timer_equivalent_reply(visual_items, warehouse_context)
-        return ""
+        return _ask_for_clearer_photo_reply(message_text) if image_path else ""
 
 
 def run_process(name, script):

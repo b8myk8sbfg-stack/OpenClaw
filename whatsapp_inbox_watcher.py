@@ -19,7 +19,6 @@ from selenium.webdriver.chrome.options import Options
 from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
     parse_qty_from_caption,
-    process_inquiry_text,
     process_structured_items,
 )
 from channel_router import send_supplier_rfq
@@ -28,9 +27,8 @@ from image_inquiry_analyzer import analyze_inquiry_image
 from openclaw_main import (
     analyze_incoming_inquiry_with_copilot,
     build_ai_research_summary,
+    build_photo_confirmation_line,
     build_technical_support_reply,
-    extract_rfq_with_copilot,
-    _resolve_visual_items,
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
@@ -3022,9 +3020,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 driver, container, contact_name, message_data_id=message_data_id
             )
             if image_path:
-                print("   🖼️ Image captured — unified Copilot analyze at end of plan")
+                print("   🖼️ Zoomed screenshot captured — unified Copilot analyze at end of plan")
             else:
-                print("   ⚠️ Image step: photo capture failed.")
+                print("   ⚠️ Image step: zoomed screenshot capture failed.")
 
         elif kind == "voice":
             processed_voice = True
@@ -3330,18 +3328,38 @@ def close_media_viewer(driver):
 
 
 def capture_image_via_media_viewer(driver, bubble, image_path):
-    """Open WhatsApp's full-screen viewer so we capture the correct photo."""
+    """Open WhatsApp full-screen viewer (click photo) and save a zoomed screenshot for Copilot."""
     thumb = find_media_image_in_bubble(bubble)
     if thumb is None:
+        print("⚠️ No image thumb found in message bubble — cannot open media viewer.")
         return None
     try:
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
             thumb,
         )
-        time.sleep(0.8)
+        time.sleep(1.0)
         driver.execute_script("arguments[0].click();", thumb)
-        time.sleep(2)
+        time.sleep(2.5)
+
+        panel_selectors = [
+            '[data-testid="media-viewer-panel"]',
+            'div[data-animate-media-viewer="true"]',
+            'div[role="dialog"]',
+        ]
+        for selector in panel_selectors:
+            for panel in driver.find_elements(By.CSS_SELECTOR, selector):
+                try:
+                    if not panel.is_displayed():
+                        continue
+                    size = panel.size or {}
+                    if int(size.get("width") or 0) < 200:
+                        continue
+                    panel.screenshot(image_path)
+                    print(f"🖼️ Saved zoomed WhatsApp media-viewer screenshot: {image_path}")
+                    return image_path
+                except Exception:
+                    continue
 
         viewer_selectors = [
             '[data-testid="media-viewer-panel"] img[src]',
@@ -3367,10 +3385,11 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
                 except Exception:
                     continue
 
-        if best is not None and wait_for_media_image_ready(driver, best):
+        if best is not None and wait_for_media_image_ready(driver, best, timeout=10):
             best.screenshot(image_path)
-            print(f"🖼️ Saved WhatsApp image from media viewer: {image_path}")
+            print(f"🖼️ Saved zoomed WhatsApp image from media viewer: {image_path}")
             return image_path
+        print("⚠️ Media viewer opened but zoomed image was not ready in time.")
     except Exception as exc:
         print(f"⚠️ Media viewer capture failed: {exc}")
     finally:
@@ -3379,6 +3398,7 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
 
 
 def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
+    """Capture only a zoomed screenshot via WhatsApp media viewer — no chat-thumb fallbacks."""
     bubble = resolve_message_container(bubble)
     if bubble is None:
         return None
@@ -3389,40 +3409,14 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     suffix = f"_{id_slug}" if id_slug else ""
     image_path = os.path.join(
         IMAGE_CAPTURE_DIR,
-        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}.png",
+        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}_zoom.png",
     )
 
     viewer_path = capture_image_via_media_viewer(driver, bubble, image_path)
     if viewer_path:
         return viewer_path
 
-    media = find_media_image_in_bubble(bubble)
-    if media is not None:
-        try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                media,
-            )
-            wait_for_media_image_ready(driver, media)
-            media.screenshot(image_path)
-            print(f"🖼️ Saved incoming WhatsApp image (thumb): {image_path}")
-            return image_path
-        except Exception as e:
-            print(f"❌ Failed to capture WhatsApp image thumb: {e}")
-
-    if container_has_image(bubble):
-        try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                bubble,
-            )
-            time.sleep(1)
-            bubble.screenshot(image_path)
-            print(f"🖼️ Saved container screenshot (image thumb fallback): {image_path}")
-            return image_path
-        except Exception as e:
-            print(f"❌ Container screenshot fallback failed: {e}")
-
+    print("❌ Could not capture zoomed screenshot — Copilot will not guess from a tiny thumbnail.")
     return None
 
 
@@ -3878,27 +3872,22 @@ def process_customer_inquiry(
     driver, contact_name, latest_message, image_analysis=None, customer_contact=None,
     classification=None, document_items=None, pre_extracted_copilot_items=None,
     voice_enrichment=None, image_path=None, copilot_technical_summary=None,
+    unified_analyze_ran=False,
 ):
     customer_contact = customer_contact or contact_name
     classification_summary = classification.summary() if classification else None
     document_items = document_items or []
     image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
 
-    if pre_extracted_copilot_items:
-        copilot_items = pre_extracted_copilot_items
-        print(f"🤖 Using {len(copilot_items)} item(s) from sequential visual extraction.")
-    elif image_path:
-        print(f"🤖 Image-first Copilot extraction: {os.path.basename(image_path)}")
-        copilot_items = _resolve_visual_items(latest_message, image_path=image_path)
-        print(f"🤖 Visual extraction result: {len(copilot_items)} item(s)")
-    elif not is_quote_without_part_number(latest_message):
-        copilot_items = extract_rfq_with_copilot(latest_message, image_path=None)
+    if unified_analyze_ran or pre_extracted_copilot_items is not None:
+        copilot_items = list(pre_extracted_copilot_items or [])
+        print(f"🤖 Using {len(copilot_items)} item(s) from unified Copilot analyze (no fallback extraction).")
     else:
-        print("⚠️ Quote caption without part number and no image — skipping text-only guess.")
+        print("⚠️ Unified Copilot analyze did not run — will not guess parts from regex or legacy OCR.")
         copilot_items = []
 
     if copilot_items:
-        print(f"🤖 Copilot is primary: processing {len(copilot_items)} visually extracted item(s).")
+        print(f"🤖 Copilot is primary: processing {len(copilot_items)} item(s).")
         structured_items = []
         existing_norms = set()
         for item in copilot_items:
@@ -3907,13 +3896,19 @@ def process_customer_inquiry(
             if not part_norm or part_norm in existing_norms:
                 continue
             qty = parse_qty_from_caption(latest_message, default=int(item.get("qty") or 1))
+            item_source = str(item.get("source") or "").strip().upper()
+            if not item_source:
+                item_source = "COPILOT_UNIFIED" if unified_analyze_ran else (
+                    "COPILOT_VISUAL" if image_path else "COPILOT_TEXT"
+                )
             structured_items.append({
                 "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
                 "part_no": part_no,
                 "desc": part_no,
                 "qty": qty,
                 "norm": part_norm,
-                "source": "COPILOT_VISUAL" if image_path else "COPILOT_TEXT",
+                "source": item_source,
+                "product_type": str(item.get("product_type") or "").strip(),
             })
             existing_norms.add(part_norm)
             print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {qty}")
@@ -3953,8 +3948,14 @@ def process_customer_inquiry(
             "skipped": skipped,
         }
     else:
-        print("⚠️ Copilot found no usable item. Falling back to regex extraction.")
-        result = process_inquiry_text(latest_message)
+        print("⚠️ Copilot found no usable item — not using regex or legacy OCR fallback.")
+        result = {
+            "formatted_rows": [],
+            "tbc_by_brand": {},
+            "has_partial": False,
+            "missing_layer2_items": [],
+            "skipped": [],
+        }
 
     formatted_rows = result["formatted_rows"]
     tbc_by_brand = result["tbc_by_brand"]
@@ -3985,11 +3986,17 @@ def process_customer_inquiry(
 
     if not formatted_rows:
         if image_path is None and is_quote_without_part_number(latest_message):
-            print("⚠️ RFQ caption with no parts and no image captured — cannot extract.")
+            print("⚠️ RFQ caption with no parts and no zoomed screenshot — cannot extract.")
             reply = (
-                "Hi, I received your quote request but could not access the photo.\n\n"
+                "Hi, I received your quote request but could not access the product photo.\n\n"
                 "Please resend the product label photo together with the part numbers, or type:\n"
-                "P36203010#1 Qty:1"
+                "ER6C 3.6V Qty:1"
+            )
+        elif image_path and unified_analyze_ran:
+            reply = (
+                "Hi, I received your photo but could not read the product label clearly enough to quote.\n\n"
+                "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
+                "ER6C 3.6V Qty:1"
             )
         elif image_analysis:
             reply = (
@@ -4051,9 +4058,14 @@ def process_customer_inquiry(
             f"Price: {row.get('price')} | LT: {row.get('lt')} | Brand: {row.get('brand')}"
         )
 
+    photo_confirmation = ""
+    if image_path and copilot_items:
+        photo_confirmation = build_photo_confirmation_line(copilot_items)
+
     customer_reply = build_plain_quotation_reply(
         formatted_rows,
         ai_research=(copilot_technical_summary or build_ai_research_summary(formatted_rows)),
+        photo_confirmation=photo_confirmation,
     )
     sent = send_customer_reply(
         driver,
@@ -4410,10 +4422,13 @@ def _process_open_chat_body(driver, raw_contact_name):
                 customer_contact=customer_contact,
                 classification=classification,
                 document_items=document_items,
-                pre_extracted_copilot_items=copilot_items or None,
+                pre_extracted_copilot_items=(
+                    copilot_analysis.get("items", []) if copilot_analysis else copilot_items
+                ),
                 voice_enrichment=enrichment,
                 image_path=image_path,
                 copilot_technical_summary=copilot_analysis.get("technical_summary") or "",
+                unified_analyze_ran=bool(copilot_analysis),
             )
             return
 
