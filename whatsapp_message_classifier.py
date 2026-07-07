@@ -55,7 +55,7 @@ def is_equivalent_support_request(message_text: str) -> bool:
         return False
     return True
 
-VERSION = "v1.06-VOICE-NOTE-DETECTION"
+VERSION = "v1.07-VOICE-VS-IMAGE-BALANCE"
 
 VOICE_NOTE_SELECTORS = (
     '[data-testid="audio-play"]',
@@ -65,15 +65,28 @@ VOICE_NOTE_SELECTORS = (
     '[data-icon="ptt"]',
     '[data-icon="audio-play"]',
     '[data-icon="audio-download"]',
-    '[data-icon="audio"]',
     'audio',
 )
 
+VOICE_WAVEFORM_SELECTORS = (
+    'canvas',
+    '[data-icon="audio-play"]',
+    '[data-icon="ptt"]',
+    'span[data-icon="audio-play"]',
+    'span[data-icon="ptt"]',
+)
 
-def bubble_looks_like_voice_note(bubble) -> bool:
-    """True for WhatsApp voice/PTT bubbles (waveform + duration), not photo attachments."""
+PHOTO_ATTACHMENT_SELECTORS = (
+    '[data-testid="image-thumb"]',
+    '[data-testid="media-url-provider"]',
+    '[data-testid="media-caption"]',
+)
+
+
+def _resolve_message_bubble(bubble):
+    """Normalize to msg-container for media detection."""
     if bubble is None:
-        return False
+        return None
     from selenium.webdriver.common.by import By as _By
 
     bubble_for_scan = bubble
@@ -91,6 +104,56 @@ def bubble_looks_like_voice_note(bubble) -> bool:
                     break
     except Exception:
         bubble_for_scan = bubble
+    return bubble_for_scan
+
+
+def is_voice_duration_line(line: str) -> bool:
+    """True for PTT duration like 0:11 — not WhatsApp send time like 1:31 PM."""
+    text = str(line or "").strip()
+    if not text or re.search(r"\b(AM|PM)\b", text, re.I):
+        return False
+    return bool(re.match(r"^\d{1,2}:[0-5]\d(\s*[×xX])?$", text))
+
+
+def bubble_has_photo_attachment(bubble) -> bool:
+    """True for WhatsApp photo/RFQ image bubbles — not bare voice notes."""
+    bubble_for_scan = _resolve_message_bubble(bubble)
+    if bubble_for_scan is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
+
+    try:
+        if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(PHOTO_ATTACHMENT_SELECTORS)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        for img in bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR,
+            'img[src*="blob"], img[src*="mmg"], img[src*="cdn.whatsapp"]',
+        ):
+            src = (img.get_attribute("src") or "").lower()
+            if any(token in src for token in ("avatar", "profile", "pps.whatsapp", "emoji")):
+                continue
+            size = img.size or {}
+            area = int(size.get("width") or 0) * int(size.get("height") or 0)
+            if area >= 2500:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def bubble_looks_like_voice_note(bubble) -> bool:
+    """True for WhatsApp voice/PTT bubbles (waveform + duration), not photo attachments."""
+    if bubble is None or bubble_has_photo_attachment(bubble):
+        return False
+
+    bubble_for_scan = _resolve_message_bubble(bubble)
+    if bubble_for_scan is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
 
     try:
         if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(VOICE_NOTE_SELECTORS)):
@@ -110,19 +173,12 @@ def bubble_looks_like_voice_note(bubble) -> bool:
         bubble_text = (bubble_for_scan.text or "").strip()
         if len(bubble_text) > 100:
             return False
-        if re.search(r"^\d{1,2}:[0-5]\d", bubble_text, re.M):
-            if bubble_for_scan.find_elements(
-                _By.CSS_SELECTOR,
-                'canvas, [data-icon="audio-play"], [data-icon="ptt"], [role="button"]',
-            ):
-                return True
         lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
-        if lines and len(lines) <= 2:
-            if any(re.match(r"^\d{1,2}:[0-5]\d(\s*[×xX])?$", ln) for ln in lines):
-                if bubble_for_scan.find_elements(
-                    _By.CSS_SELECTOR, 'canvas, [role="button"], svg'
-                ):
-                    return True
+        has_duration = any(is_voice_duration_line(ln) for ln in lines)
+        if has_duration and bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR, ", ".join(VOICE_WAVEFORM_SELECTORS)
+        ):
+            return True
     except Exception:
         pass
 
@@ -472,17 +528,19 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
     if not info.has_voice:
         try:
             bubble_text = bubble_for_scan.text or ""
-            if re.search(r"\b\d{1,2}:\d{2}\b", bubble_text):
+            lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
+            if any(is_voice_duration_line(ln) for ln in lines):
                 has_thumb = bubble_for_scan.find_elements(
                     By.CSS_SELECTOR,
-                    '[data-testid="image-thumb"], [data-testid="media-url-provider"]',
+                    '[data-testid="image-thumb"], [data-testid="media-url-provider"], '
+                    '[data-testid="media-caption"]',
                 )
                 has_video = bubble_for_scan.find_elements(
                     By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
                 )
                 has_play = bubble_for_scan.find_elements(
                     By.CSS_SELECTOR,
-                    '[role="button"], span[data-icon="audio-play"], span[data-icon="ptt"]',
+                    'span[data-icon="audio-play"], span[data-icon="ptt"], canvas',
                 )
                 if not has_thumb and not has_video and has_play:
                     info.has_voice = True
@@ -568,6 +626,9 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
         if bubble_looks_like_voice_note(bubble_for_scan):
             info.has_image = False
             info.raw_indicators.append("voice:overrides-avatar-blob")
+        elif bubble_has_photo_attachment(bubble_for_scan):
+            info.has_voice = False
+            info.raw_indicators.append("image:overrides-false-voice")
         else:
             info.has_voice = False
             info.raw_indicators.append("image:overrides-false-voice")

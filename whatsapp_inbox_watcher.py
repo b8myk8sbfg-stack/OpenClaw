@@ -47,12 +47,14 @@ from openclaw_main import (
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     apply_rfq_routing_overrides,
+    bubble_has_photo_attachment,
     bubble_looks_like_voice_note,
     build_classification_monitor_message,
     classify_whatsapp_message,
     classification_from_copilot_analysis,
     detect_bubble_media,
     is_equivalent_support_request,
+    is_voice_duration_line,
     log_classification,
 )
 from whatsapp_attachment_processor import (
@@ -72,7 +74,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.52-VOICE-NOTE-DETECTION"
+VERSION = "v3.53-VOICE-VS-IMAGE-BALANCE"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -1849,15 +1851,31 @@ function hasExplicitVoiceUi(container) {
     );
 }
 
+function isVoiceDurationLine(line) {
+    const t = String(line || '').trim();
+    if (!t || /\\b(AM|PM)\\b/i.test(t)) return false;
+    return /^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(t);
+}
+
 function hasVoiceDurationLine(container) {
     const lines = (container.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
     for (const line of lines) {
-        if (/^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(line)) return true;
+        if (isVoiceDurationLine(line)) return true;
     }
     return false;
 }
 
+function hasPhotoAttachment(container) {
+    if (container.querySelector(
+        '[data-testid="image-thumb"], [data-testid="media-url-provider"], [data-testid="media-caption"]'
+    )) {
+        return true;
+    }
+    return hasRealImage(container);
+}
+
 function hasVoice(container) {
+    if (hasPhotoAttachment(container)) return false;
     if (hasExplicitVoiceUi(container)) return true;
     const text = extractText(container);
     if (text.length > 100) return false;
@@ -1866,12 +1884,9 @@ function hasVoice(container) {
     }
     if (hasVoiceDurationLine(container) && !!container.querySelector(
         'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"], '
-        + '[data-icon="audio-play"], [data-icon="ptt"], [role="button"], svg'
+        + '[data-icon="audio-play"], [data-icon="ptt"]'
     )) {
         return true;
-    }
-    if (hasRealImage(container)) {
-        return false;
     }
     return false;
 }
@@ -2017,15 +2032,31 @@ function hasExplicitVoiceUi(container) {
     );
 }
 
+function isVoiceDurationLine(line) {
+    const t = String(line || '').trim();
+    if (!t || /\\b(AM|PM)\\b/i.test(t)) return false;
+    return /^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(t);
+}
+
 function hasVoiceDurationLine(container) {
     const lines = (container.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
     for (const line of lines) {
-        if (/^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(line)) return true;
+        if (isVoiceDurationLine(line)) return true;
     }
     return false;
 }
 
+function hasPhotoAttachment(container) {
+    if (container.querySelector(
+        '[data-testid="image-thumb"], [data-testid="media-url-provider"], [data-testid="media-caption"]'
+    )) {
+        return true;
+    }
+    return hasRealImage(container);
+}
+
 function hasVoice(container) {
+    if (hasPhotoAttachment(container)) return false;
     if (hasExplicitVoiceUi(container)) return true;
     const text = extractText(container);
     if (text.length > 100) return false;
@@ -2034,12 +2065,9 @@ function hasVoice(container) {
     }
     if (hasVoiceDurationLine(container) && !!container.querySelector(
         'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"], '
-        + '[data-icon="audio-play"], [data-icon="ptt"], [role="button"], svg'
+        + '[data-icon="audio-play"], [data-icon="ptt"]'
     )) {
         return true;
-    }
-    if (hasRealImage(container)) {
-        return false;
     }
     return false;
 }
@@ -2306,7 +2334,17 @@ def scrape_incoming_units_js(driver, lookback=6):
             continue
 
         if container is not None:
-            if item.get("hasVoice") or bubble_looks_like_voice_note(container):
+            js_image = bool(item.get("hasImage"))
+            js_voice = bool(item.get("hasVoice"))
+            has_photo = bubble_has_photo_attachment(container)
+            if has_photo or (js_image and not js_voice):
+                py_kind, py_text = classify_incoming_unit(container)
+                kind = py_kind if py_kind != "empty" else "image"
+                if py_text:
+                    text = normalize_unit_text(py_text)
+            elif js_voice or (
+                bubble_looks_like_voice_note(container) and not has_photo
+            ):
                 kind = "voice"
                 _py_kind, py_text = classify_incoming_unit(container)
                 if py_text:
@@ -2799,6 +2837,8 @@ def find_image_container_js(driver, lookback=8):
 def container_has_real_image(container):
     if container is None:
         return False
+    if bubble_has_photo_attachment(container):
+        return True
     if bubble_looks_like_voice_note(container):
         return False
     if bubble_contains_image(container):
@@ -2816,6 +2856,8 @@ def container_has_real_image(container):
 
 def container_has_voice(container):
     if container is None:
+        return False
+    if bubble_has_photo_attachment(container):
         return False
     if bubble_looks_like_voice_note(container):
         return True
@@ -2842,7 +2884,8 @@ def container_has_voice(container):
         text = (container.text or "").strip()
         if len(text) > 100:
             return False
-        if re.search(r"^\d{1,2}:[0-5]\d", text, re.M):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if any(is_voice_duration_line(ln) for ln in lines):
             if container.find_elements(
                 By.CSS_SELECTOR,
                 'canvas, [data-testid="ptt"], span[data-icon="audio-play"], span[data-icon="ptt"]',
@@ -2866,10 +2909,10 @@ def classify_incoming_unit(container):
     text = extract_text_from_message_container(container)
     if is_bot_noise_message(text):
         return "empty", ""
+    if bubble_has_photo_attachment(container):
+        return "image", text
     if bubble_looks_like_voice_note(container):
         return "voice", text
-    if container_has_real_image(container):
-        return "image", text
     if container_has_voice(container):
         if is_bot_noise_message(text) or (len(text) > 120 and "OpenClaw" in text):
             return "empty", ""
@@ -3027,11 +3070,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         unit_text = unit.get("text") or ""
 
         if kind == "image" and container is not None:
-            if (
-                unit.get("has_voice")
-                or bubble_looks_like_voice_note(container)
-                or container_has_voice(container)
-            ):
+            if bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container):
                 kind = "voice"
                 unit["kind"] = "voice"
                 print("   🎤 Reclassified image → voice (voice-note bubble detected)")
@@ -3072,7 +3111,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             if image_path_this_step:
                 image_path = image_path_this_step
                 print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
-            elif bubble_looks_like_voice_note(container) or unit.get("has_voice"):
+            elif bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container):
                 kind = "voice"
                 unit["kind"] = "voice"
                 print("   🎤 Image capture failed on voice-shaped bubble — switching to voice download")
