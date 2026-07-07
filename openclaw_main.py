@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.29-EQUIVALENT-TECH-SUPPORT"
+VERSION = "v1.30-RFQ-TABLE-ROW-VERIFY"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -235,24 +235,46 @@ items must be an array of objects with keys part_no, qty, brand, product_type
 
 RFQ_TABLE_FOCUS_PROMPT = """NEW INQUIRY
 
-Analyze ONLY the attached RFQ / enquiry table image.
-Do NOT use information from previous conversations.
+This is a brand-new RFQ photo. Analyze ONLY the attached image in this message.
+Do NOT use information from previous conversations, chat history, or typical catalog examples.
 
-The WhatsApp caption may only say "MORNING MS AMEERA PLS QUOTE". All part numbers are IN THIS IMAGE.
+The WhatsApp caption may only say "MORNING MS AMEERA PLS QUOTE". All part numbers must come from THIS image only.
 
-Read every table row (columns: No, Item, Picture, Qty):
-- part_no from the Item column text AND any product label/nameplate in the Picture column
-- qty from the Qty column (read the number exactly)
-- brand from Item text or the nameplate (e.g. ALLEN-BRADLEY, OMRON)
+STEP 1 — Count how many table data rows are actually visible (columns: No, Item, Picture, Qty).
+STEP 2 — Extract one item per visible row ONLY. If only ONE row is visible, return exactly ONE item.
 
-Example: Allen-Bradley Soft Starter Model 150-C25NBD, Qty 3
-→ part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
+Read each visible row:
+- part_no from Item column text AND/OR the product label in the Picture column
+- qty from the Qty column (exact number printed)
+- brand from Item text or nameplate (e.g. ALLEN-BRADLEY)
 
-NEVER return E3Z-T61, E2E-X5E1, or ER6C unless those exact codes appear in the table or product photo.
-Do NOT guess Omron sensors from unrelated context — read only what is printed in the RFQ table.
+Example when ONE row is visible:
+Allen-Bradley Soft Starter Model 150-C25NBD, Qty 3
+→ row_count=1, part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
 
-Return plain-text analysis, then on the last line only append JSON (no markdown):
-{"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
+NEVER invent extra rows. If the table shows only No=1, do NOT add H3CR-A8, SY3120, PZ-V31, CDQ2B, E3Z-T61, or any part not printed in this image.
+NEVER return parts from memory or prior RFQ examples — only what you can read in this photo.
+
+Return plain-text analysis (include visible row count), then on the last line only append JSON (no markdown):
+{"row_count":1,"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
+"""
+
+RFQ_TABLE_VERIFY_PROMPT = """NEW INQUIRY
+
+Re-read ONLY the attached RFQ table image. Ignore all prior analysis and conversation history.
+
+Your job: count visible table rows, then list ONLY those rows — nothing else.
+
+1. How many data rows with No/Item/Qty are visible in THIS photo? (Often just 1 row.)
+2. For each visible row only, extract part_no, qty, brand from text printed in that row.
+
+If you see only ONE row (e.g. No=1, Allen-Bradley 150-C25NBD, Qty=3):
+→ row_count MUST be 1 and items array MUST have exactly 1 object.
+
+Do NOT add rows for H3CR-A8, SY3120, PZ-V31, 3RT2026, VQZ3121, CDQ2B, E3Z-T61 unless that exact part is printed in a visible table row in this image.
+
+Return plain-text (state visible row count first), then JSON on the last line only:
+{"row_count":1,"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
 """
 
 LABEL_FOCUS_PROMPT = """NEW INQUIRY
@@ -604,6 +626,69 @@ def _copilot_label_focus_pass(
         return [], ""
 
 
+def _apply_rfq_row_count_cap(items: list, parsed: dict) -> list:
+    """Trim items to row_count when Copilot reports how many rows are visible."""
+    if not items or not isinstance(parsed, dict):
+        return items
+    row_count = parsed.get("row_count", parsed.get("visible_rows"))
+    if row_count is None:
+        return items
+    try:
+        n = int(row_count)
+    except (TypeError, ValueError):
+        return items
+    if n > 0 and len(items) > n:
+        print(
+            f"[COPILOT RFQ TABLE] row_count={n} — dropping "
+            f"{len(items) - n} extra item(s) not in visible table"
+        )
+        return items[:n]
+    return items
+
+
+def _copilot_rfq_table_verify_pass(
+    client,
+    message_text: str = "",
+    image_path: str = None,
+    voice_transcript: str = "",
+) -> tuple:
+    """Second fresh Copilot call — count visible rows and drop hallucinated extras."""
+    if not image_path or not os.path.exists(image_path):
+        return [], ""
+
+    from whatsapp_attachment_processor import validate_image_file
+
+    ok_img, reason = validate_image_file(image_path)
+    if not ok_img:
+        return [], ""
+
+    parts = [RFQ_TABLE_VERIFY_PROMPT]
+    if message_text:
+        parts.append(f"Customer caption (quote request only):\n{message_text}")
+    user_content = _copilot_user_content_with_image("\n\n".join(parts), image_path)
+
+    print("[COPILOT RFQ TABLE] Verify pass — count visible rows in this image only...")
+    try:
+        response = _copilot_fresh_chat(
+            client,
+            [{"role": "user", "content": user_content}],
+            timeout=120.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT RFQ TABLE VERIFY RAW] {raw[:400]}")
+        prose, parsed = _extract_json_from_copilot_text(raw)
+        if not isinstance(parsed, dict):
+            return [], prose
+        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
+        items = _apply_rfq_row_count_cap(items, parsed)
+        if items:
+            print(f"[COPILOT RFQ TABLE] Verify pass — {len(items)} visible row(s)")
+        return items, prose
+    except Exception as exc:
+        print(f"[WARN] Copilot RFQ table verify pass failed: {exc}")
+        return [], ""
+
+
 def _copilot_rfq_table_focus_pass(
     client,
     message_text: str = "",
@@ -640,8 +725,31 @@ def _copilot_rfq_table_focus_pass(
         if not isinstance(parsed, dict):
             return [], prose
         items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
+        items = _apply_rfq_row_count_cap(items, parsed)
         if items:
             print(f"[COPILOT RFQ TABLE] Extracted {len(items)} item(s) from table focus pass")
+
+        verify_items, verify_prose = _copilot_rfq_table_verify_pass(
+            client,
+            message_text=message_text,
+            image_path=image_path,
+            voice_transcript=voice_transcript,
+        )
+        if verify_items:
+            if len(verify_items) != len(items):
+                print(
+                    f"[COPILOT RFQ TABLE] Verify overrides focus pass: "
+                    f"{len(items)} item(s) → {len(verify_items)} visible row(s)"
+                )
+            elif items and _normalize_part_key(items[0].get("part_no")) != _normalize_part_key(
+                verify_items[0].get("part_no")
+            ):
+                print(
+                    f"[COPILOT RFQ TABLE] Verify overrides focus part: "
+                    f"{items[0].get('part_no')} → {verify_items[0].get('part_no')}"
+                )
+            items = verify_items
+            prose = verify_prose or prose
         return items, prose
     except Exception as exc:
         print(f"[WARN] Copilot RFQ table focus pass failed: {exc}")
