@@ -41,9 +41,11 @@ from openclaw_main import (
     VERSION as OPENCLAW_ENGINE_VERSION,
     analyze_incoming_inquiry_with_copilot,
     build_ai_research_summary,
+    build_extraction_failure_customer_reply,
     build_photo_confirmation_line,
     build_technical_support_reply,
     is_copilot_transport_failure,
+    is_extraction_parse_failure,
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
@@ -1726,6 +1728,10 @@ def is_bot_noise_message(text):
             "Context: QUOTATION_REPLY",
             "Context: NO_ITEMS",
             "Context: IMAGE_NO_ITEMS",
+            "Context: PARSER_ERROR",
+            "Context: JSON_INVALID",
+            "Context: OCR_NO_TEXT",
+            "Context: NO_PRODUCT_FOUND",
         )
     )
 
@@ -4344,7 +4350,8 @@ def send_copilot_malfunction_alert(
 ):
     """Notify monitor WhatsApp when Copilot API fails (non-200 / connection error)."""
     status = copilot_analysis.get("http_status")
-    error = str(copilot_analysis.get("error") or "unknown Copilot error").strip()
+    error = str(copilot_analysis.get("error") or copilot_analysis.get("extraction_error") or "unknown Copilot error").strip()
+    parse_warning = str(copilot_analysis.get("parse_warning") or "").strip()
     raw = str(copilot_analysis.get("raw_excerpt") or "").strip()
     lines = [
         "[OpenClaw Copilot Malfunction]",
@@ -4364,6 +4371,8 @@ def send_copilot_malfunction_alert(
         lines.append(f"Image: {image_path}")
     if original_message:
         lines.append(f"Caption: {original_message[:300]}")
+    if parse_warning:
+        lines.append(f"Parse warning: {parse_warning[:400]}")
     if raw:
         lines.append(f"Copilot raw excerpt: {raw[:400]}")
     alert = "\n".join(lines)
@@ -4784,6 +4793,7 @@ def process_customer_inquiry(
                 "Please resend the product label photo together with the part numbers, or type:\n"
                 "ER6C 3.6V Qty:1"
             )
+            no_items_context = "NO_PRODUCT_FOUND"
         elif image_path and unified_analyze_ran:
             if is_copilot_transport_failure(copilot_analysis):
                 send_copilot_malfunction_alert(
@@ -4800,16 +4810,36 @@ def process_customer_inquiry(
                     image_path=image_path,
                     original_message=latest_message,
                 )
-            elif copilot_analysis.get("parse_warning"):
-                print(
-                    f"⚠️ Copilot parse warning (continuing RFQ): "
-                    f"{copilot_analysis.get('parse_warning')}"
+                reply = (
+                    "Hi, thank you for your inquiry.\n\n"
+                    "We received your message and our team is processing it now. "
+                    "We will send the quotation shortly."
                 )
-            reply = (
-                "Hi, I received your photo but could not read the product details clearly enough to quote.\n\n"
-                "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
-                "150-C25NBD Qty:3"
-            )
+                no_items_context = "COPILOT_TRANSPORT_FAILURE"
+            elif is_extraction_parse_failure(copilot_analysis):
+                send_copilot_malfunction_alert(
+                    driver,
+                    operation=str(copilot_analysis.get("extraction_error") or "PARSER_ERROR"),
+                    copilot_analysis=copilot_analysis,
+                    customer_name=contact_name,
+                    customer_contact=customer_contact,
+                    image_path=image_path,
+                    original_message=latest_message,
+                )
+                reply, no_items_context = build_extraction_failure_customer_reply(
+                    copilot_analysis,
+                    image_path=image_path,
+                )
+            else:
+                reply, no_items_context = build_extraction_failure_customer_reply(
+                    copilot_analysis,
+                    image_path=image_path,
+                )
+                print(
+                    f"⚠️ Extraction produced no warehouse items — "
+                    f"context={no_items_context} | "
+                    f"error={copilot_analysis.get('extraction_error')}"
+                )
         elif image_analysis:
             reply = (
                 "Hi, I analyzed your photo but could not match the parts in our system.\n\n"
@@ -4817,6 +4847,7 @@ def process_customer_inquiry(
                 "E3Z-T61 Qty:1\n"
                 "178902 Qty:2"
             )
+            no_items_context = "NO_PRODUCT_FOUND"
         elif voice_enrichment and (
             voice_enrichment.get("transcript")
             or voice_enrichment.get("voice_path")
@@ -4836,6 +4867,7 @@ def process_customer_inquiry(
                     "E3Z-T61 Qty:1\n"
                     "178902 Qty:2"
                 )
+            no_items_context = "OCR_NO_TEXT"
         else:
             reply = (
                 "Hi, I received your WhatsApp message, but I could not detect item details.\n\n"
@@ -4843,6 +4875,7 @@ def process_customer_inquiry(
                 "E3Z-T61 Qty:1\n"
                 "178902 Qty:2"
             )
+            no_items_context = "NO_PRODUCT_FOUND"
 
         sent = send_customer_reply(
             driver,
@@ -4850,7 +4883,7 @@ def process_customer_inquiry(
             customer_name=contact_name,
             customer_contact=customer_contact,
             original_message=latest_message,
-            context=f"{image_prefix}NO_ITEMS",
+            context=f"{image_prefix}{no_items_context}",
             customer_chat_is_open=True,
             classification_summary=classification_summary,
             image_path=image_path,
@@ -4861,7 +4894,7 @@ def process_customer_inquiry(
             log_message,
             [],
             [],
-            f"{image_prefix}NO_ITEMS_REPLIED" if sent else f"{image_prefix}NO_ITEMS_REPLY_FAILED"
+            f"{image_prefix}{no_items_context}_REPLIED" if sent else f"{image_prefix}{no_items_context}_REPLY_FAILED"
         )
         return
 

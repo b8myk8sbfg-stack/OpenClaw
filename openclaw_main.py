@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.37-INDUSTRIAL-RFQ-ENGINE"
+VERSION = "v1.38-STRICT-JSON"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -113,293 +113,109 @@ def _normalize_copilot_intent(intent: str) -> str:
     return "unknown"
 
 
-OPENCLAW_UNIFIED_PROMPT = """SYSTEM
-
-You are an Industrial RFQ Extraction Engine.
-
-Your job is NOT to identify products from memory.
-
-Your job is to extract evidence from whatever the customer sends.
-
-The input may contain:
-
-- plain text
-- WhatsApp chat
-- images
-- screenshots
-- RFQ tables
-- purchase orders
-- PDF
-- Word
-- Excel
-- manuals
-- drawings
-- invoices
-- voice transcription
-- mixed attachments
-
-Always analyze ONLY the current customer message and attachments.
-
-Never use previous conversation.
-
-Never use warehouse memory.
-
-Never guess missing characters.
-
-Never replace text with familiar industrial part numbers.
-
-Always prefer literal transcription.
-
-Your output will be used for warehouse searching.
-
---------------------------------------------------
-
-STEP 1
-
-Determine input type.
-
-Possible values:
-
-text_message
-single_product_photo
-multiple_product_photo
-rfq_table
-purchase_order
-invoice
-packing_list
-manual
-datasheet
-pdf
-word_document
-excel
-voice_transcript
-mixed
-unknown
-
---------------------------------------------------
-
-STEP 2
-
-Determine customer intent.
-
-Choose ONE
-
-rfq_inquiry
-purchase_order
-technical_support
-replacement_request
-repair
-complaint
-general_chat
-greeting
-junk
-unknown
-
---------------------------------------------------
-
-STEP 3
-
-Extract every industrial product mentioned.
-
-Each product becomes one item.
-
-Sources include
-
-text
-image
-table
-drawing
-manual
-voice transcript
-pdf
-etc.
-
-Never merge unrelated products.
-
---------------------------------------------------
-
-STEP 4
-
-For each item determine evidence source.
-
-Examples
-
-table row
-image label
-nameplate
-text sentence
-voice transcript
-purchase order line
-manual cover
-drawing title block
-etc.
-
---------------------------------------------------
-
-STEP 5
-
-Extract only literal information.
-
-brand
-part number
-model
-catalog number
-description
-quantity
-serial number
-revision
-rating
-voltage
-current
-power
-size
-thread
-connector
-manufacturer
-country
-etc.
-
-If unreadable
-
-replace characters with ?
-
-Never invent.
-
---------------------------------------------------
-
-PART NUMBER RULES
-
-Only use characters actually visible.
-
-Never autocomplete.
-
-Never correct spelling.
-
-Never replace with known catalog numbers.
-
-Good
-
-E3Z-D??
-150-C25NBD
-ER6C
-3RH2131-1AP00
-
-Bad
-
-"I think it is E3Z-D61"
-
-Bad
-
-"It should be H3JA-8A"
-
-unless H3JA-8A is literally visible.
-
---------------------------------------------------
-
-IMAGE RULES
-
-First classify image.
-
-A.
-Single product photo
-The inquiry is the object closest to camera.
-Ignore background equipment.
-
-B.
-RFQ table
-Every visible row is an item.
-Ignore handheld foreground rules.
-
-C.
-Panel photo
-Only extract products clearly intended by the customer.
-Do not read every relay unless requested.
-
-D.
-Manual
-Extract cover information.
-
-E.
-Purchase order screenshot
-Extract every line.
-
---------------------------------------------------
-
-VOICE RULES
-
-Use transcription only.
-Do not infer unheard words.
-If uncertain use ?.
-
---------------------------------------------------
-
-PDF / WORD / EXCEL
-
-Read every visible line item.
-Return one item per row.
-
---------------------------------------------------
-
-UNKNOWN FILES
-
-Describe the attachment.
-Do not invent contents.
-
---------------------------------------------------
-
-CONFIDENCE
-
-High
-Literal label visible.
-
-Medium
-Partially visible.
-
-Low
-Mentioned only in text.
-
---------------------------------------------------
-
-Return plain text analysis.
-
-Then return ONE JSON object.
-
+EXTRACTION_ERRORS = frozenset({
+    "PARSER_ERROR",
+    "JSON_INVALID",
+    "OCR_NO_TEXT",
+    "NO_PRODUCT_FOUND",
+    "NO_FOREGROUND_OBJECT",
+    "LOW_CONFIDENCE",
+})
+
+REQUIRED_EXTRACTION_FIELDS = ("status", "intent", "input_type", "items")
+
+OPENCLAW_UNIFIED_PROMPT = """CRITICAL RULES (override every other instruction):
+1. Never guess. Never autocomplete. Never correct spelling.
+2. Never use previous conversations or warehouse/catalog memory.
+3. Literal transcription only. If unreadable use ?.
+4. Never substitute familiar catalog numbers (e.g. E3Z-D61, H3JA-8A) unless literally visible.
+5. Output ONLY valid JSON. No markdown. No prose. No analysis. No code fences. No text before or after JSON.
+
+You are an Industrial RFQ Extraction Engine. Extract literal evidence only — do NOT identify products from memory.
+
+STEP 1 — Classify input_type (choose ONE):
+text_message | single_product_photo | multiple_product_photo | rfq_table | purchase_order | invoice | manual | datasheet | panel_photo | document | mixed | unknown
+
+STEP 2 — Determine PRIMARY inquiry object (choose ONE before any extraction):
+A. Single handheld object — held in hand or closest to camera
+B. RFQ table — spreadsheet/form with rows and columns
+C. Nameplate — close-up label only
+D. Purchase order — PO lines
+E. Panel overview — only if customer clearly quotes panel equipment
+F. Manual / G datasheet cover
+G. Text/voice message only
+
+Only extract from the PRIMARY inquiry object.
+
+STEP 3 — Extraction rules:
+
+single_product_photo / handheld (A):
+- Primary object = held in hand OR nearest to camera
+- Ignore ALL background: terminal blocks, relays, sensors, PLCs, control panels, wiring
+- Describe shape first, then transcribe label character-by-character
+- Never read background equipment labels
+
+rfq_table (B):
+- Every visible row = one item in items[]
+- qty: from Qty column — never default to 1 if Qty column shows another number
+- part_no: from Item/Model/Catalog column; use Picture column only to confirm unreadable text
+- Do NOT apply handheld/foreground rules to tables
+
+purchase_order (D): one item per PO line.
+panel_photo (E): only products the customer clearly intends to quote.
+
+STEP 4 — intent (choose ONE):
+rfq_inquiry | purchase_order | technical_support | replacement_request | repair | complaint | general_chat | greeting | junk | unknown
+
+part_no must be literal transcription. Never normalize. Never improve.
+
+Return ONLY this JSON object (no other text):
 {
- "intent":"",
- "confidence":0.0,
- "input_type":"",
- "items":[
-   {
-      "brand":"",
-      "part_no":"",
-      "description":"",
-      "product_type":"",
-      "qty":1,
-      "source":"image label",
-      "confidence":0.99
-   }
- ],
- "technical_summary":"",
- "reasoning":""
+  "status": "success",
+  "intent": "rfq_inquiry",
+  "input_type": "single_product_photo",
+  "primary_subject": "battery",
+  "confidence": 0.99,
+  "items": [
+    {
+      "brand": "",
+      "part_no": "ER6C (AA)-3.6V",
+      "description": "Lithium battery",
+      "product_type": "battery",
+      "qty": 1,
+      "source": "foreground label",
+      "confidence": 0.99,
+      "reason": "Foreground label fully readable"
+    }
+  ],
+  "ignored": ["terminal block", "control panel"],
+  "technical_summary": "",
+  "reasoning": ""
 }
 
-Rules
+If no products found: status="no_products", items=[]. If label unreadable: status="ocr_no_text", items=[].
+One product = one item. One RFQ row = one item. One PO line = one item.
+"""
 
-part_no must exactly equal the literal transcription.
+OPENCLAW_JSON_RETRY_PROMPT = """CRITICAL: Your previous response was NOT valid JSON or failed validation.
 
-Never improve it.
+Return ONLY one valid JSON object. No markdown. No prose. No code fences. No text before or after.
 
-Never normalize it.
+Required fields: status, intent, input_type, items (array).
+Use literal part_no transcription only. Never guess catalog numbers.
 
-Never substitute a known catalog number.
-
-If unreadable use ?.
-
-One detected product = one item.
-
-One RFQ table row = one item.
-
-One purchase order line = one item.
+Schema:
+{
+  "status": "success",
+  "intent": "rfq_inquiry",
+  "input_type": "single_product_photo",
+  "primary_subject": "",
+  "confidence": 0.0,
+  "items": [{"brand":"","part_no":"","description":"","product_type":"","qty":1,"source":"","confidence":0.0,"reason":""}],
+  "ignored": [],
+  "technical_summary": "",
+  "reasoning": ""
+}
 """
 
 def _parse_caption_qty(text: str, default: int = 1) -> int:
@@ -475,25 +291,230 @@ def _minimal_copilot_analysis_result(
     raw: str = "",
     parse_warning: str = "",
     http_status: int = 200,
+    extraction_error: str = "PARSER_ERROR",
 ) -> dict:
-    """Best-effort analyze result so RFQ routing can continue after HTTP 200."""
+    """Structured failure result — never masquerade parser errors as successful analyze."""
     prose = str(analysis_text or raw or "").strip()
-    inferred_intent = _infer_intent_from_prose(prose, message_text)
     return {
         "attempted": True,
-        "ok": True,
-        "intent": inferred_intent,
-        "confidence": 0.7,
-        "reasoning": parse_warning or "Copilot response could not be fully parsed.",
+        "ok": False,
+        "intent": "unknown",
+        "confidence": 0.0,
+        "input_type": "",
+        "extraction_error": extraction_error,
+        "reasoning": parse_warning or extraction_error,
         "items": [],
-        "technical_summary": _sanitize_whatsapp_reply(prose),
+        "technical_summary": _sanitize_whatsapp_reply(prose) if prose else "",
         "analysis_text": prose,
         "is_industrial_automation": True,
         "compatible_brands": [],
+        "ignored": [],
         "raw_excerpt": str(raw or prose)[:800],
         "http_status": http_status,
-        "parse_warning": parse_warning or None,
+        "parse_warning": parse_warning or extraction_error,
     }
+
+
+def is_extraction_parse_failure(analysis: dict) -> bool:
+    """True when Copilot responded but JSON could not be parsed/validated."""
+    if not isinstance(analysis, dict):
+        return False
+    err = str(analysis.get("extraction_error") or "").upper()
+    return err in ("PARSER_ERROR", "JSON_INVALID")
+
+
+def _strip_markdown_fences(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 2:
+            cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+    return cleaned
+
+
+def _fix_trailing_commas(json_text: str) -> str:
+    """Remove trailing commas before } or ] — common model mistake."""
+    return re.sub(r",(\s*[}\]])", r"\1", json_text)
+
+
+def _try_parse_json_candidate(candidate: str):
+    if not candidate:
+        return None
+    for variant in (candidate, _fix_trailing_commas(candidate)):
+        try:
+            parsed = json.loads(variant)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _extract_json_substring_first_to_last(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return ""
+    return text[start:end + 1]
+
+
+def parse_copilot_json_response(raw: str):
+    """
+    Robust JSON extraction from Copilot output.
+    Returns (parsed_dict|None, error_code|None, detail).
+    """
+    text = _strip_markdown_fences(str(raw or "").strip())
+    if not text:
+        return None, "JSON_INVALID", "empty response"
+
+    candidates = []
+    if text.startswith("{"):
+        candidates.append(text)
+    substring = _extract_json_substring_first_to_last(text)
+    if substring and substring not in candidates:
+        candidates.append(substring)
+    balanced = _extract_balanced_json_object(text)
+    if balanced and balanced not in candidates:
+        candidates.append(balanced)
+    for match in re.finditer(r"\{", text):
+        fragment = _extract_balanced_json_object(text[match.start():])
+        if fragment and fragment not in candidates:
+            candidates.append(fragment)
+
+    for candidate in candidates:
+        parsed = _try_parse_json_candidate(candidate)
+        if parsed is not None:
+            return parsed, None, ""
+
+    return None, "JSON_INVALID", "no parseable JSON object found"
+
+
+def _validate_copilot_extraction_json(parsed: dict):
+    """Validate required contract fields. Returns (ok, missing_fields)."""
+    if not isinstance(parsed, dict):
+        return False, ["not_a_dict"]
+    missing = [field for field in REQUIRED_EXTRACTION_FIELDS if field not in parsed]
+    if missing:
+        return False, missing
+    if not isinstance(parsed.get("items"), list):
+        return False, ["items_not_array"]
+    return True, []
+
+
+def _classify_empty_extraction(parsed: dict, image_path: str = None) -> str:
+    """Map valid JSON with zero items to a specific extraction error."""
+    status = str(parsed.get("status") or "").strip().lower()
+    if status in ("ocr_no_text", "no_text", "unreadable"):
+        return "OCR_NO_TEXT"
+    if status in ("no_products", "no_product", "not_found"):
+        return "NO_PRODUCT_FOUND"
+    input_type = str(parsed.get("input_type") or "").strip().lower()
+    if image_path and input_type in ("single_product_photo", "multiple_product_photo"):
+        if not str(parsed.get("primary_subject") or "").strip():
+            return "NO_FOREGROUND_OBJECT"
+    confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
+    if confidence < 0.45:
+        return "LOW_CONFIDENCE"
+    return "NO_PRODUCT_FOUND"
+
+
+def _build_extraction_user_prompt(
+    message_text: str = "",
+    document_text: str = "",
+    voice_transcript: str = "",
+    base_prompt: str = None,
+) -> str:
+    prompt_parts = [base_prompt or OPENCLAW_UNIFIED_PROMPT]
+    if voice_transcript:
+        prompt_parts.append(
+            "Attached voice message (already transcribed from WAV):\n"
+            f"{voice_transcript}"
+        )
+    if message_text:
+        prompt_parts.append(f"Attached customer message/caption:\n{message_text}")
+    if document_text:
+        prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
+    return "\n\n".join(prompt_parts)
+
+
+def _copilot_extraction_result_from_parsed(
+    parsed: dict,
+    raw: str,
+    message_text: str = "",
+    voice_transcript: str = "",
+    image_path: str = None,
+) -> dict:
+    """Build normalized analyze result from validated Copilot JSON."""
+    intent = _normalize_copilot_intent(parsed.get("intent"))
+    confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
+    input_type = str(parsed.get("input_type") or "").strip()
+    primary_subject = str(parsed.get("primary_subject") or "").strip()
+    ignored = parsed.get("ignored") or []
+    if not isinstance(ignored, list):
+        ignored = [str(ignored)]
+    technical_summary = _sanitize_whatsapp_reply(
+        str(parsed.get("technical_summary") or "").strip()
+    )
+
+    items_out = _parse_copilot_items_from_dict(
+        parsed,
+        message_text=message_text,
+        voice_transcript=voice_transcript,
+        input_type=input_type,
+    )
+    reasoning = _build_copilot_reasoning(parsed, items_out)
+
+    if _is_equivalent_support_request(message_text):
+        intent = "technical_support"
+        if not reasoning or re.search(r"\brfq\b", reasoning, re.I):
+            reasoning = (
+                "Equivalent/replacement request — technical support, "
+                "reading product label from photo."
+            )
+
+    extraction_error = ""
+    if not items_out:
+        extraction_error = _classify_empty_extraction(parsed, image_path=image_path)
+        print(
+            f"[COPILOT ANALYZE] Zero items after validation — "
+            f"extraction_error={extraction_error}"
+        )
+
+    status = str(parsed.get("status") or "").strip().lower()
+    ok = bool(items_out) and status not in ("error", "ocr_no_text", "no_products")
+
+    result = {
+        "attempted": True,
+        "ok": ok,
+        "intent": intent,
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "input_type": input_type,
+        "primary_subject": primary_subject,
+        "extraction_error": extraction_error or None,
+        "reasoning": reasoning,
+        "items": items_out,
+        "technical_summary": technical_summary,
+        "analysis_text": "",
+        "is_industrial_automation": True,
+        "compatible_brands": [],
+        "ignored": ignored,
+        "raw_excerpt": raw[:800],
+        "parse_warning": extraction_error or None,
+    }
+    print(
+        f"[COPILOT ANALYZE] intent={intent} ({confidence:.0%}) | "
+        f"input_type={input_type or 'n/a'} | items={len(items_out)} | "
+        f"error={extraction_error or 'none'} | {reasoning[:60]}"
+    )
+    return result
+
+
+def _extract_json_from_copilot_text(raw: str):
+    """Legacy wrapper — returns (prose, parsed) for any remaining callers."""
+    parsed, error, _detail = parse_copilot_json_response(raw)
+    if parsed is not None:
+        return "", parsed
+    return str(raw or "").strip(), {}
 
 
 def _infer_intent_from_prose(prose: str, message_text: str = "") -> str:
@@ -518,63 +539,6 @@ def _copilot_fresh_chat(client, messages, timeout: float = 60.0):
         extra_body={"conversation_id": None},
         timeout=timeout,
     )
-
-
-def _extract_json_from_copilot_text(raw: str):
-    """Split Copilot prose from trailing (or embedded) JSON object."""
-    text = str(raw or "").strip()
-    if not text:
-        return "", {}
-
-    if text.startswith("```"):
-        text = "\n".join(text.splitlines()[1:-1]).strip()
-
-    lines = text.splitlines()
-    for start in range(len(lines) - 1, -1, -1):
-        tail = "\n".join(lines[start:]).strip()
-        if not tail.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(tail)
-            if isinstance(parsed, dict):
-                prose = "\n".join(lines[:start]).strip()
-                return prose, parsed
-        except json.JSONDecodeError:
-            candidate = _extract_balanced_json_object(tail)
-            if candidate:
-                try:
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, dict):
-                        prose = "\n".join(lines[:start]).strip()
-                        remainder = tail[len(candidate):].strip()
-                        if remainder:
-                            prose = f"{prose}\n{remainder}".strip() if prose else remainder
-                        return prose, parsed
-                except json.JSONDecodeError:
-                    continue
-
-    for match in re.finditer(r"\{", text):
-        candidate = _extract_balanced_json_object(text[match.start():])
-        if not candidate:
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and (
-            "intent" in parsed or "items" in parsed or "technical_summary" in parsed
-        ):
-            prose = (text[:match.start()] + text[match.start() + len(candidate):]).strip()
-            return prose, parsed
-
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return "", parsed
-    except json.JSONDecodeError:
-        pass
-
-    return text, {}
 
 
 def _detect_image_mime_from_bytes(data: bytes) -> str:
@@ -610,9 +574,15 @@ def _copilot_user_content_with_image(user_text: str, image_path: str = None):
     return user_text
 
 
-def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_transcript: str = "") -> list:
+def _parse_copilot_items_from_dict(
+    parsed: dict,
+    message_text: str = "",
+    voice_transcript: str = "",
+    input_type: str = "",
+) -> list:
     """Normalize items array from Copilot JSON — preserve literal part_no transcription."""
     caption_qty = _parse_caption_qty(message_text or voice_transcript, default=1)
+    table_mode = str(input_type or parsed.get("input_type") or "").strip().lower() == "rfq_table"
     items_out = []
     for item in parsed.get("items") or []:
         if not isinstance(item, dict):
@@ -620,15 +590,22 @@ def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_t
         part_no = str(item.get("part_no") or "").strip()
         if not part_no:
             continue
-        try:
-            qty = _parse_copilot_qty(item.get("qty"), default=caption_qty or 1)
-        except (TypeError, ValueError):
-            qty = caption_qty
+        if "qty" in item and item.get("qty") is not None and str(item.get("qty")).strip() != "":
+            try:
+                qty = _parse_copilot_qty(item.get("qty"), default=1)
+            except (TypeError, ValueError):
+                qty = 1
+        elif table_mode:
+            qty = 1
+            print("[COPILOT ANALYZE] WARN rfq_table row missing qty — defaulting to 1")
+        else:
+            qty = caption_qty or 1
         qty = max(1, qty)
         brand = str(item.get("brand") or "UNKNOWN").strip().upper()
         product_type = str(item.get("product_type") or "").strip()
         description = str(item.get("description") or "").strip()
         evidence = str(item.get("source") or "").strip()
+        item_reason = str(item.get("reason") or "").strip()
         item_confidence = parse_copilot_confidence(item.get("confidence"), default=None)
         item_out = {
             "part_no": part_no,
@@ -642,6 +619,8 @@ def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_t
             item_out["description"] = description
         if evidence:
             item_out["evidence_source"] = evidence
+        if item_reason:
+            item_out["reason"] = item_reason
         if item_confidence is not None:
             item_out["confidence"] = item_confidence
         items_out.append(item_out)
@@ -705,8 +684,8 @@ def analyze_incoming_inquiry_with_copilot(
             )
             if dims and (dims[0] < 400 or dims[1] < 400):
                 print(
-                    f"[COPILOT ANALYZE] WARN low resolution {dim_label} — "
-                    "label/table text may be hard to read"
+                    f"[COPILOT ANALYZE] Image dimensions {dim_label} — "
+                    "resolution alone does not block extraction"
                 )
             if not img_ok:
                 print("[COPILOT ANALYZE] Skipping corrupt/thumbnail image — analyzing caption/text only.")
@@ -726,104 +705,73 @@ def analyze_incoming_inquiry_with_copilot(
         max_retries=1,
     )
 
-    prompt_parts = [OPENCLAW_UNIFIED_PROMPT]
-    if voice_transcript:
-        prompt_parts.append(
-            "Attached voice message (already transcribed from WAV):\n"
-            f"{voice_transcript}"
-        )
-    if message_text:
-        prompt_parts.append(f"Attached customer message/caption:\n{message_text}")
-    if document_text:
-        prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
-    elif not message_text and not voice_transcript and not document_text and image_path:
-        prompt_parts.append("Attached image: analyze this message only.")
-
-    user_text = "\n\n".join(prompt_parts)
+    user_text = _build_extraction_user_prompt(
+        message_text=message_text,
+        document_text=document_text,
+        voice_transcript=voice_transcript,
+    )
     user_content = _copilot_user_content_with_image(user_text, image_path)
     if image_path and os.path.exists(image_path):
         print(f"[COPILOT ANALYZE] Fresh chat — attached image: {image_path}")
 
-    raw = ""
-    try:
+    def _call_and_parse(prompt_text: str, label: str):
+        content = _copilot_user_content_with_image(prompt_text, image_path)
         response = _copilot_fresh_chat(
             client,
-            [{"role": "user", "content": user_content}],
+            [{"role": "user", "content": content}],
             timeout=120.0 if image_path else 60.0,
         )
-        raw = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT ANALYZE RAW] {raw[:500]}")
-        analysis_text, parsed = _extract_json_from_copilot_text(raw)
-        if not isinstance(parsed, dict) or not parsed:
-            if analysis_text and len(analysis_text.strip()) >= 40:
-                inferred_intent = _infer_intent_from_prose(analysis_text, message_text)
-                print(
-                    "[COPILOT ANALYZE] Plain-text response without JSON — "
-                    f"using prose fallback intent={inferred_intent}"
-                )
-                parsed = {
-                    "intent": inferred_intent,
-                    "confidence": 0.7,
-                    "items": [],
-                    "technical_summary": analysis_text,
-                    "is_industrial_automation": True,
-                    "compatible_brands": [],
-                    "reasoning": "Parsed from plain-text Copilot analysis (no JSON footer).",
-                }
-            else:
-                print(
-                    "[COPILOT ANALYZE] No JSON footer — continuing with best-effort prose/caption parse"
-                )
-                return _minimal_copilot_analysis_result(
+        response_raw = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT ANALYZE RAW/{label}] {response_raw[:500]}")
+        parsed_obj, parse_err, parse_detail = parse_copilot_json_response(response_raw)
+        return response_raw, parsed_obj, parse_err, parse_detail
+
+    raw = ""
+    try:
+        raw, parsed, parse_error, parse_detail = _call_and_parse(user_text, "pass1")
+
+        if parsed is None:
+            print(f"[COPILOT ANALYZE] JSON parse failed ({parse_error}): {parse_detail}")
+            retry_prompt = (
+                _build_extraction_user_prompt(
                     message_text=message_text,
-                    analysis_text=analysis_text,
-                    raw=raw,
-                    parse_warning="no JSON object in Copilot response",
-                    http_status=200,
+                    document_text=document_text,
+                    voice_transcript=voice_transcript,
+                    base_prompt=OPENCLAW_JSON_RETRY_PROMPT,
                 )
+                + f"\n\nYour invalid response was:\n{raw[:1200]}"
+            )
+            raw, parsed, parse_error, parse_detail = _call_and_parse(retry_prompt, "pass2-json-retry")
 
-        intent = _normalize_copilot_intent(parsed.get("intent"))
-        confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
-        input_type = str(parsed.get("input_type") or "").strip()
-        reasoning = _build_copilot_reasoning(parsed, [])
-        technical_summary = _sanitize_whatsapp_reply(
-            str(parsed.get("technical_summary") or analysis_text or "").strip()
+        if parsed is None:
+            print(f"[COPILOT ANALYZE] PARSER_ERROR after retry: {parse_detail}")
+            return _minimal_copilot_analysis_result(
+                message_text=message_text,
+                analysis_text=raw,
+                raw=raw,
+                parse_warning=f"JSON parse failed after retry: {parse_detail}",
+                http_status=200,
+                extraction_error="PARSER_ERROR",
+            )
+
+        valid, missing = _validate_copilot_extraction_json(parsed)
+        if not valid:
+            print(f"[COPILOT ANALYZE] JSON_INVALID — missing/invalid fields: {missing}")
+            return _minimal_copilot_analysis_result(
+                message_text=message_text,
+                raw=raw,
+                parse_warning=f"JSON validation failed: {', '.join(missing)}",
+                http_status=200,
+                extraction_error="JSON_INVALID",
+            )
+
+        return _copilot_extraction_result_from_parsed(
+            parsed,
+            raw,
+            message_text=message_text,
+            voice_transcript=voice_transcript,
+            image_path=image_path,
         )
-
-        items_out = _parse_copilot_items_from_dict(
-            parsed, message_text=message_text, voice_transcript=voice_transcript
-        )
-        reasoning = _build_copilot_reasoning(parsed, items_out)
-
-        if _is_equivalent_support_request(message_text):
-            intent = "technical_support"
-            if not reasoning or re.search(r"\brfq\b", reasoning, re.I):
-                reasoning = (
-                    "Equivalent/replacement request — technical support, "
-                    "reading product label from photo."
-                )
-
-        result = {
-            "attempted": True,
-            "ok": True,
-            "intent": intent,
-            "confidence": max(0.0, min(confidence, 1.0)),
-            "input_type": input_type,
-            "reasoning": reasoning,
-            "items": items_out,
-            "technical_summary": technical_summary,
-            "analysis_text": analysis_text,
-            "is_industrial_automation": True,
-            "compatible_brands": [],
-            "raw_excerpt": raw[:800],
-        }
-        print(
-            f"[COPILOT ANALYZE] intent={intent} ({confidence:.0%}) | "
-            f"input_type={input_type or 'n/a'} | items={len(items_out)} | {reasoning[:80]}"
-        )
-        if not items_out and image_path:
-            print(f"[COPILOT ANALYZE] WARN zero items after parse — raw excerpt: {raw[:300]!r}")
-        return result
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[WARN] Copilot analyze parse issue (HTTP 200): {exc}")
         return _minimal_copilot_analysis_result(
@@ -832,6 +780,7 @@ def analyze_incoming_inquiry_with_copilot(
             raw=raw,
             parse_warning=f"invalid JSON from Copilot: {exc}",
             http_status=200,
+            extraction_error="JSON_INVALID",
         )
     except APIStatusError as exc:
         print(f"[WARN] Copilot analyze HTTP {exc.status_code}: {exc}")
@@ -996,6 +945,58 @@ def _sanitize_whatsapp_reply(text: str) -> str:
     return cleaned.strip()
 
 
+
+
+def build_extraction_failure_customer_reply(
+    copilot_analysis: dict = None,
+    image_path: str = None,
+) -> tuple:
+    """
+    Return (reply_text, context_code) for failed extraction.
+    Parser failures must NOT ask for a clearer image.
+    """
+    analysis = copilot_analysis or {}
+    err = str(analysis.get("extraction_error") or "").upper()
+
+    if is_extraction_parse_failure(analysis):
+        return (
+            "Hi, thank you for your inquiry.\n\n"
+            "We received your message and our team is reviewing it now. "
+            "To speed up the quotation, please also type the part number(s) and quantity, for example:\n"
+            "150-C25NBD Qty:3",
+            "PARSER_ERROR",
+        )
+
+    if err == "OCR_NO_TEXT":
+        return (_ask_for_clearer_photo_reply(), "OCR_NO_TEXT")
+
+    if err in ("NO_PRODUCT_FOUND", "NO_FOREGROUND_OBJECT"):
+        if image_path:
+            return (_ask_for_clearer_photo_reply(), err)
+        return (
+            "Hi, I received your message but could not detect part numbers.\n\n"
+            "Please send in this format:\n"
+            "150-C25NBD Qty:3",
+            err or "NO_PRODUCT_FOUND",
+        )
+
+    if err == "LOW_CONFIDENCE":
+        return (
+            "Hi, thank you for your inquiry.\n\n"
+            "We received your photo but are not fully confident in the part numbers read. "
+            "Please confirm by typing the exact part number(s) and quantity, for example:\n"
+            "ER6C (AA)-3.6V Qty:1",
+            "LOW_CONFIDENCE",
+        )
+
+    if image_path:
+        return (_ask_for_clearer_photo_reply(), "NO_PRODUCT_FOUND")
+    return (
+        "Hi, I received your WhatsApp message, but I could not detect item details.\n\n"
+        "Please send in this format:\n"
+        "150-C25NBD Qty:3",
+        "NO_PRODUCT_FOUND",
+    )
 
 
 def _ask_for_clearer_photo_reply(caption: str = "") -> str:
