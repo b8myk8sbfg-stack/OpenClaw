@@ -55,7 +55,78 @@ def is_equivalent_support_request(message_text: str) -> bool:
         return False
     return True
 
-VERSION = "v1.05-EQUIVALENT-TECH-SUPPORT"
+VERSION = "v1.06-VOICE-NOTE-DETECTION"
+
+VOICE_NOTE_SELECTORS = (
+    '[data-testid="audio-play"]',
+    '[data-testid="ptt-play-button"]',
+    '[data-testid="ptt"]',
+    '[data-testid="audio"]',
+    '[data-icon="ptt"]',
+    '[data-icon="audio-play"]',
+    '[data-icon="audio-download"]',
+    '[data-icon="audio"]',
+    'audio',
+)
+
+
+def bubble_looks_like_voice_note(bubble) -> bool:
+    """True for WhatsApp voice/PTT bubbles (waveform + duration), not photo attachments."""
+    if bubble is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
+
+    bubble_for_scan = bubble
+    try:
+        testid = bubble.get_attribute("data-testid") or ""
+        if testid != "msg-container" and "message-in" not in (bubble.get_attribute("class") or ""):
+            node = bubble
+            for _ in range(10):
+                node = node.find_element(_By.XPATH, "..")
+                if (node.get_attribute("data-testid") or "") == "msg-container":
+                    bubble_for_scan = node
+                    break
+                if "message-in" in (node.get_attribute("class") or ""):
+                    bubble_for_scan = node
+                    break
+    except Exception:
+        bubble_for_scan = bubble
+
+    try:
+        if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(VOICE_NOTE_SELECTORS)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
+        ):
+            return False
+    except Exception:
+        pass
+
+    try:
+        bubble_text = (bubble_for_scan.text or "").strip()
+        if len(bubble_text) > 100:
+            return False
+        if re.search(r"^\d{1,2}:[0-5]\d", bubble_text, re.M):
+            if bubble_for_scan.find_elements(
+                _By.CSS_SELECTOR,
+                'canvas, [data-icon="audio-play"], [data-icon="ptt"], [role="button"]',
+            ):
+                return True
+        lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
+        if lines and len(lines) <= 2:
+            if any(re.match(r"^\d{1,2}:[0-5]\d(\s*[×xX])?$", ln) for ln in lines):
+                if bubble_for_scan.find_elements(
+                    _By.CSS_SELECTOR, 'canvas, [role="button"], svg'
+                ):
+                    return True
+    except Exception:
+        pass
+
+    return False
 
 
 def is_rfq_quote_caption(message_text: str) -> bool:
@@ -494,8 +565,12 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
         return info
 
     if info.has_voice and info.has_image:
-        info.has_voice = False
-        info.raw_indicators.append("image:overrides-false-voice")
+        if bubble_looks_like_voice_note(bubble_for_scan):
+            info.has_image = False
+            info.raw_indicators.append("voice:overrides-avatar-blob")
+        else:
+            info.has_voice = False
+            info.raw_indicators.append("image:overrides-false-voice")
 
     if info.has_voice:
         info.media_type = "voice"

@@ -47,6 +47,7 @@ from openclaw_main import (
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     apply_rfq_routing_overrides,
+    bubble_looks_like_voice_note,
     build_classification_monitor_message,
     classify_whatsapp_message,
     classification_from_copilot_analysis,
@@ -71,7 +72,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.51-EQUIVALENT-TECH-SUPPORT"
+VERSION = "v3.52-VOICE-NOTE-DETECTION"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -1863,13 +1864,14 @@ function hasVoice(container) {
     if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
         return false;
     }
-    if (hasRealImage(container)) {
-        return false;
-    }
     if (hasVoiceDurationLine(container) && !!container.querySelector(
-        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"]'
+        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"], '
+        + '[data-icon="audio-play"], [data-icon="ptt"], [role="button"], svg'
     )) {
         return true;
+    }
+    if (hasRealImage(container)) {
+        return false;
     }
     return false;
 }
@@ -2030,13 +2032,14 @@ function hasVoice(container) {
     if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
         return false;
     }
-    if (hasRealImage(container)) {
-        return false;
-    }
     if (hasVoiceDurationLine(container) && !!container.querySelector(
-        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"]'
+        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"], '
+        + '[data-icon="audio-play"], [data-icon="ptt"], [role="button"], svg'
     )) {
         return true;
+    }
+    if (hasRealImage(container)) {
+        return false;
     }
     return false;
 }
@@ -2303,11 +2306,17 @@ def scrape_incoming_units_js(driver, lookback=6):
             continue
 
         if container is not None:
-            py_kind, py_text = classify_incoming_unit(container)
-            if py_kind != "empty":
-                kind = py_kind
+            if item.get("hasVoice") or bubble_looks_like_voice_note(container):
+                kind = "voice"
+                _py_kind, py_text = classify_incoming_unit(container)
                 if py_text:
                     text = normalize_unit_text(py_text)
+            else:
+                py_kind, py_text = classify_incoming_unit(container)
+                if py_kind != "empty":
+                    kind = py_kind
+                    if py_text:
+                        text = normalize_unit_text(py_text)
         elif item.get("hasDocument"):
             kind = "document"
         elif item.get("hasVoice"):
@@ -2790,6 +2799,8 @@ def find_image_container_js(driver, lookback=8):
 def container_has_real_image(container):
     if container is None:
         return False
+    if bubble_looks_like_voice_note(container):
+        return False
     if bubble_contains_image(container):
         return True
     try:
@@ -2806,6 +2817,8 @@ def container_has_real_image(container):
 def container_has_voice(container):
     if container is None:
         return False
+    if bubble_looks_like_voice_note(container):
+        return True
     try:
         info = detect_bubble_media(container)
         if info.has_voice:
@@ -2825,8 +2838,6 @@ def container_has_voice(container):
         pass
     try:
         if container.find_elements(By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'):
-            return False
-        if container_has_real_image(container):
             return False
         text = (container.text or "").strip()
         if len(text) > 100:
@@ -2855,6 +2866,8 @@ def classify_incoming_unit(container):
     text = extract_text_from_message_container(container)
     if is_bot_noise_message(text):
         return "empty", ""
+    if bubble_looks_like_voice_note(container):
+        return "voice", text
     if container_has_real_image(container):
         return "image", text
     if container_has_voice(container):
@@ -3013,6 +3026,16 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         kind = unit["kind"]
         unit_text = unit.get("text") or ""
 
+        if kind == "image" and container is not None:
+            if (
+                unit.get("has_voice")
+                or bubble_looks_like_voice_note(container)
+                or container_has_voice(container)
+            ):
+                kind = "voice"
+                unit["kind"] = "voice"
+                print("   🎤 Reclassified image → voice (voice-note bubble detected)")
+
         print("")
         print("-" * 90)
         print(f"📨 Step {step}/{len(plan)}: {kind.upper()} message")
@@ -3027,19 +3050,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         except Exception:
             pass
 
-        if kind == "image":
-            has_real_image = (
-                unit.get("has_image")
-                or (container is not None and container_has_real_image(container))
-            )
-            if (
-                not has_real_image
-                and container is not None
-                and container_has_voice(container)
-            ):
-                kind = "voice"
-                unit["kind"] = "voice"
-                print("   🎤 Reclassified image → voice (PTT bubble detected)")
+        image_path_this_step = None
         if kind == "image":
             if container is None:
                 print("   ❌ Image step: container element missing — cannot capture photo.")
@@ -3055,15 +3066,20 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 latest_message = caption
             media_info = detect_bubble_media(container, caption_text=caption)
             message_data_id = str(unit.get("data_id") or "").strip()
-            image_path = capture_bubble_image(
+            image_path_this_step = capture_bubble_image(
                 driver, container, contact_name, message_data_id=message_data_id
             )
-            if image_path:
+            if image_path_this_step:
+                image_path = image_path_this_step
                 print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
+            elif bubble_looks_like_voice_note(container) or unit.get("has_voice"):
+                kind = "voice"
+                unit["kind"] = "voice"
+                print("   🎤 Image capture failed on voice-shaped bubble — switching to voice download")
             else:
                 print("   ⚠️ Image step: message-bubble screenshot capture failed.")
 
-        elif kind == "voice":
+        if kind == "voice":
             processed_voice = True
             if container is None:
                 print("   ❌ Voice step: container missing before relocation.")
