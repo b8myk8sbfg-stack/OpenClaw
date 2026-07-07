@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.34-COPILOT-SINGLE-PASS"
+VERSION = "v1.35-COPILOT-SINGLE-PASS"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -106,37 +106,43 @@ def _normalize_copilot_intent(intent: str) -> str:
 
 OPENCLAW_UNIFIED_PROMPT = """NEW INQUIRY
 
-Analyze ONLY this attached message and/or image. Do not use prior conversations or catalog memory.
+Analyze ONLY this attached message and/or image. Do not use prior conversations, warehouse catalogs, or brand memory.
 
-You are the vision expert. Look at the image yourself and decide what the customer is asking about.
+You are the vision expert. Read the image literally — transcribe printed text; never guess a familiar catalog part number.
 
 Tasks:
 1. Classify intent: rfq_inquiry | technical_support | purchase_order | junk_ad | greeting | general_chat | unknown
-2. Identify the product the customer wants quoted or discussed.
-3. Transcribe the exact model/part code on that product's label, character by character. Never substitute a different catalog number.
-4. Describe what is in the foreground vs background. Quote the foreground subject, not background equipment.
+2. Identify the foreground product the customer is holding or pointing at (closest to camera / in hand).
+3. Describe its physical shape first (cylinder, rectangle, relay block, sensor housing, etc.).
+4. Transcribe ONLY characters printed on that foreground label — letter by letter, digit by digit.
 5. Extract quantity from caption or image (default 1).
 6. Summarize technical details for the identified product.
 
+Critical anti-hallucination rules:
+- items[].part_no MUST be copied exactly from visual_analysis.label_transcription. If they differ, fix part_no before returning JSON.
+- NEVER substitute a well-known catalog number (e.g. Omron E3Z-D61, E2E-X5, H3JA-8A) unless those exact characters are printed on the foreground label.
+- Background control panels, terminal blocks, relays, and sensors are NOT the inquiry — ignore their labels even if larger or clearer.
+- If the foreground object is a cylindrical cell with "Lithium" text, it is a battery (e.g. ER6C, CR123, BR-2/3A) — not a photoelectric sensor or timer relay.
+- If any character is unreadable, use "?" for that character in label_transcription. Do NOT invent missing characters.
+- product_type must match the physical object (battery, sensor, relay, valve, etc.) — not a guess from background equipment.
+
 Image guidance:
-- Photo + short caption (e.g. "quote me 1 pc") usually shows ONE product — the item held in hand or closest to the camera.
-- The customer's inquiry is almost always the foreground object they are showing you, NOT equipment mounted behind it.
-- If someone holds a small labelled item in front of a control panel, quote the held item's label only.
-- Ignore background wiring, terminal blocks, timers, and panel nameplates unless the customer is clearly quoting those.
+- Photo + short caption (e.g. "quote me 1 pc") = ONE product: the item held in hand or closest to the camera.
+- If someone holds a small labelled item in front of a control panel, quote ONLY the held item's label.
 - RFQ/enquiry tables: read only rows visible in the image; count rows; do not invent extra line items.
 - Equivalent/replacement requests: intent=technical_support unless they also ask for price/quote.
 
-In reasoning, state which label you quoted and which background labels you ignored.
+In reasoning, state: (1) foreground shape, (2) exact label transcription, (3) background labels you ignored.
 
 Return plain-text analysis first. Include:
-- What product is in the foreground (what the customer is quoting)
+- Foreground physical shape and product type
 - Exact label transcription (character by character)
-- What background items you are ignoring
+- Background items you are ignoring
 
 On the very last line only, append one JSON object (no markdown fences):
 {"intent":"rfq_inquiry","confidence":0.9,"visual_analysis":{"foreground_subject":"...","label_transcription":"...","background_ignored":"..."},"items":[{"part_no":"EXACT-CODE","qty":1,"brand":"BRAND","product_type":"TYPE"}],"technical_summary":"...","is_industrial_automation":true,"compatible_brands":[],"reasoning":"..."}
 
-items: one entry per distinct part the customer is inquiring about. part_no must match the label transcription.
+items: one entry per distinct part the customer is inquiring about. part_no must equal label_transcription (same characters, ignoring spaces).
 """
 
 def _parse_caption_qty(text: str, default: int = 1) -> int:
@@ -371,6 +377,43 @@ def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_t
     return items_out
 
 
+def _normalize_label_code(text: str) -> str:
+    return re.sub(r"[\s_]+", "", str(text or "").strip().upper())
+
+
+def _primary_code_from_transcription(transcription: str) -> str:
+    """Extract the main model code from Copilot's own label_transcription field."""
+    text = str(transcription or "").strip().upper()
+    if not text:
+        return ""
+    head = re.split(r"[\(\[,;]", text, maxsplit=1)[0].strip()
+    tokens = re.findall(r"[A-Z0-9][A-Z0-9\-/]{2,}", head)
+    if tokens:
+        return tokens[0]
+    return head.replace(" ", "-")[:40]
+
+
+def _align_items_with_label_transcription(parsed: dict, items_out: list) -> list:
+    """Enforce Copilot JSON contract: items.part_no must match label_transcription."""
+    visual = parsed.get("visual_analysis") or {}
+    if not isinstance(visual, dict) or not items_out:
+        return items_out
+    trans = str(visual.get("label_transcription") or "").strip()
+    code = _primary_code_from_transcription(trans)
+    if not code:
+        return items_out
+    code_norm = _normalize_label_code(code)
+    for item in items_out:
+        part_norm = _normalize_label_code(item.get("part_no", ""))
+        if part_norm and code_norm and part_norm != code_norm:
+            print(
+                f"[COPILOT ANALYZE] part_no '{item.get('part_no')}' "
+                f"≠ label_transcription '{code}' — using transcription"
+            )
+            item["part_no"] = code
+    return items_out
+
+
 def analyze_incoming_inquiry_with_copilot(
     message_text: str = "",
     image_path: str = None,
@@ -391,11 +434,15 @@ def analyze_incoming_inquiry_with_copilot(
     print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
     if image_path:
         if os.path.exists(image_path):
-            from whatsapp_attachment_processor import validate_image_file
+            from whatsapp_attachment_processor import validate_image_file, read_image_dimensions
 
             img_ok, img_reason = validate_image_file(image_path)
+            img_size = os.path.getsize(image_path)
+            dims = read_image_dimensions(image_path)
+            dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
             print(
-                f"[COPILOT ANALYZE] Image file size: {os.path.getsize(image_path)} bytes "
+                f"[COPILOT ANALYZE] Image file size: {img_size} bytes, "
+                f"dimensions: {dim_label} "
                 f"({'valid' if img_ok else 'INVALID: ' + img_reason})"
             )
             if not img_ok:
@@ -438,7 +485,7 @@ def analyze_incoming_inquiry_with_copilot(
     user_text = "\n\n".join(prompt_parts)
     user_content = _copilot_user_content_with_image(user_text, image_path)
     if image_path and os.path.exists(image_path):
-        print(f"[COPILOT ANALYZE] Fresh chat — bubble screenshot only: {image_path}")
+        print(f"[COPILOT ANALYZE] Fresh chat — attached image: {image_path}")
 
     raw = ""
     try:
@@ -490,6 +537,7 @@ def analyze_incoming_inquiry_with_copilot(
         items_out = _parse_copilot_items_from_dict(
             parsed, message_text=message_text, voice_transcript=voice_transcript
         )
+        items_out = _align_items_with_label_transcription(parsed, items_out)
 
         visual = parsed.get("visual_analysis") or {}
         if isinstance(visual, dict):

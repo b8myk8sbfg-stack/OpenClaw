@@ -69,6 +69,7 @@ from whatsapp_attachment_processor import (
     save_wa_image_manifest,
     save_validated_image_bytes,
     validate_image_file,
+    read_image_dimensions,
     MIN_WA_IMAGE_DISPLAY_PX,
     MIN_WA_IMAGE_NATURAL_PX,
     BLOB_TO_BASE64_JS,
@@ -3650,6 +3651,7 @@ def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
     """Wait until viewer shows a real image (not 72x32 placeholder)."""
     end = time.time() + timeout
     best_info = None
+    best_natural = 0
     while time.time() < end:
         info = _viewer_image_info(driver)
         if info:
@@ -3657,10 +3659,14 @@ def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
             nh = int(info.get("naturalH") or 0)
             dw = int(info.get("displayW") or 0)
             dh = int(info.get("displayH") or 0)
-            best_info = info
+            natural_area = nw * nh
+            if natural_area > best_natural:
+                best_info = info
+                best_natural = natural_area
             if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
                 return info
-            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+            # Display size alone is not enough — WhatsApp upscales tiny placeholders in the viewer.
+            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150 and nw >= 120 and nh >= 120:
                 return info
         time.sleep(0.75)
     return best_info
@@ -3676,9 +3682,11 @@ def _save_downloaded_image(downloaded: str, dest_path: str) -> Optional[str]:
         return None
     saved = save_validated_image_bytes(data, dest_path)
     if saved:
+        dims = read_image_dimensions(saved)
+        dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
         print(
             f"🖼️ Saved full-resolution image → {saved} "
-            f"({os.path.getsize(saved)} bytes)"
+            f"({os.path.getsize(saved)} bytes, {dim_label})"
         )
     return saved
 
@@ -3787,6 +3795,25 @@ def download_full_resolution_image(driver, bubble, image_path):
             "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0};",
             main_img,
         ) or {}
+        nw = int(natural.get("w") or 0)
+        nh = int(natural.get("h") or 0)
+        if nw < MIN_WA_IMAGE_NATURAL_PX or nh < 80:
+            print(
+                f"🖼️ Viewer still loading — natural {nw}x{nh}, waiting for full resolution..."
+            )
+            extra_end = time.time() + 12.0
+            while time.time() < extra_end:
+                time.sleep(1.0)
+                natural = driver.execute_script(
+                    "return {w: arguments[0].naturalWidth||0, h: arguments[0].naturalHeight||0,"
+                    "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0};",
+                    main_img,
+                ) or {}
+                nw = int(natural.get("w") or 0)
+                nh = int(natural.get("h") or 0)
+                if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+                    break
+
         print(
             f"🖼️ Viewer image — display {natural.get('dw', 0)}x{natural.get('dh', 0)}, "
             f"natural {natural.get('w', 0)}x{natural.get('h', 0)}"
@@ -3813,7 +3840,7 @@ def download_full_resolution_image(driver, bubble, image_path):
             except Exception:
                 continue
 
-        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX:
+        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX and nw >= 80 and nh >= 80:
             saved = _save_viewer_panel_screenshot(driver, image_path)
             if saved:
                 return saved

@@ -1730,6 +1730,56 @@ def detect_image_format(data: bytes) -> Tuple[Optional[str], str]:
     return None, ""
 
 
+def read_image_dimensions(path: str) -> Optional[Tuple[int, int]]:
+    """Return (width, height) from PNG/JPEG/WebP header without Pillow."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(256 * 1024)
+    except OSError:
+        return None
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        if w > 0 and h > 0:
+            return w, h
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h = int.from_bytes(data[idx + 5:idx + 7], "big")
+                w = int.from_bytes(data[idx + 7:idx + 9], "big")
+                if w > 0 and h > 0:
+                    return w, h
+                break
+            if marker in (0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0x01):
+                idx += 4
+                continue
+            if idx + 3 >= len(data):
+                break
+            seg_len = int.from_bytes(data[idx + 2:idx + 4], "big")
+            idx += 2 + max(seg_len, 2)
+    if len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8 " and len(data) >= 30:
+            w = int.from_bytes(data[26:28], "little") & 0x3FFF
+            h = int.from_bytes(data[28:30], "little") & 0x3FFF
+            if w > 0 and h > 0:
+                return w, h
+        if chunk == b"VP8L" and len(data) >= 25:
+            bits = int.from_bytes(data[21:25], "little")
+            w = (bits & 0x3FFF) + 1
+            h = ((bits >> 14) & 0x3FFF) + 1
+            if w > 0 and h > 0:
+                return w, h
+    return None
+
+
 def validate_image_file(path: str, min_bytes: int = None) -> Tuple[bool, str]:
     """Reject corrupt placeholders / tiny thumbnails before Copilot vision."""
     min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
