@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.10-OBM-API-EX-STOCK"
+VERSION = "v1.11-COPILOT-FIRST-ANALYZE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -107,6 +107,199 @@ def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool
         return False
 
     return True
+
+
+COPILOT_ANALYZE_INTENTS = {
+    "rfq_inquiry",
+    "technical_support",
+    "purchase_order",
+    "delivery_tracking",
+    "payment_invoice",
+    "supplier_reply",
+    "order_confirmation",
+    "complaint",
+    "greeting",
+    "general_chat",
+    "junk_ad",
+    "unknown",
+}
+
+
+def _normalize_copilot_intent(intent: str) -> str:
+    intent_u = str(intent or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "request_for_quotation": "rfq_inquiry",
+        "quotation": "rfq_inquiry",
+        "rfq": "rfq_inquiry",
+        "quote": "rfq_inquiry",
+        "technical_support": "technical_support",
+        "equivalent": "technical_support",
+        "replacement": "technical_support",
+        "purchase_order": "purchase_order",
+        "po": "purchase_order",
+        "junk": "junk_ad",
+        "spam": "junk_ad",
+        "advertisement": "junk_ad",
+    }
+    if intent_u in aliases:
+        return aliases[intent_u]
+    if intent_u in COPILOT_ANALYZE_INTENTS:
+        return intent_u
+    return "unknown"
+
+
+def analyze_incoming_inquiry_with_copilot(
+    message_text: str = "",
+    image_path: str = None,
+    document_text: str = None,
+    voice_transcript: str = None,
+) -> dict:
+    """Copilot-first unified analysis: classify intent + extract parts from text/image/voice/doc together."""
+    if os.getenv("OPENCLAW_COPILOT_FIRST", "1").strip().lower() in ("0", "false", "no", "off"):
+        return {}
+
+    message_text = str(message_text or "").strip()
+    document_text = str(document_text or "").strip()
+    voice_transcript = str(voice_transcript or "").strip()
+
+    if not any([message_text, image_path, document_text, voice_transcript]):
+        return {}
+
+    print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
+
+    client = OpenAI(
+        base_url=COPILOT_BASE_URL,
+        api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
+        timeout=90.0 if image_path else 60.0,
+        max_retries=1,
+    )
+
+    system_instruction = (
+        "You analyze incoming WhatsApp messages for Robomatics, an industrial automation distributor "
+        "in Malaysia (brands: OMRON, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, "
+        "Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, and more).\n\n"
+        "Read ALL provided inputs together — customer text, photo label, document text, and voice "
+        "transcript. Treat this as a brand-new message; do not reuse parts from other conversations.\n\n"
+        "Classify the message intent as one of:\n"
+        "- rfq_inquiry: customer asks price/availability/quote (e.g. 'quote me 1 pc')\n"
+        "- technical_support: equivalent/replacement, specs, wiring, fault, how-to\n"
+        "- purchase_order: formal PO/PR document or order placement\n"
+        "- delivery_tracking, payment_invoice, complaint, greeting, junk_ad, general_chat, unknown\n\n"
+        "Extract every distinct part visible on a label/photo or stated in text.\n"
+        "Read model codes character-by-character from the label in the photo.\n"
+        "NEVER default to OMRON E2E-X5E1 unless those exact characters are printed on the label.\n"
+        "Examples: ER6C 3.6V = lithium battery (NOT E2E); H3JA-8A = timer (NOT E2E); E2E-X5E1 = proximity sensor only if label says E2E.\n"
+        "Use customer text for quantity ('quote 1 pce' → qty 1). Default qty 1 if not stated.\n\n"
+        "Return STRICTLY one raw JSON object with keys:\n"
+        "intent, confidence, reasoning, items, technical_summary, is_industrial_automation, compatible_brands\n"
+        "items = array of {part_no, qty, brand, product_type}\n"
+        "technical_summary = concise specs suitable for a sales reply (plain text, no markdown links)\n"
+        "compatible_brands = array of automation brands this item is commonly used with\n"
+        "No markdown fences, no extra keys."
+    )
+
+    parts = []
+    if voice_transcript:
+        parts.append(f"Voice transcript:\n{voice_transcript}")
+    if message_text:
+        parts.append(f"Customer WhatsApp text/caption:\n{message_text}")
+    if document_text:
+        parts.append(f"Attached document text:\n{document_text[:4000]}")
+    if not parts:
+        parts.append("Customer WhatsApp text/caption:\n(see attached photo only)")
+
+    user_text = (
+        "Analyze this incoming customer message. Read the photo AND text together.\n\n"
+        + "\n\n".join(parts)
+    )
+
+    user_content = user_text
+    if image_path and os.path.exists(image_path):
+        print(f"[COPILOT ANALYZE] Attaching image: {image_path}")
+        with open(image_path, "rb") as image_file:
+            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+        user_content = [
+            {"type": "text", "text": user_text},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{image_b64}",
+                    "detail": "high",
+                },
+            },
+        ]
+
+    try:
+        response = client.chat.completions.create(
+            model=COPILOT_MODEL,
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT ANALYZE RAW] {raw[:500]}")
+        if raw.startswith("```"):
+            raw = "\n".join(raw.splitlines()[1:-1]).strip()
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {}
+
+        intent = _normalize_copilot_intent(parsed.get("intent"))
+        confidence = float(parsed.get("confidence") or 0.75)
+        reasoning = str(parsed.get("reasoning") or "").strip()
+        technical_summary = _sanitize_whatsapp_reply(str(parsed.get("technical_summary") or "").strip())
+        is_ia = bool(parsed.get("is_industrial_automation", True))
+        compatible_brands = parsed.get("compatible_brands") or []
+
+        from openclaw_inquiry_engine import parse_qty_from_caption
+
+        caption_qty = parse_qty_from_caption(message_text or voice_transcript, default=1)
+        items_out = []
+        for item in parsed.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            part_no = str(item.get("part_no") or "").strip().upper()
+            if not part_no:
+                continue
+            try:
+                qty = int(item.get("qty") or caption_qty or 1)
+            except (TypeError, ValueError):
+                qty = caption_qty
+            qty = max(1, qty)
+            brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+            product_type = str(item.get("product_type") or "").strip()
+            if image_path and product_type and not _visual_part_consistent(part_no, brand, product_type):
+                print(f"[COPILOT ANALYZE] Rejected inconsistent item {part_no!r} ({product_type})")
+                continue
+            item_out = {"part_no": part_no, "qty": qty, "brand": brand, "source": "COPILOT_UNIFIED"}
+            if product_type:
+                item_out["product_type"] = product_type
+            items_out.append(item_out)
+
+        if image_path:
+            items_out = _filter_conflicting_visual_items(items_out)
+
+        result = {
+            "intent": intent,
+            "confidence": max(0.0, min(confidence, 1.0)),
+            "reasoning": reasoning,
+            "items": items_out,
+            "technical_summary": technical_summary,
+            "is_industrial_automation": is_ia,
+            "compatible_brands": compatible_brands,
+        }
+        print(
+            f"[COPILOT ANALYZE] intent={intent} ({confidence:.0%}) | "
+            f"items={len(items_out)} | {reasoning[:80]}"
+        )
+        return result
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"[WARN] Copilot analyze returned invalid JSON: {exc}")
+    except Exception as exc:
+        print(f"[WARN] Copilot unified analyze failed: {exc}")
+    return {}
 
 
 def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -> list:
@@ -755,9 +948,17 @@ def build_technical_support_reply(
     if not message_text and not image_path:
         return ""
 
-    # Always re-read the photo for tech support — never trust stale RFQ extraction.
-    fresh_items = None if image_path else copilot_items
-    visual_items = _resolve_visual_items(message_text, image_path=image_path, copilot_items=fresh_items)
+    # Always re-read the photo for tech support — unless unified Copilot analyze already ran.
+    unified_items = [
+        item for item in (copilot_items or [])
+        if str(item.get("source") or "") == "COPILOT_UNIFIED"
+    ]
+    if unified_items:
+        visual_items = _filter_conflicting_visual_items(unified_items)
+        print("[COPILOT TECH SUPPORT] Using unified Copilot analyze items (image + caption together)")
+    else:
+        fresh_items = None if image_path else copilot_items
+        visual_items = _resolve_visual_items(message_text, image_path=image_path, copilot_items=fresh_items)
     timer_items = [item for item in visual_items if _is_timer_visual_item(item)]
 
     if timer_items:

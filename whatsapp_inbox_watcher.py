@@ -26,15 +26,17 @@ from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
 from openclaw_main import (
-    extract_rfq_with_copilot,
+    analyze_incoming_inquiry_with_copilot,
     build_ai_research_summary,
     build_technical_support_reply,
+    extract_rfq_with_copilot,
     _resolve_visual_items,
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     build_classification_monitor_message,
     classify_whatsapp_message,
+    classification_from_copilot_analysis,
     detect_bubble_media,
     is_equivalent_support_request,
     log_classification,
@@ -3019,12 +3021,10 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             image_path = capture_bubble_image(
                 driver, container, contact_name, message_data_id=message_data_id
             )
-            items = _resolve_visual_items(caption, image_path=image_path, copilot_items=None)
-            if items:
-                copilot_items = items
-                print(f"   👁️ Image step: Copilot extracted {len(items)} item(s)")
-            elif image_path:
-                print("   ⚠️ Image step: photo captured but Copilot found no parts yet.")
+            if image_path:
+                print("   🖼️ Image captured — unified Copilot analyze at end of plan")
+            else:
+                print("   ⚠️ Image step: photo capture failed.")
 
         elif kind == "voice":
             processed_voice = True
@@ -3077,14 +3077,6 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             )
             if not voice_ok:
                 print("   ⚠️ Voice step: download/transcribe failed — will retry next cycle.")
-            inquiry_for_extract = transcript or latest_message
-            if not copilot_items and inquiry_for_extract:
-                items = extract_rfq_with_copilot(inquiry_for_extract, image_path=None)
-                if items:
-                    copilot_items = items
-                    print(f"   🎤 Voice step: Copilot extracted {len(items)} item(s) from transcript")
-                else:
-                    print("   🎤 Voice step: running inquiry engine on transcript text...")
 
         elif kind == "document":
             media_info = detect_bubble_media(container, caption_text=unit_text or latest_message)
@@ -3104,22 +3096,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 continue
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
-            if not copilot_items and not document_items and not (
-                is_quote_without_part_number(unit_text) or is_support_without_part_number(unit_text)
-            ):
-                items = extract_rfq_with_copilot(unit_text, image_path=None)
-                if items:
-                    copilot_items = items
-                    print(f"   📝 Text step: Copilot extracted {len(items)} item(s)")
-            elif (
-                is_quote_without_part_number(unit_text) or is_support_without_part_number(unit_text)
-            ) and not image_path:
-                print(
-                    "   📝 Text step: caption without part number — "
-                    "waiting for paired image step (no text-only guess)."
-                )
-            else:
-                print("   📝 Text step: caption/qty merged with prior image/document extraction.")
+            print("   📝 Text step: caption saved — unified Copilot analyze at end of plan")
 
         else:
             print(f"   ⚠️ Skipping empty/unknown message unit at step {step}.")
@@ -3153,9 +3130,29 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         media_info.media_type = "voice"
         media_info.has_voice = True
 
+    copilot_analysis = analyze_incoming_inquiry_with_copilot(
+        message_text=latest_message,
+        image_path=image_path,
+        document_text=enrichment.get("document_text") or "",
+        voice_transcript=enrichment.get("transcript") or "",
+    )
+    if copilot_analysis:
+        if copilot_analysis.get("items"):
+            copilot_items = copilot_analysis["items"]
+            print(f"   🧠 Unified Copilot analyze: {len(copilot_items)} item(s)")
+        if image_path and copilot_items:
+            image_analysis = {
+                "items": copilot_items,
+                "inquiry_text": latest_message,
+                "notes": "Unified Copilot analyze (image + caption together).",
+                "source": "copilot_unified",
+                "image_path": image_path,
+            }
+
     return {
         "latest_message": latest_message,
         "copilot_items": copilot_items,
+        "copilot_analysis": copilot_analysis,
         "document_items": document_items,
         "image_path": image_path,
         "image_analysis": image_analysis,
@@ -3880,7 +3877,7 @@ def process_supplier_reply(driver, contact_name, latest_message):
 def process_customer_inquiry(
     driver, contact_name, latest_message, image_analysis=None, customer_contact=None,
     classification=None, document_items=None, pre_extracted_copilot_items=None,
-    voice_enrichment=None, image_path=None,
+    voice_enrichment=None, image_path=None, copilot_technical_summary=None,
 ):
     customer_contact = customer_contact or contact_name
     classification_summary = classification.summary() if classification else None
@@ -4056,7 +4053,7 @@ def process_customer_inquiry(
 
     customer_reply = build_plain_quotation_reply(
         formatted_rows,
-        ai_research=build_ai_research_summary(formatted_rows),
+        ai_research=(copilot_technical_summary or build_ai_research_summary(formatted_rows)),
     )
     sent = send_customer_reply(
         driver,
@@ -4154,7 +4151,7 @@ def process_classified_non_inquiry(
         copilot_reply = build_technical_support_reply(
             latest_message,
             image_path=image_path,
-            copilot_items=None,
+            copilot_items=copilot_items or None,
         )
         if copilot_reply:
             reply = copilot_reply
@@ -4245,6 +4242,7 @@ def _process_open_chat_body(driver, raw_contact_name):
         media_info = payload["media_info"]
         document_items = payload["document_items"]
         copilot_items = payload["copilot_items"]
+        copilot_analysis = payload.get("copilot_analysis") or {}
         enrichment = payload.get("enrichment") or {}
 
         if media_info.media_type == "voice" and not voice_ok and not enrichment.get("transcript"):
@@ -4310,62 +4308,69 @@ def _process_open_chat_body(driver, raw_contact_name):
         print(repr(inquiry_text))
         print("=" * 90)
 
-        classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
-        if is_equivalent_support_request(inquiry_text):
-            classification.intent = "technical_support"
-            classification.handler = "technical_support"
-            classification.confidence = max(classification.confidence, 0.93)
-            classification.reasoning = (
-                "Equivalent/replacement request — technical support, not RFQ quotation."
-            )
-            print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
+        if copilot_analysis:
+            classification = classification_from_copilot_analysis(copilot_analysis, media_info=media_info)
+            if copilot_analysis.get("items"):
+                copilot_items = copilot_analysis["items"]
+            print(f"🧠 Using Copilot-first classification: {classification.intent} ({classification.confidence:.0%})")
+        else:
+            classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
+            if is_equivalent_support_request(inquiry_text):
+                classification.intent = "technical_support"
+                classification.handler = "technical_support"
+                classification.confidence = max(classification.confidence, 0.93)
+                classification.reasoning = (
+                    "Equivalent/replacement request — technical support, not RFQ quotation."
+                )
+                print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
         if media_info.media_type == "voice":
             classification.media_type = "voice"
             if classification.media_info is not None:
                 classification.media_info.media_type = "voice"
                 classification.media_info.has_voice = True
                 classification.media_info.has_image = False
-        if (
-            classification.intent in ("unknown", "greeting", "general_chat")
-            and (document_items or enrichment.get("document_text") or media_info.media_type == "pdf")
-        ):
-            classification.intent = "purchase_order"
-            classification.confidence = max(classification.confidence, 0.9)
-            classification.handler = "purchase_order"
-            classification.reasoning = "PDF/PO document content detected after attachment extraction."
-            classification.suggested_reply = (
-                "Hi, thank you for sending your purchase order.\n\n"
-                "Our team is reviewing the document and will confirm shortly."
-            )
-        if copilot_items and classification.intent in ("unknown", "general_chat"):
-            if not is_equivalent_support_request(inquiry_text):
+        if not copilot_analysis:
+            if (
+                classification.intent in ("unknown", "greeting", "general_chat")
+                and (document_items or enrichment.get("document_text") or media_info.media_type == "pdf")
+            ):
+                classification.intent = "purchase_order"
+                classification.confidence = max(classification.confidence, 0.9)
+                classification.handler = "purchase_order"
+                classification.reasoning = "PDF/PO document content detected after attachment extraction."
+                classification.suggested_reply = (
+                    "Hi, thank you for sending your purchase order.\n\n"
+                    "Our team is reviewing the document and will confirm shortly."
+                )
+            if copilot_items and classification.intent in ("unknown", "general_chat"):
+                if not is_equivalent_support_request(inquiry_text):
+                    classification.intent = "rfq_inquiry"
+                    classification.handler = "rfq_inquiry"
+                    classification.confidence = max(classification.confidence, 0.85)
+                    if enrichment.get("transcript"):
+                        classification.reasoning = "Parts extracted from voice transcript."
+                    elif image_path:
+                        classification.reasoning = "Parts extracted from customer photo."
+                    else:
+                        classification.reasoning = "Parts extracted from customer message."
+            if enrichment.get("transcript") and classification.handler in (
+                "monitor_only", "voice_note", "unknown", "general_chat"
+            ):
+                if not is_equivalent_support_request(inquiry_text):
+                    classification.intent = "rfq_inquiry"
+                    classification.handler = "rfq_inquiry"
+                    classification.confidence = max(classification.confidence, 0.85)
+                    classification.reasoning = "Voice note transcribed — processing as inquiry."
+            if (
+                (image_path or getattr(media_info, "has_image", False))
+                and classification.intent in ("unknown", "general_chat", "greeting")
+                and getattr(media_info, "media_type", "") != "voice"
+                and not is_equivalent_support_request(inquiry_text)
+            ):
                 classification.intent = "rfq_inquiry"
                 classification.handler = "rfq_inquiry"
                 classification.confidence = max(classification.confidence, 0.85)
-                if enrichment.get("transcript"):
-                    classification.reasoning = "Parts extracted from voice transcript."
-                elif image_path:
-                    classification.reasoning = "Parts extracted from customer photo."
-                else:
-                    classification.reasoning = "Parts extracted from customer message."
-        if enrichment.get("transcript") and classification.handler in (
-            "monitor_only", "voice_note", "unknown", "general_chat"
-        ):
-            if not is_equivalent_support_request(inquiry_text):
-                classification.intent = "rfq_inquiry"
-                classification.handler = "rfq_inquiry"
-                classification.confidence = max(classification.confidence, 0.85)
-                classification.reasoning = "Voice note transcribed — processing as inquiry."
-        if (
-            (image_path or getattr(media_info, "has_image", False))
-            and classification.intent in ("unknown", "general_chat", "greeting")
-            and getattr(media_info, "media_type", "") != "voice"
-            and not is_equivalent_support_request(inquiry_text)
-        ):
-            classification.intent = "rfq_inquiry"
-            classification.handler = "rfq_inquiry"
-            classification.confidence = max(classification.confidence, 0.85)
-            classification.reasoning = "Customer photo inquiry detected."
+                classification.reasoning = "Customer photo inquiry detected."
         log_classification(contact_name, customer_contact, inquiry_text, classification)
 
         if re.search(r"WA-\d{8}-[A-Z0-9]+-[A-Z0-9]+", inquiry_text, re.I):
@@ -4408,6 +4413,7 @@ def _process_open_chat_body(driver, raw_contact_name):
                 pre_extracted_copilot_items=copilot_items or None,
                 voice_enrichment=enrichment,
                 image_path=image_path,
+                copilot_technical_summary=copilot_analysis.get("technical_summary") or "",
             )
             return
 

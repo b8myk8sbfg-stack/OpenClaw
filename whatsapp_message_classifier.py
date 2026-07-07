@@ -631,6 +631,26 @@ def _default_reply(intent: str, media_type: str) -> str:
     return ""
 
 
+def classification_from_copilot_analysis(analysis: dict, media_info: Optional[MediaInfo] = None) -> ClassificationResult:
+    """Build ClassificationResult from unified Copilot analyze_incoming_inquiry output."""
+    media_info = media_info or MediaInfo(media_type="text")
+    intent = str(analysis.get("intent") or "unknown").strip().lower()
+    if intent not in INTENT_TYPES:
+        intent = "unknown"
+    confidence = float(analysis.get("confidence") or 0.75)
+    reasoning = str(analysis.get("reasoning") or "Copilot unified message analysis.").strip()
+    return ClassificationResult(
+        media_type=media_info.media_type,
+        intent=intent,
+        confidence=max(0.0, min(confidence, 1.0)),
+        reasoning=reasoning,
+        media_filename=media_info.filename,
+        handler=_handler_for_intent(intent),
+        suggested_reply=_default_reply(intent, media_info.media_type),
+        media_info=media_info,
+    )
+
+
 def _classify_with_copilot(message_text: str, media_info: MediaInfo) -> Optional[ClassificationResult]:
     if not str(message_text or "").strip() and media_info.media_type in ("text", "unknown"):
         return None
