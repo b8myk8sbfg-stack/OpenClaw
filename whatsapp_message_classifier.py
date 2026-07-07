@@ -34,7 +34,279 @@ LEGACY_LEARNING = os.path.join(BASE_DIR, "whatsapp_classification_learning.json"
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
 
-VERSION = "v1.02-VOICE-NOT-AVATAR"
+EQUIVALENT_SUPPORT_MARKERS = (
+    "EQUIVALENT",
+    "REPLACEMENT",
+    "SUBSTITUTE",
+    "ALTERNATIVE",
+    "SUCCESSOR",
+    "REPLACE WITH",
+    "COMPATIBLE",
+    "INTERCHANGE",
+)
+
+
+def is_equivalent_support_request(message_text: str) -> bool:
+    """True when customer wants an equivalent/replacement, not a price quote."""
+    text_u = str(message_text or "").upper()
+    if not any(marker in text_u for marker in EQUIVALENT_SUPPORT_MARKERS):
+        return False
+    if re.search(r"\b(QUOTE|QUOTATION|PRICE|HOW MUCH|UNIT PRICE|COST|RFQ)\b", text_u):
+        return False
+    return True
+
+VERSION = "v1.08-VOICE-BEFORE-AVATAR-BLOB"
+
+VOICE_NOTE_SELECTORS = (
+    '[data-testid="audio-play"]',
+    '[data-testid="ptt-play-button"]',
+    '[data-testid="ptt"]',
+    '[data-testid="audio"]',
+    '[data-icon="ptt"]',
+    '[data-icon="audio-play"]',
+    '[data-icon="audio-download"]',
+    'audio',
+)
+
+VOICE_WAVEFORM_SELECTORS = (
+    'canvas',
+    '[data-icon="audio-play"]',
+    '[data-icon="ptt"]',
+    'span[data-icon="audio-play"]',
+    'span[data-icon="ptt"]',
+)
+
+PHOTO_ATTACHMENT_SELECTORS = (
+    '[data-testid="image-thumb"]',
+    '[data-testid="media-url-provider"]',
+    '[data-testid="media-caption"]',
+)
+
+
+def _resolve_message_bubble(bubble):
+    """Normalize to msg-container for media detection."""
+    if bubble is None:
+        return None
+    from selenium.webdriver.common.by import By as _By
+
+    bubble_for_scan = bubble
+    try:
+        testid = bubble.get_attribute("data-testid") or ""
+        if testid != "msg-container" and "message-in" not in (bubble.get_attribute("class") or ""):
+            node = bubble
+            for _ in range(10):
+                node = node.find_element(_By.XPATH, "..")
+                if (node.get_attribute("data-testid") or "") == "msg-container":
+                    bubble_for_scan = node
+                    break
+                if "message-in" in (node.get_attribute("class") or ""):
+                    bubble_for_scan = node
+                    break
+    except Exception:
+        bubble_for_scan = bubble
+    return bubble_for_scan
+
+
+def is_voice_duration_line(line: str) -> bool:
+    """True for PTT duration like 0:11 — not WhatsApp send time like 1:31 PM."""
+    text = str(line or "").strip()
+    if not text or re.search(r"\b(AM|PM)\b", text, re.I):
+        return False
+    return bool(re.match(r"^\d{1,2}:[0-5]\d(\s*[×xX])?$", text))
+
+
+def bubble_has_explicit_voice_ui(bubble) -> bool:
+    """True when bubble has PTT/play/audio controls (not just a profile avatar)."""
+    bubble_for_scan = _resolve_message_bubble(bubble)
+    if bubble_for_scan is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
+
+    try:
+        if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(VOICE_NOTE_SELECTORS)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
+        ):
+            return False
+        bubble_text = (bubble_for_scan.text or "").strip()
+        if len(bubble_text) > 100:
+            return False
+        lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
+        if any(is_voice_duration_line(ln) for ln in lines):
+            if bubble_for_scan.find_elements(
+                _By.CSS_SELECTOR, ", ".join(VOICE_WAVEFORM_SELECTORS)
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def bubble_has_photo_attachment(bubble) -> bool:
+    """True for WhatsApp photo/RFQ image bubbles — not bare voice notes."""
+    if bubble is None:
+        return False
+    if bubble_has_explicit_voice_ui(bubble):
+        return False
+
+    bubble_for_scan = _resolve_message_bubble(bubble)
+    if bubble_for_scan is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
+
+    try:
+        if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(PHOTO_ATTACHMENT_SELECTORS)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        for img in bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR,
+            'img[src*="blob"], img[src*="mmg"], img[src*="cdn.whatsapp"]',
+        ):
+            src = (img.get_attribute("src") or "").lower()
+            if any(token in src for token in ("avatar", "profile", "pps.whatsapp", "emoji")):
+                continue
+            size = img.size or {}
+            area = int(size.get("width") or 0) * int(size.get("height") or 0)
+            if area >= 2500:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def bubble_looks_like_voice_note(bubble) -> bool:
+    """True for WhatsApp voice/PTT bubbles (waveform + duration), not photo attachments."""
+    if bubble is None:
+        return False
+    if bubble_has_explicit_voice_ui(bubble):
+        return True
+    if bubble_has_photo_attachment(bubble):
+        return False
+
+    bubble_for_scan = _resolve_message_bubble(bubble)
+    if bubble_for_scan is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
+
+    try:
+        bubble_text = (bubble_for_scan.text or "").strip()
+        if len(bubble_text) > 100:
+            return False
+        lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
+        has_duration = any(is_voice_duration_line(ln) for ln in lines)
+        if has_duration and bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR, ", ".join(VOICE_WAVEFORM_SELECTORS)
+        ):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def is_rfq_quote_caption(message_text: str) -> bool:
+    """True when caption explicitly asks for a quote/price."""
+    text_u = str(message_text or "").upper()
+    return bool(
+        re.search(
+            r"\b(QUOTE|QUOTATION|RFQ|ENQ|PRICE|PLS QUOTE|KINDLY QUOTE|QUOTE ME|HOW MUCH)\b",
+            text_u,
+        )
+    )
+
+
+def apply_rfq_routing_overrides(
+    classification: "ClassificationResult",
+    message_text: str = "",
+    media_info: Optional["MediaInfo"] = None,
+    image_path: str = None,
+    copilot_items: list = None,
+    copilot_analysis: dict = None,
+    transcript: str = "",
+    document_items: list = None,
+    document_text: str = "",
+) -> "ClassificationResult":
+    """Force rfq_inquiry / purchase_order after Copilot or heuristic classification."""
+    if is_equivalent_support_request(message_text):
+        classification.intent = "technical_support"
+        classification.handler = "technical_support"
+        classification.confidence = max(classification.confidence, 0.93)
+        classification.reasoning = (
+            "Equivalent/replacement request — technical support, not RFQ quotation."
+        )
+        return classification
+
+    media_info = media_info or MediaInfo()
+    items = list(copilot_items or [])
+    if copilot_analysis and copilot_analysis.get("items"):
+        items = copilot_analysis["items"]
+
+    has_image = bool(image_path) or getattr(media_info, "has_image", False)
+    quote_caption = is_rfq_quote_caption(message_text)
+    has_document = bool(document_items) or bool(document_text) or media_info.media_type == "pdf"
+
+    if (
+        classification.intent in ("unknown", "greeting", "general_chat")
+        and has_document
+    ):
+        classification.intent = "purchase_order"
+        classification.handler = "purchase_order"
+        classification.confidence = max(classification.confidence, 0.9)
+        classification.reasoning = "Document/PO attachment detected."
+        return classification
+
+    if items and classification.intent in ("unknown", "general_chat", "greeting"):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.9)
+        classification.reasoning = "Copilot extracted parts — routing as RFQ."
+        return classification
+
+    if quote_caption and has_image and classification.handler in (
+        "monitor_only", "unknown", "general_chat", "greeting"
+    ):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.93)
+        classification.reasoning = "Quote request with product photo — RFQ inquiry."
+        return classification
+
+    if transcript and classification.handler in (
+        "monitor_only", "voice_note", "unknown", "general_chat"
+    ):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.85)
+        classification.reasoning = "Voice note transcribed — processing as inquiry."
+        return classification
+
+    if (
+        has_image
+        and classification.intent in ("unknown", "general_chat", "greeting")
+        and getattr(media_info, "media_type", "") != "voice"
+    ):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.85)
+        classification.reasoning = "Customer photo inquiry detected."
+        return classification
+
+    if quote_caption and classification.handler in ("monitor_only", "unknown", "general_chat"):
+        classification.intent = "rfq_inquiry"
+        classification.handler = "rfq_inquiry"
+        classification.confidence = max(classification.confidence, 0.88)
+        classification.reasoning = "Explicit quote request in caption."
+        return classification
+
+    return classification
 
 MEDIA_TYPES = (
     "text",
@@ -264,8 +536,16 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
     for selector in voice_selectors:
         try:
             if bubble_for_scan.find_elements(By.CSS_SELECTOR, selector):
-                if selector == "canvas" and bubble_for_scan.find_elements(By.CSS_SELECTOR, '[data-testid="video-thumb"]'):
-                    continue
+                if selector == "canvas":
+                    if bubble_for_scan.find_elements(
+                        By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
+                    ):
+                        continue
+                    if bubble_for_scan.find_elements(
+                        By.CSS_SELECTOR,
+                        '[data-testid="image-thumb"], [data-testid="media-url-provider"]',
+                    ):
+                        continue
                 info.has_voice = True
                 info.raw_indicators.append(f"voice:{selector}")
                 break
@@ -275,17 +555,19 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
     if not info.has_voice:
         try:
             bubble_text = bubble_for_scan.text or ""
-            if re.search(r"\b\d{1,2}:\d{2}\b", bubble_text):
+            lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
+            if any(is_voice_duration_line(ln) for ln in lines):
                 has_thumb = bubble_for_scan.find_elements(
                     By.CSS_SELECTOR,
-                    '[data-testid="image-thumb"], [data-testid="media-url-provider"]',
+                    '[data-testid="image-thumb"], [data-testid="media-url-provider"], '
+                    '[data-testid="media-caption"]',
                 )
                 has_video = bubble_for_scan.find_elements(
                     By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
                 )
                 has_play = bubble_for_scan.find_elements(
                     By.CSS_SELECTOR,
-                    '[role="button"], span[data-icon="audio-play"], span[data-icon="ptt"]',
+                    'span[data-icon="audio-play"], span[data-icon="ptt"], canvas',
                 )
                 if not has_thumb and not has_video and has_play:
                     info.has_voice = True
@@ -367,9 +649,21 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
         info.media_type = _guess_media_from_filename(info.filename)
         return info
 
+    if info.has_voice and info.has_image:
+        if bubble_has_explicit_voice_ui(bubble_for_scan) or bubble_looks_like_voice_note(
+            bubble_for_scan
+        ):
+            info.has_image = False
+            info.raw_indicators.append("voice:overrides-avatar-blob")
+        elif bubble_has_photo_attachment(bubble_for_scan):
+            info.has_voice = False
+            info.raw_indicators.append("image:overrides-false-voice")
+        else:
+            info.has_voice = False
+            info.raw_indicators.append("image:overrides-false-voice")
+
     if info.has_voice:
         info.media_type = "voice"
-        info.has_image = False
     elif info.has_document:
         info.media_type = _guess_media_from_filename(info.filename)
     elif info.has_video:
@@ -459,6 +753,16 @@ def _heuristic_intent(message_text: str, media_info: MediaInfo) -> Optional[Clas
         "TECHNICAL SUPPORT", "WARRANTY", "REPAIR", "ERROR CODE", "HOW TO",
         "MANUAL", "WIRING", "CONNECTION", "SPEC", "DATASHEET",
     ]
+    if is_equivalent_support_request(message_text):
+        return ClassificationResult(
+            media_type=media_info.media_type,
+            intent="technical_support",
+            confidence=0.93,
+            reasoning="Customer asking for equivalent/replacement part — technical support, not RFQ.",
+            media_filename=media_info.filename,
+            handler="technical_support",
+        )
+
     if any(marker in text for marker in support_markers):
         return ClassificationResult(
             media_type=media_info.media_type,
@@ -600,6 +904,43 @@ def _default_reply(intent: str, media_type: str) -> str:
     return ""
 
 
+def classification_from_copilot_analysis(analysis: dict, media_info: Optional[MediaInfo] = None) -> ClassificationResult:
+    """Build ClassificationResult from unified Copilot analyze_incoming_inquiry output."""
+    media_info = media_info or MediaInfo(media_type="text")
+    intent = str(analysis.get("intent") or "unknown").strip().lower()
+    if intent not in INTENT_TYPES:
+        intent = "unknown"
+    confidence = float(analysis.get("confidence") or 0.75)
+    reasoning = str(analysis.get("reasoning") or "Copilot unified message analysis.").strip()
+    return ClassificationResult(
+        media_type=media_info.media_type,
+        intent=intent,
+        confidence=max(0.0, min(confidence, 1.0)),
+        reasoning=reasoning,
+        media_filename=media_info.filename,
+        handler=_handler_for_intent(intent),
+        suggested_reply=_default_reply(intent, media_info.media_type),
+        media_info=media_info,
+    )
+
+
+def _parse_copilot_confidence(value, default: float = 0.5) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        num = float(value)
+        return max(0.0, min(num / 100.0 if num > 1.0 else num, 1.0))
+    text = str(value).strip().lower()
+    labels = {"very high": 0.95, "high": 0.9, "medium": 0.75, "med": 0.75, "low": 0.6}
+    if text in labels:
+        return labels[text]
+    try:
+        num = float(text.rstrip("%"))
+        return max(0.0, min(num / 100.0 if num > 1.0 else num, 1.0))
+    except (TypeError, ValueError):
+        return default
+
+
 def _classify_with_copilot(message_text: str, media_info: MediaInfo) -> Optional[ClassificationResult]:
     if not str(message_text or "").strip() and media_info.media_type in ("text", "unknown"):
         return None
@@ -619,9 +960,9 @@ Return STRICT JSON only:
 {{"intent": "<one of {list(INTENT_TYPES)}>", "confidence": 0.0-1.0, "reasoning": "short reason"}}
 
 Intent guide:
-- rfq_inquiry: customer asking price/availability for parts
+- rfq_inquiry: customer asking price/availability for parts (quote me, how much, qty, RFQ)
 - purchase_order: PO, formal order document, PR
-- technical_support: product fault, wiring, specs, how-to
+- technical_support: product fault, wiring, specs, how-to, AND equivalent/replacement/substitute/successor part questions (even with a photo)
 - delivery_tracking: shipment, courier, ETA
 - payment_invoice: invoice, payment, receipt
 - supplier_reply: reply containing WA-YYYYMMDD-BRAND-XXXX ref
@@ -631,6 +972,9 @@ Intent guide:
 - junk_ad: ads, promotions, spam, unrelated marketing
 - general_chat: other business chat
 - unknown: cannot tell
+
+IMPORTANT: "find equivalent", "replacement for", "substitute", "successor", "alternative part"
+→ always technical_support, NOT rfq_inquiry (unless they also explicitly ask for price/quote).
 
 Learned examples:
 {examples_block}
@@ -663,7 +1007,7 @@ Learned examples:
         intent = str(parsed.get("intent") or "unknown").strip().lower()
         if intent not in INTENT_TYPES:
             intent = "unknown"
-        confidence = float(parsed.get("confidence") or 0.5)
+        confidence = _parse_copilot_confidence(parsed.get("confidence"), default=0.5)
         reasoning = str(parsed.get("reasoning") or "").strip()
         return ClassificationResult(
             media_type=media_info.media_type,
@@ -733,6 +1077,17 @@ def classify_whatsapp_message(
 
     final.media_info = media_info
     final.suggested_reply = final.suggested_reply or _default_reply(final.intent, media_info.media_type)
+
+    if is_equivalent_support_request(message_text):
+        was_rfq = final.intent == "rfq_inquiry"
+        final.intent = "technical_support"
+        final.handler = "technical_support"
+        final.confidence = max(final.confidence, 0.93)
+        if was_rfq:
+            final.reasoning = (
+                "Equivalent/replacement request — routed to technical support, not quotation."
+            )
+
     record_classification_example(
         message_text, media_info.media_type, final.intent, final.confidence, channel="whatsapp",
     )

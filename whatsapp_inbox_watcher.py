@@ -3,10 +3,13 @@ import re
 import time
 import csv
 import json
+import base64
+import shutil
 import datetime
 import random
 import string
 import socket
+from typing import Optional
 
 import sys
 
@@ -16,31 +19,63 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options
 
+from openclaw_busy import (
+    clear_busy,
+    flip_channel_turn,
+    get_channel_turn,
+    is_busy,
+    is_channel_turn,
+    set_busy,
+    throttled_log,
+    wait_until_idle,
+)
 from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
-    process_inquiry_text,
+    parse_qty_from_caption,
     process_structured_items,
 )
 from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
-from openclaw_main import extract_rfq_with_copilot, build_ai_research_summary
+from openclaw_main import (
+    analyze_incoming_inquiry_with_copilot,
+    build_ai_research_summary,
+    build_photo_confirmation_line,
+    build_technical_support_reply,
+    is_copilot_transport_failure,
+)
 from whatsapp_message_classifier import (
     INTENT_TYPES,
+    apply_rfq_routing_overrides,
+    bubble_has_explicit_voice_ui,
+    bubble_has_photo_attachment,
+    bubble_looks_like_voice_note,
     build_classification_monitor_message,
     classify_whatsapp_message,
+    classification_from_copilot_analysis,
     detect_bubble_media,
+    is_equivalent_support_request,
+    is_voice_duration_line,
     log_classification,
 )
 from whatsapp_attachment_processor import (
     VOICE_LATEST_OPUS,
-    clear_wa_audio_workspace,
+    WA_IMAGE_DIR,
+    clear_wa_attachment_workspace,
     enrich_message_from_attachments,
     ensure_voice_transcript,
+    pick_newest_image_download,
+    save_wa_image_manifest,
+    save_validated_image_bytes,
+    validate_image_file,
+    MIN_WA_IMAGE_DISPLAY_PX,
+    MIN_WA_IMAGE_NATURAL_PX,
+    BLOB_TO_BASE64_JS,
+    _execute_async_js,
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.37-VOICE-DOWNLOAD-FIX"
+VERSION = "v3.54-VOICE-BEFORE-AVATAR-BLOB"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -55,11 +90,10 @@ PROCESS_CONTACT_FLAG = "/Users/evon/OpenClaw/whatsapp_process_contact.flag"
 WHATSAPP_WATCH_CONTACTS_FILE = "/Users/evon/OpenClaw/whatsapp_watch_contacts.txt"
 WHATSAPP_LAST_PROCESSED_FILE = "/Users/evon/OpenClaw/whatsapp_last_processed.json"
 WHATSAPP_CUSTOMER_REGISTRY_FILE = "/Users/evon/OpenClaw/whatsapp_customer_registry.json"
-IMAGE_CAPTURE_DIR = "/Users/evon/OpenClaw/logs/wa_image_capture"
 CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.txt"
 
 MAX_UNREAD_CHATS_PER_RUN = 1
-CHECK_INTERVAL_SECONDS = int(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "45"))
+CHECK_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "2"))
 INCOMING_LOOKBACK = 6
 MARKUP_DIVISOR = 0.8
 MONITOR_WHATSAPP_PHONE = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONE", "+60167222208")
@@ -517,6 +551,26 @@ def registry_entry_for_hint(contact_hint):
             return entry
 
     return None
+
+
+def contact_store_key(contact_name: str = "", contact_hint: str = "") -> str:
+    """Stable key for whatsapp_last_processed.json across aliases."""
+    for hint in (contact_name, contact_hint):
+        entry = registry_entry_for_hint(hint)
+        if entry:
+            canonical = str(entry.get("canonical_name") or "").strip()
+            if canonical:
+                return canonical.lower()
+    return str(contact_name or contact_hint or "").strip().lower()
+
+
+def watch_read_contacts_enabled() -> bool:
+    return os.getenv("OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def resolve_search_hint(contact_hint):
@@ -1693,17 +1747,17 @@ def is_monitor_phone(phone: str) -> bool:
     return digits == monitor or digits.endswith(monitor[-9:])
 
 
-def get_processed_data_ids(contact_name: str) -> set:
+def get_processed_data_ids(contact_name: str = "", contact_hint: str = "") -> set:
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
+    key = contact_store_key(contact_name, contact_hint)
     entry = store.get(key) or {}
     ids = entry.get("processed_data_ids") or []
     return set(str(x) for x in ids if x)
 
 
-def filter_processable_units(units, contact_name: str = ""):
+def filter_processable_units(units, contact_name: str = "", contact_hint: str = ""):
     """Keep only new, non-bot incoming customer messages."""
-    processed_ids = get_processed_data_ids(contact_name)
+    processed_ids = get_processed_data_ids(contact_name, contact_hint)
     kept = []
     for unit in units or []:
         kind = unit.get("kind") or "empty"
@@ -1776,16 +1830,29 @@ function isPlaybackSpeed(text) {
     return /^\\d+(?:\\.\\d+)?\\s*[×xX]$/.test(String(text || '').trim());
 }
 
+function isSmallAvatarImg(img) {
+    const w = img.naturalWidth || img.clientWidth || 0;
+    const h = img.naturalHeight || img.clientHeight || 0;
+    if (w > 0 && h > 0 && w <= 100 && h <= 100) return true;
+    const src = (img.getAttribute('src') || '').toLowerCase();
+    return src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile');
+}
+
 function hasRealImage(container) {
+    if (hasExplicitVoiceUi(container)) return false;
+    if (hasVoiceDurationLine(container) && container.querySelector(
+        'canvas, [data-icon="audio-play"], [data-icon="ptt"]'
+    )) {
+        return false;
+    }
     const imgs = container.querySelectorAll(
         '[data-testid="image-thumb"], [data-testid="media-url-provider"], '
         + 'img[src*="blob"]:not([src*="emoji"]), img[src*="mmg"], img[src*="cdn.whatsapp"]'
     );
     for (const img of imgs) {
+        if (isSmallAvatarImg(img)) continue;
         const src = (img.getAttribute('src') || '').toLowerCase();
-        if (src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile')) {
-            continue;
-        }
+        if (src.includes('emoji')) continue;
         return true;
     }
     return false;
@@ -1798,29 +1865,41 @@ function hasExplicitVoiceUi(container) {
     );
 }
 
+function isVoiceDurationLine(line) {
+    const t = String(line || '').trim();
+    if (!t || /\\b(AM|PM)\\b/i.test(t)) return false;
+    return /^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(t);
+}
+
 function hasVoiceDurationLine(container) {
     const lines = (container.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
     for (const line of lines) {
-        if (/^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(line)) return true;
+        if (isVoiceDurationLine(line)) return true;
     }
     return false;
 }
 
-function hasVoice(container) {
-    if (hasExplicitVoiceUi(container)) return true;
-    const text = extractText(container);
-    if (text.length > 100) return false;
-    if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
-        return false;
-    }
-    if (hasRealImage(container)) {
-        return false;
-    }
-    if (hasVoiceDurationLine(container) && !!container.querySelector(
-        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"]'
+function hasPhotoAttachment(container) {
+    if (container.querySelector(
+        '[data-testid="image-thumb"], [data-testid="media-url-provider"], [data-testid="media-caption"]'
     )) {
         return true;
     }
+    return hasRealImage(container);
+}
+
+function hasVoice(container) {
+    if (hasExplicitVoiceUi(container)) return true;
+    if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
+        return false;
+    }
+    if (hasVoiceDurationLine(container) && !!container.querySelector(
+        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"], '
+        + '[data-icon="audio-play"], [data-icon="ptt"]'
+    )) {
+        return true;
+    }
+    if (hasPhotoAttachment(container)) return false;
     return false;
 }
 
@@ -1943,16 +2022,29 @@ function isPlaybackSpeed(text) {
     return /^\\d+(?:\\.\\d+)?\\s*[×xX]$/.test(String(text || '').trim());
 }
 
+function isSmallAvatarImg(img) {
+    const w = img.naturalWidth || img.clientWidth || 0;
+    const h = img.naturalHeight || img.clientHeight || 0;
+    if (w > 0 && h > 0 && w <= 100 && h <= 100) return true;
+    const src = (img.getAttribute('src') || '').toLowerCase();
+    return src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile');
+}
+
 function hasRealImage(container) {
+    if (hasExplicitVoiceUi(container)) return false;
+    if (hasVoiceDurationLine(container) && container.querySelector(
+        'canvas, [data-icon="audio-play"], [data-icon="ptt"]'
+    )) {
+        return false;
+    }
     const imgs = container.querySelectorAll(
         '[data-testid="image-thumb"], [data-testid="media-url-provider"], '
         + 'img[src*="blob"]:not([src*="emoji"]), img[src*="mmg"], img[src*="cdn.whatsapp"]'
     );
     for (const img of imgs) {
+        if (isSmallAvatarImg(img)) continue;
         const src = (img.getAttribute('src') || '').toLowerCase();
-        if (src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile')) {
-            continue;
-        }
+        if (src.includes('emoji')) continue;
         return true;
     }
     return false;
@@ -1965,29 +2057,41 @@ function hasExplicitVoiceUi(container) {
     );
 }
 
+function isVoiceDurationLine(line) {
+    const t = String(line || '').trim();
+    if (!t || /\\b(AM|PM)\\b/i.test(t)) return false;
+    return /^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(t);
+}
+
 function hasVoiceDurationLine(container) {
     const lines = (container.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
     for (const line of lines) {
-        if (/^\\d{1,2}:[0-5]\\d(\\s*[×xX])?$/.test(line)) return true;
+        if (isVoiceDurationLine(line)) return true;
     }
     return false;
 }
 
-function hasVoice(container) {
-    if (hasExplicitVoiceUi(container)) return true;
-    const text = extractText(container);
-    if (text.length > 100) return false;
-    if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
-        return false;
-    }
-    if (hasRealImage(container)) {
-        return false;
-    }
-    if (hasVoiceDurationLine(container) && !!container.querySelector(
-        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"]'
+function hasPhotoAttachment(container) {
+    if (container.querySelector(
+        '[data-testid="image-thumb"], [data-testid="media-url-provider"], [data-testid="media-caption"]'
     )) {
         return true;
     }
+    return hasRealImage(container);
+}
+
+function hasVoice(container) {
+    if (hasExplicitVoiceUi(container)) return true;
+    if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
+        return false;
+    }
+    if (hasVoiceDurationLine(container) && !!container.querySelector(
+        'canvas, [data-testid="ptt"], span[data-icon="ptt"], span[data-icon="audio-play"], '
+        + '[data-icon="audio-play"], [data-icon="ptt"]'
+    )) {
+        return true;
+    }
+    if (hasPhotoAttachment(container)) return false;
     return false;
 }
 
@@ -2253,11 +2357,28 @@ def scrape_incoming_units_js(driver, lookback=6):
             continue
 
         if container is not None:
-            py_kind, py_text = classify_incoming_unit(container)
-            if py_kind != "empty":
-                kind = py_kind
+            js_image = bool(item.get("hasImage"))
+            js_voice = bool(item.get("hasVoice"))
+            explicit_voice = bubble_has_explicit_voice_ui(container)
+            looks_voice = bubble_looks_like_voice_note(container)
+            has_photo = bubble_has_photo_attachment(container)
+
+            if js_voice or explicit_voice or looks_voice:
+                kind = "voice"
+                _py_kind, py_text = classify_incoming_unit(container)
                 if py_text:
                     text = normalize_unit_text(py_text)
+            elif has_photo or js_image:
+                py_kind, py_text = classify_incoming_unit(container)
+                kind = py_kind if py_kind != "empty" else "image"
+                if py_text:
+                    text = normalize_unit_text(py_text)
+            else:
+                py_kind, py_text = classify_incoming_unit(container)
+                if py_kind != "empty":
+                    kind = py_kind
+                    if py_text:
+                        text = normalize_unit_text(py_text)
         elif item.get("hasDocument"):
             kind = "document"
         elif item.get("hasVoice"):
@@ -2281,6 +2402,8 @@ def scrape_incoming_units_js(driver, lookback=6):
             "incoming_index": incoming_index,
             "kind": kind,
             "text": text,
+            "has_image": bool(item.get("hasImage")),
+            "has_voice": bool(item.get("hasVoice")),
         })
         print(
             f"   📩 JS unit: kind={kind} idx={incoming_index} data_id={data_id[:24]!r} "
@@ -2672,16 +2795,36 @@ def is_quote_without_part_number(text):
     return len(text_u) < 80
 
 
+def is_support_without_part_number(text):
+    """Caption like 'find equivalent' with no part number — needs paired image."""
+    text_u = str(text or "").upper().strip()
+    if not text_u:
+        return False
+    support_markers = (
+        "EQUIVALENT", "REPLACEMENT", "SUBSTITUTE", "ALTERNATIVE",
+        "SUCCESSOR", "REPLACE", "COMPATIBLE",
+    )
+    if not any(marker in text_u for marker in support_markers):
+        return False
+    if re.search(r"[A-Z]{1,4}[-]?\d{1,}[A-Z0-9#\-/]*", text_u):
+        return False
+    return True
+
+
 def bubble_contains_image(bubble):
     container = resolve_message_container(bubble)
     return find_media_image_in_bubble(container) is not None
 
 
 def container_has_image(container):
-    """Detect image messages — requires a real image thumb, not just media-caption."""
-    if container is None or container_has_voice(container):
+    """Detect image messages — real image thumb wins over false PTT markers."""
+    if container is None:
         return False
-    return container_has_real_image(container)
+    if container_has_real_image(container):
+        return True
+    if container_has_voice(container):
+        return False
+    return False
 
 
 def find_image_container_js(driver, lookback=8):
@@ -2718,6 +2861,10 @@ def find_image_container_js(driver, lookback=8):
 def container_has_real_image(container):
     if container is None:
         return False
+    if bubble_has_photo_attachment(container):
+        return True
+    if bubble_looks_like_voice_note(container):
+        return False
     if bubble_contains_image(container):
         return True
     try:
@@ -2734,6 +2881,12 @@ def container_has_real_image(container):
 def container_has_voice(container):
     if container is None:
         return False
+    if bubble_has_explicit_voice_ui(container):
+        return True
+    if bubble_has_photo_attachment(container):
+        return False
+    if bubble_looks_like_voice_note(container):
+        return True
     try:
         info = detect_bubble_media(container)
         if info.has_voice:
@@ -2754,12 +2907,11 @@ def container_has_voice(container):
     try:
         if container.find_elements(By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'):
             return False
-        if container_has_real_image(container):
-            return False
         text = (container.text or "").strip()
         if len(text) > 100:
             return False
-        if re.search(r"^\d{1,2}:[0-5]\d", text, re.M):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if any(is_voice_duration_line(ln) for ln in lines):
             if container.find_elements(
                 By.CSS_SELECTOR,
                 'canvas, [data-testid="ptt"], span[data-icon="audio-play"], span[data-icon="ptt"]',
@@ -2783,6 +2935,10 @@ def classify_incoming_unit(container):
     text = extract_text_from_message_container(container)
     if is_bot_noise_message(text):
         return "empty", ""
+    if bubble_has_explicit_voice_ui(container) or bubble_looks_like_voice_note(container):
+        return "voice", text
+    if bubble_has_photo_attachment(container):
+        return "image", text
     if container_has_voice(container):
         if is_bot_noise_message(text) or (len(text) > 120 and "OpenClaw" in text):
             return "empty", ""
@@ -2846,13 +3002,13 @@ def find_image_unit(units):
     return None
 
 
-def plan_sequential_units(units, contact_name: str = ""):
+def plan_sequential_units(units, contact_name: str = "", contact_hint: str = ""):
     """
     When customer sends photo then 'Quote 2 pcs' as separate messages,
     process image bubble first, then text bubble — one at a time.
     Only returns NEW unprocessed units (never the whole lookback window).
     """
-    units = filter_processable_units(units, contact_name)
+    units = filter_processable_units(units, contact_name, contact_hint)
     if not units:
         return []
 
@@ -2895,10 +3051,13 @@ def plan_sequential_units(units, contact_name: str = ""):
         print("📨 Sequential plan: 1) document  2) text caption")
         return [newest, prev]
 
-    if newest["kind"] == "text" and is_quote_without_part_number(newest.get("text")):
+    if newest["kind"] == "text" and (
+        is_quote_without_part_number(newest.get("text"))
+        or is_support_without_part_number(newest.get("text"))
+    ):
         image_unit = find_image_unit(working)
         if image_unit and image_unit is not newest:
-            print("📨 Sequential plan: image + quote caption (within lookback window)")
+            print("📨 Sequential plan: image + caption without part number (within lookback window)")
             return [image_unit, newest]
 
     if newest["kind"] == "document":
@@ -2936,6 +3095,14 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         kind = unit["kind"]
         unit_text = unit.get("text") or ""
 
+        if kind == "image" and container is not None:
+            if bubble_has_explicit_voice_ui(container) or (
+                bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
+            ):
+                kind = "voice"
+                unit["kind"] = "voice"
+                print("   🎤 Reclassified image → voice (voice-note bubble detected)")
+
         print("")
         print("-" * 90)
         print(f"📨 Step {step}/{len(plan)}: {kind.upper()} message")
@@ -2950,11 +3117,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         except Exception:
             pass
 
-        if kind == "image":
-            if container is not None and container_has_voice(container):
-                kind = "voice"
-                unit["kind"] = "voice"
-                print("   🎤 Reclassified image → voice (PTT bubble detected)")
+        image_path_this_step = None
         if kind == "image":
             if container is None:
                 print("   ❌ Image step: container element missing — cannot capture photo.")
@@ -2970,17 +3133,22 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 latest_message = caption
             media_info = detect_bubble_media(container, caption_text=caption)
             message_data_id = str(unit.get("data_id") or "").strip()
-            image_path = capture_bubble_image(
+            image_path_this_step = capture_bubble_image(
                 driver, container, contact_name, message_data_id=message_data_id
             )
-            items = extract_rfq_with_copilot(caption, image_path=image_path)
-            if items:
-                copilot_items = items
-                print(f"   👁️ Image step: Copilot extracted {len(items)} item(s)")
-            elif image_path:
-                print("   ⚠️ Image step: photo captured but Copilot found no parts yet.")
+            if image_path_this_step:
+                image_path = image_path_this_step
+                print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
+            elif bubble_has_explicit_voice_ui(container) or (
+                bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
+            ):
+                kind = "voice"
+                unit["kind"] = "voice"
+                print("   🎤 Image capture failed on voice-shaped bubble — switching to voice download")
+            else:
+                print("   ⚠️ Image step: message-bubble screenshot capture failed.")
 
-        elif kind == "voice":
+        if kind == "voice":
             processed_voice = True
             if container is None:
                 print("   ❌ Voice step: container missing before relocation.")
@@ -3031,14 +3199,6 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             )
             if not voice_ok:
                 print("   ⚠️ Voice step: download/transcribe failed — will retry next cycle.")
-            inquiry_for_extract = transcript or latest_message
-            if not copilot_items and inquiry_for_extract:
-                items = extract_rfq_with_copilot(inquiry_for_extract, image_path=None)
-                if items:
-                    copilot_items = items
-                    print(f"   🎤 Voice step: Copilot extracted {len(items)} item(s) from transcript")
-                else:
-                    print("   🎤 Voice step: running inquiry engine on transcript text...")
 
         elif kind == "document":
             media_info = detect_bubble_media(container, caption_text=unit_text or latest_message)
@@ -3058,13 +3218,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 continue
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
-            if not copilot_items and not document_items:
-                items = extract_rfq_with_copilot(unit_text, image_path=None)
-                if items:
-                    copilot_items = items
-                    print(f"   📝 Text step: Copilot extracted {len(items)} item(s)")
-            else:
-                print("   📝 Text step: caption/qty merged with prior image/document extraction.")
+            print("   📝 Text step: caption saved — unified Copilot analyze at end of plan")
 
         else:
             print(f"   ⚠️ Skipping empty/unknown message unit at step {step}.")
@@ -3098,9 +3252,37 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         media_info.media_type = "voice"
         media_info.has_voice = True
 
+    copilot_analysis = analyze_incoming_inquiry_with_copilot(
+        message_text=latest_message,
+        image_path=image_path,
+        document_text=enrichment.get("document_text") or "",
+        voice_transcript=enrichment.get("transcript") or "",
+    )
+    if copilot_analysis.get("attempted"):
+        if copilot_analysis.get("items"):
+            copilot_items = copilot_analysis["items"]
+            print(f"   🧠 Unified Copilot analyze: {len(copilot_items)} item(s)")
+        elif copilot_analysis.get("ok"):
+            print("   ⚠️ Unified Copilot analyze OK but returned zero items")
+        else:
+            print(
+                f"   ❌ Unified Copilot analyze failed "
+                f"(HTTP {copilot_analysis.get('http_status')}): "
+                f"{copilot_analysis.get('error')}"
+            )
+        if image_path and copilot_items:
+            image_analysis = {
+                "items": copilot_items,
+                "inquiry_text": latest_message,
+                "notes": "Unified Copilot analyze (image + caption together).",
+                "source": "copilot_unified",
+                "image_path": image_path,
+            }
+
     return {
         "latest_message": latest_message,
         "copilot_items": copilot_items,
+        "copilot_analysis": copilot_analysis,
         "document_items": document_items,
         "image_path": image_path,
         "image_analysis": image_analysis,
@@ -3277,48 +3459,452 @@ def close_media_viewer(driver):
         pass
 
 
-def capture_image_via_media_viewer(driver, bubble, image_path):
-    """Open WhatsApp's full-screen viewer so we capture the correct photo."""
+def capture_message_bubble_screenshot(driver, bubble, image_path):
+    """Screenshot only the target WhatsApp message bubble — not the full screen or media gallery."""
+    bubble = resolve_message_container(bubble)
+    if bubble is None:
+        return None
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            bubble,
+        )
+        time.sleep(1.2)
+        bubble.screenshot(image_path)
+        size = bubble.size or {}
+        print(
+            f"🖼️ Saved exact message-bubble screenshot "
+            f"({int(size.get('width') or 0)}x{int(size.get('height') or 0)}): {image_path}"
+        )
+        return image_path
+    except Exception as exc:
+        print(f"❌ Message bubble screenshot failed: {exc}")
+        return None
+
+
+def _largest_media_in_bubble(bubble):
+    """Return the largest in-bubble media element (image/document preview)."""
+    bubble = resolve_message_container(bubble)
+    if bubble is None:
+        return None
+
+    best = None
+    best_area = 0
+    selectors = [
+        '[data-testid="image-thumb"] img',
+        '[data-testid="image-thumb"]',
+        '[data-testid="media-url-provider"] img',
+        'img[src]',
+    ]
+    for selector in selectors:
+        try:
+            for element in bubble.find_elements(By.CSS_SELECTOR, selector):
+                if not element.is_displayed():
+                    continue
+                src = (element.get_attribute("src") or "").lower()
+                if is_profile_or_ui_image_src(src):
+                    continue
+                size = element.size or {}
+                area = int(size.get("width") or 0) * int(size.get("height") or 0)
+                if area > best_area:
+                    best = element
+                    best_area = area
+        except Exception:
+            continue
+    return best if best_area >= 80 else None
+
+
+def capture_bubble_media_crop(driver, bubble, image_path):
+    """Screenshot only the media region inside the message bubble (still no gallery strip)."""
+    bubble = resolve_message_container(bubble)
+    media = _largest_media_in_bubble(bubble)
+    if media is None:
+        return None
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            media,
+        )
+        time.sleep(0.8)
+        wait_for_media_image_ready(driver, media)
+        media.screenshot(image_path)
+        size = media.size or {}
+        print(
+            f"🖼️ Saved in-bubble media crop "
+            f"({int(size.get('width') or 0)}x{int(size.get('height') or 0)}): {image_path}"
+        )
+        return image_path
+    except Exception as exc:
+        print(f"⚠️ In-bubble media crop failed: {exc}")
+        return None
+
+
+BEST_VIEWER_IMAGE_INFO_JS = """
+var callback = arguments[arguments.length - 1];
+function isThumb(el) {
+  var p = el;
+  for (var i = 0; i < 12 && p; i++) {
+    var tid = (p.getAttribute && p.getAttribute('data-testid')) || '';
+    if (/thumb|thumbnail|filmstrip/i.test(tid)) return true;
+    p = p.parentElement;
+  }
+  return false;
+}
+function isUiIcon(src) {
+  src = (src || '').toLowerCase();
+  return !src || src.indexOf('emoji') >= 0 || src.indexOf('profile') >= 0
+    || src.indexOf('avatar') >= 0 || src.indexOf('data:image/gif') === 0;
+}
+var panel = document.querySelector('[data-testid="media-viewer-panel"]')
+  || document.querySelector('div[data-animate-media-viewer="true"]')
+  || document.body;
+var imgs = Array.from(panel.querySelectorAll('img[src]')).filter(function(img) {
+  if (!img.offsetParent) return false;
+  var src = img.currentSrc || img.src || '';
+  if (isUiIcon(src)) return false;
+  if (isThumb(img)) return false;
+  return true;
+});
+var best = null, bestScore = 0;
+imgs.forEach(function(img) {
+  var nw = img.naturalWidth || 0;
+  var nh = img.naturalHeight || 0;
+  var dw = img.clientWidth || 0;
+  var dh = img.clientHeight || 0;
+  var score = Math.max(nw * nh, dw * dh);
+  if (score > bestScore) {
+    best = img;
+    bestScore = score;
+  }
+});
+if (!best) {
+  callback(null);
+  return;
+}
+callback({
+  src: best.currentSrc || best.src || '',
+  naturalW: best.naturalWidth || 0,
+  naturalH: best.naturalHeight || 0,
+  displayW: best.clientWidth || 0,
+  displayH: best.clientHeight || 0
+});
+"""
+
+
+def _viewer_image_info(driver):
+    try:
+        return _execute_async_js(driver, BEST_VIEWER_IMAGE_INFO_JS, timeout=10)
+    except Exception:
+        return None
+
+
+def _find_main_viewer_image(driver, src_hint: str = ""):
+    """Return the main viewer <img> element (largest natural/display size)."""
+    hint = str(src_hint or "").strip()
+    if hint:
+        for element in driver.find_elements(By.CSS_SELECTOR, "img[src]"):
+            try:
+                if not element.is_displayed():
+                    continue
+                src = element.get_attribute("src") or ""
+                current = element.get_attribute("currentSrc") or ""
+                if hint in src or hint in current:
+                    return element
+            except Exception:
+                continue
+
+    info = _viewer_image_info(driver)
+    if info and info.get("src"):
+        return _find_main_viewer_image(driver, info["src"])
+
+    best = None
+    best_score = 0
+    for element in driver.find_elements(By.CSS_SELECTOR, "img[src]"):
+        try:
+            if not element.is_displayed():
+                continue
+            src = (element.get_attribute("src") or "").lower()
+            if is_profile_or_ui_image_src(src):
+                continue
+            dims = driver.execute_script(
+                "return {"
+                "nw: arguments[0].naturalWidth||0, nh: arguments[0].naturalHeight||0,"
+                "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0"
+                "};",
+                element,
+            ) or {}
+            score = max(
+                int(dims.get("nw") or 0) * int(dims.get("nh") or 0),
+                int(dims.get("dw") or 0) * int(dims.get("dh") or 0),
+            )
+            if score > best_score:
+                best = element
+                best_score = score
+        except Exception:
+            continue
+    return best
+
+
+def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
+    """Wait until viewer shows a real image (not 72x32 placeholder)."""
+    end = time.time() + timeout
+    best_info = None
+    while time.time() < end:
+        info = _viewer_image_info(driver)
+        if info:
+            nw = int(info.get("naturalW") or 0)
+            nh = int(info.get("naturalH") or 0)
+            dw = int(info.get("displayW") or 0)
+            dh = int(info.get("displayH") or 0)
+            best_info = info
+            if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+                return info
+            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+                return info
+        time.sleep(0.75)
+    return best_info
+
+
+def _save_downloaded_image(downloaded: str, dest_path: str) -> Optional[str]:
+    if not downloaded:
+        return None
+    try:
+        with open(downloaded, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    saved = save_validated_image_bytes(data, dest_path)
+    if saved:
+        print(
+            f"🖼️ Saved full-resolution image → {saved} "
+            f"({os.path.getsize(saved)} bytes)"
+        )
+    return saved
+
+
+def _save_element_screenshot(element, dest_path: str) -> Optional[str]:
+    try:
+        tmp_path = dest_path if dest_path.endswith(".png") else f"{dest_path}.png"
+        element.screenshot(tmp_path)
+        ok, reason = validate_image_file(tmp_path)
+        if ok:
+            print(
+                f"🖼️ Saved viewer screenshot → {tmp_path} "
+                f"({os.path.getsize(tmp_path)} bytes)"
+            )
+            return tmp_path
+        print(f"⚠️ Viewer screenshot rejected: {reason}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    except Exception as exc:
+        print(f"⚠️ Viewer screenshot failed: {exc}")
+    return None
+
+
+IMAGE_CANVAS_EXPORT_JS = """
+var img = arguments[0];
+var callback = arguments[arguments.length - 1];
+try {
+  var w = img.naturalWidth || img.width || 0;
+  var h = img.naturalHeight || img.height || 0;
+  if (w < 80 || h < 80) {
+    callback(null);
+    return;
+  }
+  var canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  var ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  var data = canvas.toDataURL('image/png');
+  callback(data && data.indexOf(',') >= 0 ? data.split(',')[1] : null);
+} catch (e) {
+  callback(null);
+}
+"""
+
+
+def _save_viewer_panel_screenshot(driver, dest_path: str) -> Optional[str]:
+    """Screenshot the whole media viewer panel (better for RFQ tables than tiny <img>)."""
+    for selector in (
+        '[data-testid="media-viewer-panel"]',
+        'div[data-animate-media-viewer="true"]',
+    ):
+        try:
+            panel = driver.find_element(By.CSS_SELECTOR, selector)
+            if not panel.is_displayed():
+                continue
+            tmp_path = dest_path if dest_path.endswith(".png") else f"{dest_path}.png"
+            panel.screenshot(tmp_path)
+            ok, reason = validate_image_file(tmp_path)
+            if ok:
+                print(
+                    f"🖼️ Saved viewer panel screenshot → {tmp_path} "
+                    f"({os.path.getsize(tmp_path)} bytes)"
+                )
+                return tmp_path
+            print(f"⚠️ Viewer panel screenshot rejected: {reason}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        except Exception:
+            continue
+    return None
+
+
+def download_full_resolution_image(driver, bubble, image_path):
+    """
+    Open the WhatsApp image viewer and save a readable product image to WA_Image.
+    Rejects tiny placeholders (e.g. 72x32 / 898 bytes) that break Copilot vision.
+    """
     thumb = find_media_image_in_bubble(bubble)
     if thumb is None:
+        print("⚠️ No in-bubble image thumb found for full-resolution download.")
         return None
+
+    baseline_mtime = time.time()
     try:
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
             thumb,
         )
-        time.sleep(0.8)
+        time.sleep(1.0)
         driver.execute_script("arguments[0].click();", thumb)
-        time.sleep(2)
+        time.sleep(3.0)
 
-        viewer_selectors = [
-            '[data-testid="media-viewer-panel"] img[src]',
-            'div[data-animate-media-viewer="true"] img[src]',
-            'img[src*="blob:"]',
-            'img[src*="mmg"]',
+        info = wait_for_viewer_high_resolution(driver, timeout=22.0)
+        main_img = _find_main_viewer_image(driver, (info or {}).get("src", ""))
+        if main_img is None:
+            print("⚠️ Media viewer opened but main image element not found.")
+            return None
+
+        natural = driver.execute_script(
+            "return {w: arguments[0].naturalWidth||0, h: arguments[0].naturalHeight||0,"
+            "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0};",
+            main_img,
+        ) or {}
+        print(
+            f"🖼️ Viewer image — display {natural.get('dw', 0)}x{natural.get('dh', 0)}, "
+            f"natural {natural.get('w', 0)}x{natural.get('h', 0)}"
+        )
+
+        download_selectors = [
+            '[data-testid="media-viewer-download"]',
+            '[data-testid="download"]',
+            '[data-icon="download"]',
+            'span[data-icon="download"]',
+            '[aria-label="Download"]',
+            '[title="Download"]',
         ]
-        best = None
-        best_area = 0
-        for selector in viewer_selectors:
-            for element in driver.find_elements(By.CSS_SELECTOR, selector):
+        for selector in download_selectors:
+            try:
+                for btn in driver.find_elements(By.CSS_SELECTOR, selector):
+                    if btn.is_displayed():
+                        btn.click()
+                        time.sleep(4)
+                        downloaded = pick_newest_image_download(baseline_mtime)
+                        saved = _save_downloaded_image(downloaded, image_path)
+                        if saved:
+                            return saved
+            except Exception:
+                continue
+
+        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX:
+            saved = _save_viewer_panel_screenshot(driver, image_path)
+            if saved:
+                return saved
+            saved = _save_element_screenshot(main_img, image_path)
+            if saved:
+                return saved
+
+        nw = int(natural.get("w") or 0)
+        nh = int(natural.get("h") or 0)
+        if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+            try:
+                b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
+                if b64:
+                    saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+                    if saved:
+                        print(f"🖼️ Saved full-resolution image (blob fetch) → {saved}")
+                        return saved
+            except Exception as exc:
+                print(f"⚠️ Blob fetch failed: {exc}")
+
+            try:
+                b64 = _execute_async_js(driver, IMAGE_CANVAS_EXPORT_JS, main_img, timeout=20)
+                if b64:
+                    saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+                    if saved:
+                        print(f"🖼️ Saved full-resolution image (canvas export) → {saved}")
+                        return saved
+            except Exception as exc:
+                print(f"⚠️ Canvas export failed: {exc}")
+        else:
+            print(
+                f"⚠️ Skipping blob/canvas — natural {nw}x{nh} looks like a loading placeholder."
+            )
+
+        try:
+            ActionChains(driver).context_click(main_img).perform()
+            time.sleep(0.8)
+            for label in ("Save image as", "Save Image As", "Save image", "Save picture as"):
                 try:
-                    if not element.is_displayed():
-                        continue
-                    src = (element.get_attribute("src") or "").lower()
-                    if is_profile_or_ui_image_src(src):
-                        continue
-                    size = element.size or {}
-                    area = int(size.get("width") or 0) * int(size.get("height") or 0)
-                    if area > best_area:
-                        best = element
-                        best_area = area
+                    items = driver.find_elements(
+                        By.XPATH,
+                        f"//*[contains(translate(normalize-space(.),"
+                        f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                        f"'{label.lower()}')]",
+                    )
+                    for item in items:
+                        if item.is_displayed():
+                            item.click()
+                            time.sleep(4)
+                            downloaded = pick_newest_image_download(baseline_mtime)
+                            saved = _save_downloaded_image(downloaded, image_path)
+                            if saved:
+                                return saved
                 except Exception:
                     continue
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.3)
+        except Exception as exc:
+            print(f"⚠️ Save Image As menu failed: {exc}")
 
-        if best is not None and wait_for_media_image_ready(driver, best):
-            best.screenshot(image_path)
-            print(f"🖼️ Saved WhatsApp image from media viewer: {image_path}")
-            return image_path
+        saved = _save_element_screenshot(main_img, image_path)
+        if saved:
+            return saved
+    except Exception as exc:
+        print(f"⚠️ Full-resolution image download failed: {exc}")
+    finally:
+        close_media_viewer(driver)
+    return None
+
+
+def capture_image_via_media_viewer(driver, bubble, image_path):
+    """Open viewer and screenshot the main image (fallback when download fails)."""
+    thumb = find_media_image_in_bubble(bubble)
+    if thumb is None:
+        return None
+
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            thumb,
+        )
+        time.sleep(1.0)
+        driver.execute_script("arguments[0].click();", thumb)
+        time.sleep(3.0)
+
+        wait_for_viewer_high_resolution(driver, timeout=15.0)
+        best = _find_main_viewer_image(driver)
+        if best is not None:
+            saved = _save_element_screenshot(best, image_path)
+            if saved:
+                return saved
+        print("⚠️ Media viewer opened but no valid screenshot produced.")
     except Exception as exc:
         print(f"⚠️ Media viewer capture failed: {exc}")
     finally:
@@ -3327,50 +3913,48 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
 
 
 def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
+    """Save full-resolution product image to WA_Image for Copilot — not tiny bubble screenshots."""
     bubble = resolve_message_container(bubble)
     if bubble is None:
         return None
 
-    os.makedirs(IMAGE_CAPTURE_DIR, exist_ok=True)
+    os.makedirs(WA_IMAGE_DIR, exist_ok=True)
     safe_contact = re.sub(r"[^A-Za-z0-9._-]+", "_", str(contact_name or "contact"))[:60]
-    id_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(message_data_id or ""))[:24]
-    suffix = f"_{id_slug}" if id_slug else ""
-    image_path = os.path.join(
-        IMAGE_CAPTURE_DIR,
-        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}.png",
-    )
+    id_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(message_data_id or ""))[:48]
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = id_slug or safe_contact
 
-    viewer_path = capture_image_via_media_viewer(driver, bubble, image_path)
-    if viewer_path:
-        return viewer_path
+    full_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_full.png")
+    full_result = download_full_resolution_image(driver, bubble, full_path)
+    if full_result:
+        save_wa_image_manifest(full_result, message_data_id=message_data_id)
+        return full_result
 
-    media = find_media_image_in_bubble(bubble)
-    if media is not None:
-        try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                media,
-            )
-            wait_for_media_image_ready(driver, media)
-            media.screenshot(image_path)
-            print(f"🖼️ Saved incoming WhatsApp image (thumb): {image_path}")
-            return image_path
-        except Exception as e:
-            print(f"❌ Failed to capture WhatsApp image thumb: {e}")
+    viewer_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_viewer.png")
+    viewer_result = capture_image_via_media_viewer(driver, bubble, viewer_path)
+    if viewer_result:
+        save_wa_image_manifest(viewer_result, message_data_id=message_data_id)
+        return viewer_result
 
-    if container_has_image(bubble):
-        try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                bubble,
-            )
-            time.sleep(1)
-            bubble.screenshot(image_path)
-            print(f"🖼️ Saved container screenshot (image thumb fallback): {image_path}")
-            return image_path
-        except Exception as e:
-            print(f"❌ Container screenshot fallback failed: {e}")
+    crop_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_media.png")
+    crop_result = capture_bubble_media_crop(driver, bubble, crop_path)
+    if crop_result:
+        ok, _reason = validate_image_file(crop_result)
+        if ok:
+            save_wa_image_manifest(crop_result, message_data_id=message_data_id)
+            return crop_result
+        print(f"⚠️ In-bubble media crop rejected: {_reason}")
 
+    bubble_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_bubble.png")
+    bubble_result = capture_message_bubble_screenshot(driver, bubble, bubble_path)
+    if bubble_result:
+        ok, _reason = validate_image_file(bubble_result, min_bytes=4000)
+        if ok:
+            save_wa_image_manifest(bubble_result, message_data_id=message_data_id)
+            return bubble_result
+        print(f"⚠️ Bubble screenshot rejected: {_reason}")
+
+    print(f"❌ Could not save image for Copilot ({WA_IMAGE_DIR}).")
     return None
 
 
@@ -3410,7 +3994,7 @@ def find_message_box(driver):
     return None
 
 
-def click_send_button(driver, timeout=15):
+def click_send_button(driver, timeout=15, include_preview: bool = False):
     end = time.time() + timeout
 
     send_selectors = [
@@ -3424,11 +4008,21 @@ def click_send_button(driver, timeout=15):
         '//*[@data-icon="send"]/ancestor::div[@role="button"]',
         '//*[@data-icon="send"]',
     ]
+    if include_preview:
+        send_selectors = [
+            '[data-testid="media-preview-send"]',
+            'span[data-icon="send"]',
+            'div[role="button"][aria-label="Send"]',
+            'button[aria-label="Send"]',
+        ] + send_selectors
 
     while time.time() < end:
         for selector in send_selectors:
             try:
-                elements = driver.find_elements(By.XPATH, selector)
+                if selector.startswith("/") or selector.startswith("("):
+                    elements = driver.find_elements(By.XPATH, selector)
+                else:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
 
                 for el in elements:
                     if el.is_displayed():
@@ -3525,8 +4119,106 @@ def customer_replies_go_to_monitor():
     return get_customer_reply_mode() in ("monitor", "debug", "test")
 
 
+def send_image_attachment_in_current_chat(driver, image_path: str, caption: str = "") -> bool:
+    """Attach and send an image in the open WhatsApp chat (for monitor verification)."""
+    if not image_path or not os.path.exists(image_path):
+        return False
+
+    abs_path = os.path.abspath(image_path)
+    print(f"📷 Attaching image to WhatsApp chat: {abs_path}")
+
+    try:
+        attach_selectors = [
+            'span[data-icon="plus"]',
+            'span[data-icon="clip"]',
+            'div[title="Attach"]',
+            '[data-testid="attach-menu"]',
+        ]
+        for selector in attach_selectors:
+            try:
+                for btn in driver.find_elements(By.CSS_SELECTOR, selector):
+                    if btn.is_displayed():
+                        btn.click()
+                        time.sleep(0.8)
+                        break
+            except Exception:
+                continue
+
+        file_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
+        sent = False
+        for file_input in file_inputs:
+            try:
+                accept = (file_input.get_attribute("accept") or "").lower()
+                if accept and "image" not in accept and "video" not in accept:
+                    continue
+                file_input.send_keys(abs_path)
+                sent = True
+                break
+            except Exception:
+                continue
+
+        if not sent:
+            print("⚠️ Could not find WhatsApp file input for image attach.")
+            return False
+
+        time.sleep(4)
+
+        if caption:
+            for selector in (
+                'div[contenteditable="true"][data-tab="10"]',
+                'div[contenteditable="true"][role="textbox"]',
+                'footer div[contenteditable="true"]',
+            ):
+                try:
+                    boxes = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for box in boxes:
+                        if box.is_displayed():
+                            box.click()
+                            time.sleep(0.3)
+                            box.send_keys(caption[:900])
+                            break
+                except Exception:
+                    continue
+
+        if click_send_button(driver, timeout=25, include_preview=True):
+            print("✅ Image attachment sent.")
+            return True
+
+        try:
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+            time.sleep(1)
+            print("✅ Image attachment sent via ENTER.")
+            return True
+        except Exception:
+            pass
+
+        print("⚠️ Image attached but send button not found.")
+        return False
+    except Exception as exc:
+        print(f"⚠️ Image attach failed: {exc}")
+        return False
+
+
+def send_monitor_notification(
+    driver,
+    message: str,
+    image_path: str = None,
+    image_caption: str = "OpenClaw analyzed image",
+) -> bool:
+    """Send analyzed image first, then text — so monitor sees photo before long reply."""
+    ok = True
+    if image_path and os.path.exists(image_path):
+        if not send_image_attachment_in_current_chat(driver, image_path, caption=image_caption):
+            print("⚠️ Monitor image attach failed — continuing with text only.")
+            ok = False
+        time.sleep(2)
+    if not send_reply_in_current_chat(driver, message):
+        return False
+    return ok
+
+
 def build_monitor_reply(context, customer_name, customer_contact, original_message, reply_message,
-                        classification_summary=None):
+                        classification_summary=None, image_path=None, copilot_items=None):
     lines = [
         "[OpenClaw Monitor Mode]",
         f"Context: {context or 'Customer reply'}",
@@ -3542,6 +4234,20 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
         lines.append("Classification:")
         lines.append(classification_summary)
 
+    if copilot_items:
+        lines.append("")
+        lines.append("Copilot extracted parts:")
+        for item in copilot_items:
+            lines.append(
+                f"  - {item.get('part_no')} | Qty: {item.get('qty')} | "
+                f"Brand: {item.get('brand')} | Source: {item.get('source')}"
+            )
+
+    if image_path:
+        lines.append("")
+        lines.append(f"Analyzed image file: {image_path}")
+        lines.append("(Photo attached below for verification)")
+
     lines.extend([
         "",
         "Original Message:",
@@ -3556,7 +4262,8 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
 
 def send_customer_reply(driver, reply_message, customer_name=None, customer_contact=None,
                         original_message=None, context="CUSTOMER_REPLY",
-                        customer_chat_is_open=True, classification_summary=None):
+                        customer_chat_is_open=True, classification_summary=None,
+                        image_path=None, copilot_items=None):
     if customer_replies_go_to_monitor():
         print(
             "🧪 Monitor mode active. Redirecting alert to your monitor number "
@@ -3574,8 +4281,15 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
             original_message=original_message,
             reply_message=reply_message,
             classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_items,
         )
-        return send_reply_in_current_chat(driver, monitor_message)
+        return send_monitor_notification(
+            driver,
+            monitor_message,
+            image_path=image_path,
+            image_caption=f"OpenClaw: {context or 'analyzed image'}",
+        )
 
     if not customer_chat_is_open:
         if not open_whatsapp_chat_by_phone(driver, customer_contact, chat_label="customer"):
@@ -3584,7 +4298,60 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
     return send_reply_in_current_chat(driver, reply_message)
 
 
-def send_classification_alert(driver, contact_name, customer_contact, message_text, classification):
+def send_copilot_malfunction_alert(
+    driver,
+    operation: str,
+    copilot_analysis: dict,
+    customer_name: str = "",
+    customer_contact: str = "",
+    image_path: str = "",
+    original_message: str = "",
+):
+    """Notify monitor WhatsApp when Copilot API fails (non-200 / connection error)."""
+    status = copilot_analysis.get("http_status")
+    error = str(copilot_analysis.get("error") or "unknown Copilot error").strip()
+    raw = str(copilot_analysis.get("raw_excerpt") or "").strip()
+    lines = [
+        "[OpenClaw Copilot Malfunction]",
+        "Please Check",
+        "",
+        f"Operation: {operation}",
+        f"Customer: {customer_name or '-'}",
+    ]
+    phone_display = format_customer_phone_display(customer_contact)
+    if phone_display:
+        lines.append(f"Customer Contact: {phone_display}")
+    lines.extend([
+        f"HTTP status: {status if status is not None else 'n/a'}",
+        f"Error: {error[:600]}",
+    ])
+    if image_path:
+        lines.append(f"Image: {image_path}")
+    if original_message:
+        lines.append(f"Caption: {original_message[:300]}")
+    if raw:
+        lines.append(f"Copilot raw excerpt: {raw[:400]}")
+    alert = "\n".join(lines)
+    print("")
+    print("=" * 90)
+    print("🚨 COPILOT MALFUNCTION — alerting monitor")
+    print(alert[:500])
+    print("=" * 90)
+    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
+        print("❌ Could not open monitor chat for Copilot malfunction alert.")
+        return False
+    return send_monitor_notification(
+        driver,
+        alert,
+        image_path=image_path if image_path and os.path.exists(image_path) else None,
+        image_caption=f"OpenClaw malfunction: {operation}",
+    )
+
+
+def send_classification_alert(
+    driver, contact_name, customer_contact, message_text, classification,
+    image_path: str = None, copilot_items=None,
+):
     """Always notify monitor during development so every message is classified and visible."""
     alert = build_classification_monitor_message(
         contact_name, customer_contact, message_text, classification
@@ -3599,7 +4366,12 @@ def send_classification_alert(driver, contact_name, customer_contact, message_te
         print("❌ Could not open monitor chat for classification alert.")
         return False
 
-    return send_reply_in_current_chat(driver, alert)
+    return send_monitor_notification(
+        driver,
+        alert,
+        image_path=image_path if image_path and os.path.exists(image_path) else None,
+        image_caption="OpenClaw classification image",
+    )
 
 
 def process_monitor_feedback(driver):
@@ -3825,21 +4597,54 @@ def process_supplier_reply(driver, contact_name, latest_message):
 def process_customer_inquiry(
     driver, contact_name, latest_message, image_analysis=None, customer_contact=None,
     classification=None, document_items=None, pre_extracted_copilot_items=None,
-    voice_enrichment=None,
+    voice_enrichment=None, image_path=None, copilot_technical_summary=None,
+    unified_analyze_ran=False, copilot_analysis=None,
 ):
     customer_contact = customer_contact or contact_name
     classification_summary = classification.summary() if classification else None
     document_items = document_items or []
-    image_path = image_analysis.get("image_path") if image_analysis else None
+    copilot_analysis = copilot_analysis or {}
+    image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
 
-    if pre_extracted_copilot_items:
-        copilot_items = pre_extracted_copilot_items
-        print(f"🤖 Using {len(copilot_items)} item(s) from sequential extraction.")
+    if is_copilot_transport_failure(copilot_analysis):
+        send_copilot_malfunction_alert(
+            driver,
+            operation="unified_analyze",
+            copilot_analysis=copilot_analysis,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            image_path=image_path or "",
+            original_message=latest_message,
+        )
+        reply = (
+            "Hi, thank you for your inquiry.\n\n"
+            "We received your message and our team is processing it now. "
+            "We will send the quotation shortly."
+        )
+        send_customer_reply(
+            driver,
+            reply,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            original_message=latest_message,
+            context="COPILOT_MALFUNCTION_HOLD",
+            customer_chat_is_open=True,
+            classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_analysis.get("items") or [],
+        )
+        append_log(contact_name, latest_message, [], [], "COPILOT_MALFUNCTION_HOLD")
+        return
+
+    if unified_analyze_ran or pre_extracted_copilot_items is not None:
+        copilot_items = list(pre_extracted_copilot_items or [])
+        print(f"🤖 Using {len(copilot_items)} item(s) from unified Copilot analyze (no fallback extraction).")
     else:
-        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
+        print("⚠️ Unified Copilot analyze did not run — will not guess parts from regex or legacy OCR.")
+        copilot_items = []
 
     if copilot_items:
-        print(f"🤖 Copilot is primary: processing {len(copilot_items)} visually extracted item(s).")
+        print(f"🤖 Copilot is primary: processing {len(copilot_items)} item(s).")
         structured_items = []
         existing_norms = set()
         for item in copilot_items:
@@ -3847,16 +4652,23 @@ def process_customer_inquiry(
             part_norm = re.sub(r"[^A-Z0-9]", "", part_no)
             if not part_norm or part_norm in existing_norms:
                 continue
+            qty = parse_qty_from_caption(latest_message, default=int(item.get("qty") or 1))
+            item_source = str(item.get("source") or "").strip().upper()
+            if not item_source:
+                item_source = "COPILOT_UNIFIED" if unified_analyze_ran else (
+                    "COPILOT_VISUAL" if image_path else "COPILOT_TEXT"
+                )
             structured_items.append({
                 "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
                 "part_no": part_no,
                 "desc": part_no,
-                "qty": int(item["qty"]),
+                "qty": qty,
                 "norm": part_norm,
-                "source": "COPILOT_VISUAL" if image_path else "COPILOT_TEXT",
+                "source": item_source,
+                "product_type": str(item.get("product_type") or "").strip(),
             })
             existing_norms.add(part_norm)
-            print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {item['qty']}")
+            print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {qty}")
 
         formatted_rows, tbc_by_brand, skipped = process_structured_items(structured_items)
         result = {
@@ -3893,8 +4705,14 @@ def process_customer_inquiry(
             "skipped": skipped,
         }
     else:
-        print("⚠️ Copilot found no usable item. Falling back to regex extraction.")
-        result = process_inquiry_text(latest_message)
+        print("⚠️ Copilot found no usable item — not using regex or legacy OCR fallback.")
+        result = {
+            "formatted_rows": [],
+            "tbc_by_brand": {},
+            "has_partial": False,
+            "missing_layer2_items": [],
+            "skipped": [],
+        }
 
     formatted_rows = result["formatted_rows"]
     tbc_by_brand = result["tbc_by_brand"]
@@ -3925,11 +4743,37 @@ def process_customer_inquiry(
 
     if not formatted_rows:
         if image_path is None and is_quote_without_part_number(latest_message):
-            print("⚠️ RFQ caption with no parts and no image captured — cannot extract.")
+            print("⚠️ RFQ caption with no parts and no zoomed screenshot — cannot extract.")
             reply = (
-                "Hi, I received your quote request but could not access the photo.\n\n"
+                "Hi, I received your quote request but could not access the product photo.\n\n"
                 "Please resend the product label photo together with the part numbers, or type:\n"
-                "P36203010#1 Qty:1"
+                "ER6C 3.6V Qty:1"
+            )
+        elif image_path and unified_analyze_ran:
+            if is_copilot_transport_failure(copilot_analysis):
+                send_copilot_malfunction_alert(
+                    driver,
+                    operation="rfq_no_items_after_analyze",
+                    copilot_analysis=copilot_analysis or {
+                        "error": "Copilot transport failure",
+                        "http_status": None,
+                        "attempted": True,
+                        "ok": False,
+                    },
+                    customer_name=contact_name,
+                    customer_contact=customer_contact,
+                    image_path=image_path,
+                    original_message=latest_message,
+                )
+            elif copilot_analysis.get("parse_warning"):
+                print(
+                    f"⚠️ Copilot parse warning (continuing RFQ): "
+                    f"{copilot_analysis.get('parse_warning')}"
+                )
+            reply = (
+                "Hi, I received your photo but could not read the product details clearly enough to quote.\n\n"
+                "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
+                "150-C25NBD Qty:3"
             )
         elif image_analysis:
             reply = (
@@ -3974,6 +4818,8 @@ def process_customer_inquiry(
             context=f"{image_prefix}NO_ITEMS",
             customer_chat_is_open=True,
             classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_items,
         )
         append_log(
             contact_name,
@@ -3991,9 +4837,22 @@ def process_customer_inquiry(
             f"Price: {row.get('price')} | LT: {row.get('lt')} | Brand: {row.get('brand')}"
         )
 
+    photo_confirmation = ""
+    if image_path and copilot_items:
+        photo_confirmation = build_photo_confirmation_line(copilot_items)
+
+    if unified_analyze_ran:
+        ai_research = (
+            copilot_technical_summary
+            or str((copilot_analysis or {}).get("analysis_text") or "").strip()
+        )
+    else:
+        ai_research = copilot_technical_summary or build_ai_research_summary(formatted_rows)
+
     customer_reply = build_plain_quotation_reply(
         formatted_rows,
-        ai_research=build_ai_research_summary(formatted_rows),
+        ai_research=ai_research,
+        photo_confirmation=photo_confirmation,
     )
     sent = send_customer_reply(
         driver,
@@ -4004,6 +4863,8 @@ def process_customer_inquiry(
         context=f"{image_prefix}QUOTATION_REPLY",
         customer_chat_is_open=True,
         classification_summary=classification_summary,
+        image_path=image_path,
+        copilot_items=copilot_items,
     )
 
     if tbc_by_brand:
@@ -4042,10 +4903,13 @@ def process_classified_non_inquiry(
     customer_contact=None,
     image_analysis=None,
     document_items=None,
+    image_path=None,
+    copilot_items=None,
 ):
     """Handle non-RFQ intents with appropriate acknowledgement while learning in background."""
     customer_contact = customer_contact or contact_name
     handler = classification.handler
+    image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
     reply = classification.suggested_reply or (
         "Hi, thank you for your message.\n\nOur team will review and respond shortly."
     )
@@ -4084,6 +4948,19 @@ def process_classified_non_inquiry(
         )
         return
 
+    if handler == "technical_support":
+        copilot_reply = build_technical_support_reply(
+            latest_message,
+            image_path=image_path,
+            copilot_items=copilot_items or None,
+        )
+        if copilot_reply:
+            reply = copilot_reply
+            context = "TECHNICAL_SUPPORT_COPILOT"
+            print("🧠 Copilot technical support reply generated.")
+        else:
+            print("⚠️ Copilot technical support unavailable — using default acknowledgement.")
+
     sent = send_customer_reply(
         driver,
         reply,
@@ -4116,9 +4993,12 @@ def process_open_chat(driver):
     if not acquire_chat_processing_lock(raw_contact_name or "open-chat"):
         return
 
+    set_busy("whatsapp", "processing_chat", raw_contact_name or "")
     try:
         _process_open_chat_body(driver, raw_contact_name)
     finally:
+        clear_busy()
+        flip_channel_turn()
         release_chat_processing_lock()
 
 
@@ -4137,7 +5017,8 @@ def _process_open_chat_body(driver, raw_contact_name):
                 "ℹ️ No incoming customer messages in this chat lookback window. "
                 "OpenClaw ignores outgoing bubbles (messages sent FROM this WhatsApp account)."
             )
-        plan = plan_sequential_units(units, raw_contact_name)
+        store_key = contact_store_key(raw_contact_name)
+        plan = plan_sequential_units(units, store_key, raw_contact_name)
         bubble = plan[-1]["container"] if plan else None
 
         if not plan:
@@ -4165,6 +5046,7 @@ def _process_open_chat_body(driver, raw_contact_name):
         media_info = payload["media_info"]
         document_items = payload["document_items"]
         copilot_items = payload["copilot_items"]
+        copilot_analysis = payload.get("copilot_analysis") or {}
         enrichment = payload.get("enrichment") or {}
 
         if media_info.media_type == "voice" and not voice_ok and not enrichment.get("transcript"):
@@ -4230,76 +5112,90 @@ def _process_open_chat_body(driver, raw_contact_name):
         print(repr(inquiry_text))
         print("=" * 90)
 
-        classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
+        if copilot_analysis.get("attempted"):
+            classification = classification_from_copilot_analysis(copilot_analysis, media_info=media_info)
+            if copilot_analysis.get("items"):
+                copilot_items = copilot_analysis["items"]
+            print(
+                f"🧠 Using Copilot-first classification: {classification.intent} "
+                f"({classification.confidence:.0%}) | ok={copilot_analysis.get('ok')}"
+            )
+            if is_equivalent_support_request(inquiry_text):
+                classification.intent = "technical_support"
+                classification.handler = "technical_support"
+                classification.confidence = max(classification.confidence, 0.93)
+                classification.reasoning = (
+                    "Equivalent/replacement request — technical support, not RFQ quotation."
+                )
+                print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
+        else:
+            classification = classify_whatsapp_message(inquiry_text or "(voice inquiry)", media_info=media_info)
+            if is_equivalent_support_request(inquiry_text):
+                classification.intent = "technical_support"
+                classification.handler = "technical_support"
+                classification.confidence = max(classification.confidence, 0.93)
+                classification.reasoning = (
+                    "Equivalent/replacement request — technical support, not RFQ quotation."
+                )
+                print("🔧 Equivalent/replacement detected — forcing technical_support handler.")
+
+        classification = apply_rfq_routing_overrides(
+            classification,
+            message_text=inquiry_text,
+            media_info=media_info,
+            image_path=image_path,
+            copilot_items=copilot_items,
+            copilot_analysis=copilot_analysis,
+            transcript=enrichment.get("transcript") or "",
+            document_items=document_items,
+            document_text=enrichment.get("document_text") or "",
+        )
         if media_info.media_type == "voice":
             classification.media_type = "voice"
             if classification.media_info is not None:
                 classification.media_info.media_type = "voice"
                 classification.media_info.has_voice = True
                 classification.media_info.has_image = False
-        if (
-            classification.intent in ("unknown", "greeting", "general_chat")
-            and (document_items or enrichment.get("document_text") or media_info.media_type == "pdf")
-        ):
-            classification.intent = "purchase_order"
-            classification.confidence = max(classification.confidence, 0.9)
-            classification.handler = "purchase_order"
-            classification.reasoning = "PDF/PO document content detected after attachment extraction."
-            classification.suggested_reply = (
-                "Hi, thank you for sending your purchase order.\n\n"
-                "Our team is reviewing the document and will confirm shortly."
-            )
-        if copilot_items and classification.intent in ("unknown", "general_chat"):
-            classification.intent = "rfq_inquiry"
-            classification.handler = "rfq_inquiry"
-            classification.confidence = max(classification.confidence, 0.85)
-            if enrichment.get("transcript"):
-                classification.reasoning = "Parts extracted from voice transcript."
-            elif image_path:
-                classification.reasoning = "Parts extracted from customer photo."
-            else:
-                classification.reasoning = "Parts extracted from customer message."
-        if enrichment.get("transcript") and classification.handler in (
-            "monitor_only", "voice_note", "unknown", "general_chat"
-        ):
-            classification.intent = "rfq_inquiry"
-            classification.handler = "rfq_inquiry"
-            classification.confidence = max(classification.confidence, 0.85)
-            classification.reasoning = "Voice note transcribed — processing as inquiry."
-        if (
-            (image_path or getattr(media_info, "has_image", False))
-            and classification.intent in ("unknown", "general_chat", "greeting")
-            and getattr(media_info, "media_type", "") != "voice"
-        ):
-            classification.intent = "rfq_inquiry"
-            classification.handler = "rfq_inquiry"
-            classification.confidence = max(classification.confidence, 0.85)
-            classification.reasoning = "Customer photo inquiry detected."
         log_classification(contact_name, customer_contact, inquiry_text, classification)
 
         if re.search(r"WA-\d{8}-[A-Z0-9]+-[A-Z0-9]+", inquiry_text, re.I):
-            send_classification_alert(driver, contact_name, customer_contact, inquiry_text, classification)
+            send_classification_alert(
+                driver, contact_name, customer_contact, inquiry_text, classification,
+                image_path=image_path, copilot_items=copilot_items,
+            )
             process_supplier_reply(driver, contact_name, inquiry_text)
             return
 
         if classification.handler == "supplier_reply":
-            send_classification_alert(driver, contact_name, customer_contact, inquiry_text, classification)
+            send_classification_alert(
+                driver, contact_name, customer_contact, inquiry_text, classification,
+                image_path=image_path, copilot_items=copilot_items,
+            )
             process_supplier_reply(driver, contact_name, inquiry_text)
             return
 
         if classification.handler == "skip":
-            send_classification_alert(driver, contact_name, customer_contact, inquiry_text, classification)
+            send_classification_alert(
+                driver, contact_name, customer_contact, inquiry_text, classification,
+                image_path=image_path, copilot_items=copilot_items,
+            )
             process_classified_non_inquiry(
                 driver, contact_name, inquiry_text, classification,
                 customer_contact=customer_contact, image_analysis=image_analysis,
                 document_items=document_items,
+                image_path=image_path,
+                copilot_items=copilot_items,
             )
             return
 
         if classification.handler == "rfq_inquiry" or (
             classification.handler == "purchase_order"
             and (document_items or image_analysis or media_info.media_type == "pdf")
-        ) or (enrichment.get("transcript") and inquiry_text):
+        ) or (
+            enrichment.get("transcript")
+            and inquiry_text
+            and not is_equivalent_support_request(inquiry_text)
+        ):
             process_customer_inquiry(
                 driver,
                 contact_name,
@@ -4308,8 +5204,14 @@ def _process_open_chat_body(driver, raw_contact_name):
                 customer_contact=customer_contact,
                 classification=classification,
                 document_items=document_items,
-                pre_extracted_copilot_items=copilot_items or None,
+                pre_extracted_copilot_items=(
+                    copilot_analysis.get("items", []) if copilot_analysis else copilot_items
+                ),
                 voice_enrichment=enrichment,
+                image_path=image_path,
+                copilot_technical_summary=copilot_analysis.get("technical_summary") or "",
+                unified_analyze_ran=bool(copilot_analysis.get("attempted")),
+                copilot_analysis=copilot_analysis,
             )
             return
 
@@ -4321,9 +5223,16 @@ def _process_open_chat_body(driver, raw_contact_name):
             customer_contact=customer_contact,
             image_analysis=image_analysis,
             document_items=document_items,
+            image_path=image_path,
+            copilot_items=copilot_items,
         )
     finally:
-        finalize_chat_processing(contact_name, plan, voice_ok=voice_ok)
+        finalize_chat_processing(
+            contact_name,
+            plan,
+            voice_ok=voice_ok,
+            contact_hint=raw_contact_name,
+        )
 
 
 def _process_open_chat_legacy_removed(driver):
@@ -4611,61 +5520,79 @@ def save_last_processed_store(store):
 def build_plan_fingerprint(plan):
     parts = []
     for unit in plan or []:
+        data_id = str(unit.get("data_id") or "").strip()
+        if data_id:
+            parts.append(f"id:{data_id}")
+            continue
         parts.append(
-            f"{unit.get('data_id') or ''}|{unit.get('kind') or ''}|"
+            f"{unit.get('incoming_index') or ''}|{unit.get('kind') or ''}|"
             f"{(unit.get('text') or '')[:80]}"
         )
     return "||".join(parts)
 
 
-def build_process_fingerprint(units, contact_name: str = ""):
-    plan = plan_sequential_units(units, contact_name)
+def build_process_fingerprint(units, contact_name: str = "", contact_hint: str = ""):
+    plan = plan_sequential_units(units, contact_name, contact_hint)
     return build_plan_fingerprint(plan)
 
 
-def finalize_chat_processing(contact_name, plan, voice_ok: bool = True):
+def finalize_chat_processing(contact_name, plan, voice_ok: bool = True, contact_hint: str = ""):
     if not plan:
+        clear_wa_attachment_workspace()
         return
     if not voice_ok:
         print(
             "⚠️ Voice message not saved/transcribed — NOT marking processed "
             "(will retry on next scan)"
         )
-        clear_wa_audio_workspace()
+        clear_wa_attachment_workspace()
         return
     fingerprint = build_plan_fingerprint(plan)
     data_ids = [str(u.get("data_id") or "").strip() for u in plan if u.get("data_id")]
-    mark_watch_contact_processed(contact_name, fingerprint, data_ids)
-    clear_wa_audio_workspace()
+    store_key = contact_store_key(contact_name, contact_hint)
+    mark_watch_contact_processed(store_key, fingerprint, data_ids)
+    clear_wa_attachment_workspace()
 
 
-def should_process_watch_contact(contact_name, fingerprint):
+def should_process_watch_contact(contact_name, fingerprint, plan=None, contact_hint: str = ""):
     if not fingerprint:
         return False
+    store_key = contact_store_key(contact_name, contact_hint)
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
-    prev = store.get(key)
-    if not prev:
-        return True
-    return prev.get("fingerprint") != fingerprint
+    prev = store.get(store_key)
+    if prev and prev.get("fingerprint") == fingerprint:
+        return False
+
+    processed_ids = get_processed_data_ids(store_key)
+    if plan and processed_ids:
+        units_with_ids = [
+            u for u in plan
+            if str(u.get("data_id") or "").strip()
+        ]
+        if units_with_ids and all(
+            str(u.get("data_id") or "").strip() in processed_ids for u in units_with_ids
+        ):
+            return False
+
+    return True
 
 
 def mark_watch_contact_processed(contact_name, fingerprint, data_ids=None):
     if not fingerprint and not data_ids:
         return
+    store_key = contact_store_key(contact_name)
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
-    prev = store.get(key) or {}
+    prev = store.get(store_key) or {}
     prev_ids = list(prev.get("processed_data_ids") or [])
     merged_ids = list(dict.fromkeys([*(data_ids or []), *prev_ids]))[:80]
-    store[key] = {
+    store[store_key] = {
         "fingerprint": fingerprint or prev.get("fingerprint") or "",
         "processed_at": now_iso(),
         "processed_data_ids": merged_ids,
     }
     save_last_processed_store(store)
     if data_ids:
-        print(f"✅ Marked {len(data_ids)} WhatsApp message(s) processed for {contact_name!r}")
+        print(f"✅ Marked {len(data_ids)} WhatsApp message(s) processed for {store_key!r}")
 
 
 def process_watched_contacts(driver, max_contacts: int = 1):
@@ -4699,20 +5626,20 @@ def process_watched_contacts(driver, max_contacts: int = 1):
         raw_contact_name = get_contact_name_from_open_chat(driver)
         units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
         contact_name = raw_contact_name or contact_hint
-        plan = plan_sequential_units(units, contact_name)
+        store_key = contact_store_key(contact_name, contact_hint)
+        plan = plan_sequential_units(units, contact_name, contact_hint)
         if not plan:
             print(f"   ℹ️ {contact_name}: no new unprocessed incoming messages")
             continue
 
         fingerprint = build_plan_fingerprint(plan)
 
-        if not should_process_watch_contact(contact_name, fingerprint):
+        if not should_process_watch_contact(contact_name, fingerprint, plan=plan, contact_hint=contact_hint):
             print(f"   ℹ️ {contact_name}: already processed latest incoming cluster")
             continue
 
         print(f"   🆕 {contact_name}: new incoming detected — processing now")
         process_open_chat(driver)
-        mark_watch_contact_processed(contact_name, fingerprint)
         processed_any = True
         print("↩️ Returning to WhatsApp chat list after watch contact...")
         ensure_on_chat_list(driver)
@@ -4820,9 +5747,12 @@ def watch_unread_with_existing_driver(driver):
 
     if not unread_rows:
         print("✅ No unread WhatsApp chats found.")
-        if process_watched_contacts(driver, max_contacts=1):
+        if watch_read_contacts_enabled() and process_watched_contacts(driver, max_contacts=1):
             return
-        print('ℹ️ To force-process a read chat: uv run python whatsapp_inbox_watcher.py process "Stephen"')
+        print(
+            'ℹ️ To force-process a read chat: uv run python whatsapp_inbox_watcher.py process "Stephen"\n'
+            'ℹ️ To disable read-chat polling: set OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS=0'
+        )
         return
 
     row = unread_rows[0]
@@ -4834,13 +5764,6 @@ def watch_unread_with_existing_driver(driver):
         return
 
     process_open_chat(driver)
-
-    try:
-        contact_name = get_contact_name_from_open_chat(driver)
-        units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
-        mark_watch_contact_processed(contact_name, build_process_fingerprint(units, contact_name))
-    except Exception:
-        pass
 
     print("↩️ Returning to WhatsApp chat list after completed chat...")
     ensure_on_chat_list(driver)
@@ -4859,9 +5782,20 @@ def run_persistent_watcher():
 
         while True:
             try:
+                if is_busy():
+                    wait_until_idle(poll_seconds=CHECK_INTERVAL_SECONDS, label="whatsapp-watcher")
+                    continue
+                if not is_channel_turn("whatsapp"):
+                    throttled_log(
+                        "whatsapp-not-turn",
+                        f"⏸️ Not WhatsApp turn (current={get_channel_turn()}) — waiting...",
+                    )
+                    time.sleep(CHECK_INTERVAL_SECONDS)
+                    continue
+
                 print("")
                 print("=" * 90)
-                print(f"🔁 New WhatsApp scan cycle @ {now_iso()}")
+                print(f"🔁 WhatsApp scan cycle @ {now_iso()}")
 
                 watch_unread_with_existing_driver(driver)
 
@@ -4886,7 +5820,6 @@ def run_persistent_watcher():
 
                     driver = init_driver()
 
-            print(f"⏳ Sleeping {CHECK_INTERVAL_SECONDS} seconds...")
             time.sleep(CHECK_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
