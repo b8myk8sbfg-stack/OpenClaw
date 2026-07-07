@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.33-COPILOT-SINGLE-PASS"
+VERSION = "v1.34-COPILOT-SINGLE-PASS"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -120,9 +120,13 @@ Tasks:
 
 Image guidance:
 - Photo + short caption (e.g. "quote me 1 pc") usually shows ONE product — the item held in hand or closest to the camera.
-- Ignore background wiring, terminal blocks, and panel equipment unless the customer is clearly quoting those.
+- The customer's inquiry is almost always the foreground object they are showing you, NOT equipment mounted behind it.
+- If someone holds a small labelled item in front of a control panel, quote the held item's label only.
+- Ignore background wiring, terminal blocks, timers, and panel nameplates unless the customer is clearly quoting those.
 - RFQ/enquiry tables: read only rows visible in the image; count rows; do not invent extra line items.
 - Equivalent/replacement requests: intent=technical_support unless they also ask for price/quote.
+
+In reasoning, state which label you quoted and which background labels you ignored.
 
 Return plain-text analysis first. Include:
 - What product is in the foreground (what the customer is quoting)
@@ -487,6 +491,19 @@ def analyze_incoming_inquiry_with_copilot(
             parsed, message_text=message_text, voice_transcript=voice_transcript
         )
 
+        visual = parsed.get("visual_analysis") or {}
+        if isinstance(visual, dict):
+            fg = str(visual.get("foreground_subject") or "").strip()
+            trans = str(visual.get("label_transcription") or "").strip()
+            ignored = str(visual.get("background_ignored") or "").strip()
+            if trans:
+                reasoning = f"Copilot label read: {trans}"
+            elif fg:
+                reasoning = f"Copilot foreground: {fg}"
+            if ignored and reasoning:
+                reasoning = f"{reasoning} (ignored background: {ignored})"
+            elif ignored:
+                reasoning = f"Copilot ignored background: {ignored}"
 
         if _is_equivalent_support_request(message_text):
             intent = "technical_support"

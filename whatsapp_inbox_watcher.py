@@ -38,6 +38,7 @@ from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
 from openclaw_main import (
+    VERSION as OPENCLAW_ENGINE_VERSION,
     analyze_incoming_inquiry_with_copilot,
     build_ai_research_summary,
     build_photo_confirmation_line,
@@ -4221,6 +4222,7 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
                         classification_summary=None, image_path=None, copilot_items=None):
     lines = [
         "[OpenClaw Monitor Mode]",
+        f"Engine: {OPENCLAW_ENGINE_VERSION}",
         f"Context: {context or 'Customer reply'}",
         f"Customer: {customer_name or '-'}",
     ]
