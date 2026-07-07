@@ -376,8 +376,16 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
     for selector in voice_selectors:
         try:
             if bubble_for_scan.find_elements(By.CSS_SELECTOR, selector):
-                if selector == "canvas" and bubble_for_scan.find_elements(By.CSS_SELECTOR, '[data-testid="video-thumb"]'):
-                    continue
+                if selector == "canvas":
+                    if bubble_for_scan.find_elements(
+                        By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
+                    ):
+                        continue
+                    if bubble_for_scan.find_elements(
+                        By.CSS_SELECTOR,
+                        '[data-testid="image-thumb"], [data-testid="media-url-provider"]',
+                    ):
+                        continue
                 info.has_voice = True
                 info.raw_indicators.append(f"voice:{selector}")
                 break
@@ -479,9 +487,12 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
         info.media_type = _guess_media_from_filename(info.filename)
         return info
 
+    if info.has_voice and info.has_image:
+        info.has_voice = False
+        info.raw_indicators.append("image:overrides-false-voice")
+
     if info.has_voice:
         info.media_type = "voice"
-        info.has_image = False
     elif info.has_document:
         info.media_type = _guess_media_from_filename(info.filename)
     elif info.has_video:

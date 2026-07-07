@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.27-LABEL-FOCUS-OVERRIDE"
+VERSION = "v1.28-RFQ-TABLE-FOCUS-OVERRIDE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -234,15 +234,18 @@ RFQ_TABLE_FOCUS_PROMPT = """NEW INQUIRY
 Analyze ONLY the attached RFQ / enquiry table image.
 Do NOT use information from previous conversations.
 
-The WhatsApp caption may only say "please quote". All part numbers are IN THIS IMAGE.
+The WhatsApp caption may only say "MORNING MS AMEERA PLS QUOTE". All part numbers are IN THIS IMAGE.
 
 Read every table row (columns: No, Item, Picture, Qty):
-- part_no from the Item column and/or the product label in the Picture column
-- qty from the Qty column
+- part_no from the Item column text AND any product label/nameplate in the Picture column
+- qty from the Qty column (read the number exactly)
 - brand from Item text or the nameplate (e.g. ALLEN-BRADLEY, OMRON)
 
-Example: Allen-Bradley Soft Starter 150-C25NBD, Qty 3
+Example: Allen-Bradley Soft Starter Model 150-C25NBD, Qty 3
 → part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
+
+NEVER return E3Z-T61, E2E-X5E1, or ER6C unless those exact codes appear in the table or product photo.
+Do NOT guess Omron sensors from unrelated context — read only what is printed in the RFQ table.
 
 Return plain-text analysis, then on the last line only append JSON (no markdown):
 {"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
@@ -283,12 +286,25 @@ def _is_single_product_photo_inquiry(message_text: str) -> bool:
     )
 
 
-def _should_run_rfq_table_focus(message_text: str = "", analysis_text: str = "") -> bool:
-    """RFQ table focus only for table-style quote requests — not single label photos."""
+def _is_rfq_table_inquiry(message_text: str) -> bool:
+    """True for RFQ table photos (PLS QUOTE / MORNING MS) — not single label photos."""
     if _is_single_product_photo_inquiry(message_text):
         return False
+    text = str(message_text or "").upper()
+    return bool(
+        re.search(
+            r"\b(PLS QUOTE|KINDLY QUOTE|MORNING MS|RFQ|ENQUIRY TABLE)\b",
+            text,
+        )
+    )
+
+
+def _should_run_rfq_table_focus(message_text: str = "", analysis_text: str = "") -> bool:
+    """RFQ table focus only for table-style quote requests — not single label photos."""
+    if _is_rfq_table_inquiry(message_text):
+        return True
     blob = f"{message_text}\n{analysis_text}".upper()
-    return bool(re.search(r"\b(PLS QUOTE|KINDLY QUOTE|MORNING MS|RFQ|QTY\s*3)\b", blob))
+    return bool(re.search(r"\b(RFQ|QTY\s*3|ENQUIRY TABLE)\b", blob))
 
 
 def _normalize_part_key(part_no: str) -> str:
@@ -545,17 +561,17 @@ def _copilot_label_focus_pass(
     message_text: str = "",
     image_path: str = None,
     voice_transcript: str = "",
-) -> list:
+) -> tuple:
     """Fresh Copilot call to read a single product label/nameplate (battery, timer, etc.)."""
     if not image_path or not os.path.exists(image_path):
-        return []
+        return [], ""
 
     from whatsapp_attachment_processor import validate_image_file
 
     ok_img, reason = validate_image_file(image_path)
     if not ok_img:
         print(f"[COPILOT LABEL] Skipping focus pass — invalid image: {reason}")
-        return []
+        return [], ""
 
     parts = [LABEL_FOCUS_PROMPT]
     if message_text:
@@ -571,16 +587,16 @@ def _copilot_label_focus_pass(
         )
         raw = (response.choices[0].message.content or "").strip()
         print(f"[COPILOT LABEL RAW] {raw[:400]}")
-        _prose, parsed = _extract_json_from_copilot_text(raw)
+        prose, parsed = _extract_json_from_copilot_text(raw)
         if not isinstance(parsed, dict):
-            return []
+            return [], prose
         items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
         if items:
             print(f"[COPILOT LABEL] Extracted {len(items)} item(s) from label focus pass")
-        return items
+        return items, prose
     except Exception as exc:
         print(f"[WARN] Copilot label focus pass failed: {exc}")
-        return []
+        return [], ""
 
 
 def _copilot_rfq_table_focus_pass(
@@ -588,17 +604,17 @@ def _copilot_rfq_table_focus_pass(
     message_text: str = "",
     image_path: str = None,
     voice_transcript: str = "",
-) -> list:
+) -> tuple:
     """Fresh Copilot call focused on reading RFQ table rows from the image only."""
     if not image_path or not os.path.exists(image_path):
-        return []
+        return [], ""
 
     from whatsapp_attachment_processor import validate_image_file
 
     ok_img, reason = validate_image_file(image_path)
     if not ok_img:
         print(f"[COPILOT RFQ TABLE] Skipping focus pass — invalid image: {reason}")
-        return []
+        return [], ""
 
     parts = [RFQ_TABLE_FOCUS_PROMPT]
     if message_text:
@@ -615,16 +631,16 @@ def _copilot_rfq_table_focus_pass(
         )
         raw = (response.choices[0].message.content or "").strip()
         print(f"[COPILOT RFQ TABLE RAW] {raw[:400]}")
-        _prose, parsed = _extract_json_from_copilot_text(raw)
+        prose, parsed = _extract_json_from_copilot_text(raw)
         if not isinstance(parsed, dict):
-            return []
+            return [], prose
         items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
         if items:
             print(f"[COPILOT RFQ TABLE] Extracted {len(items)} item(s) from table focus pass")
-        return items
+        return items, prose
     except Exception as exc:
         print(f"[WARN] Copilot RFQ table focus pass failed: {exc}")
-        return []
+        return [], ""
 
 
 def analyze_incoming_inquiry_with_copilot(
@@ -747,9 +763,10 @@ def analyze_incoming_inquiry_with_copilot(
             parsed, message_text=message_text, voice_transcript=voice_transcript
         )
 
+        focus_prose = ""
         if image_path and os.path.exists(image_path):
             if _is_single_product_photo_inquiry(message_text):
-                label_items = _copilot_label_focus_pass(
+                label_items, label_prose = _copilot_label_focus_pass(
                     client,
                     message_text=message_text,
                     image_path=image_path,
@@ -764,10 +781,32 @@ def analyze_incoming_inquiry_with_copilot(
                             f"{items_out[0].get('part_no')} → {label_items[0].get('part_no')}"
                         )
                     items_out = label_items
+                    focus_prose = label_prose
                     for item in items_out:
                         item["source"] = "COPILOT_LABEL"
                 elif not items_out:
                     print("[COPILOT ANALYZE] Label focus returned no items — keeping first pass")
+            elif _is_rfq_table_inquiry(message_text):
+                table_items, table_prose = _copilot_rfq_table_focus_pass(
+                    client,
+                    message_text=message_text,
+                    image_path=image_path,
+                    voice_transcript=voice_transcript,
+                )
+                if table_items:
+                    first_key = _normalize_part_key((items_out[0] or {}).get("part_no"))
+                    table_key = _normalize_part_key(table_items[0].get("part_no"))
+                    if items_out and first_key != table_key:
+                        print(
+                            f"[COPILOT ANALYZE] RFQ table focus overrides first pass: "
+                            f"{items_out[0].get('part_no')} → {table_items[0].get('part_no')}"
+                        )
+                    items_out = table_items
+                    focus_prose = table_prose
+                    for item in items_out:
+                        item["source"] = "COPILOT_RFQ_TABLE"
+                elif not items_out:
+                    print("[COPILOT ANALYZE] RFQ table focus returned no items — keeping first pass")
             elif _items_need_label_reverify(items_out, message_text):
                 print(
                     "[COPILOT ANALYZE] Sensor-like guess on single-product photo — "
@@ -777,23 +816,35 @@ def analyze_incoming_inquiry_with_copilot(
 
             if not items_out:
                 if _should_run_rfq_table_focus(message_text, analysis_text):
-                    items_out = _copilot_rfq_table_focus_pass(
+                    table_items, table_prose = _copilot_rfq_table_focus_pass(
                         client,
                         message_text=message_text,
                         image_path=image_path,
                         voice_transcript=voice_transcript,
                     )
+                    items_out = table_items
+                    focus_prose = table_prose or focus_prose
                     for item in items_out:
                         item["source"] = "COPILOT_RFQ_TABLE"
                 elif not _is_single_product_photo_inquiry(message_text):
-                    items_out = _copilot_label_focus_pass(
+                    label_items, label_prose = _copilot_label_focus_pass(
                         client,
                         message_text=message_text,
                         image_path=image_path,
                         voice_transcript=voice_transcript,
                     )
+                    items_out = label_items
+                    focus_prose = label_prose or focus_prose
                     for item in items_out:
                         item["source"] = "COPILOT_LABEL"
+
+        if focus_prose:
+            technical_summary = _sanitize_whatsapp_reply(focus_prose[:800])
+            part_list = ", ".join(
+                str(item.get("part_no") or "") for item in items_out if item.get("part_no")
+            )
+            if part_list:
+                reasoning = f"Focus pass read from image: {part_list}"
 
         result = {
             "attempted": True,

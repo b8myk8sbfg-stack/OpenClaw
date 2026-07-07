@@ -71,7 +71,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.49-MONITOR-IMAGE-SEND-FIX"
+VERSION = "v3.50-IMAGE-BEATS-VOICE-FIX"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -2331,6 +2331,8 @@ def scrape_incoming_units_js(driver, lookback=6):
             "incoming_index": incoming_index,
             "kind": kind,
             "text": text,
+            "has_image": bool(item.get("hasImage")),
+            "has_voice": bool(item.get("hasVoice")),
         })
         print(
             f"   📩 JS unit: kind={kind} idx={incoming_index} data_id={data_id[:24]!r} "
@@ -2744,10 +2746,14 @@ def bubble_contains_image(bubble):
 
 
 def container_has_image(container):
-    """Detect image messages — requires a real image thumb, not just media-caption."""
-    if container is None or container_has_voice(container):
+    """Detect image messages — real image thumb wins over false PTT markers."""
+    if container is None:
         return False
-    return container_has_real_image(container)
+    if container_has_real_image(container):
+        return True
+    if container_has_voice(container):
+        return False
+    return False
 
 
 def find_image_container_js(driver, lookback=8):
@@ -2849,6 +2855,8 @@ def classify_incoming_unit(container):
     text = extract_text_from_message_container(container)
     if is_bot_noise_message(text):
         return "empty", ""
+    if container_has_real_image(container):
+        return "image", text
     if container_has_voice(container):
         if is_bot_noise_message(text) or (len(text) > 120 and "OpenClaw" in text):
             return "empty", ""
@@ -3020,7 +3028,15 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             pass
 
         if kind == "image":
-            if container is not None and container_has_voice(container):
+            has_real_image = (
+                unit.get("has_image")
+                or (container is not None and container_has_real_image(container))
+            )
+            if (
+                not has_real_image
+                and container is not None
+                and container_has_voice(container)
+            ):
                 kind = "voice"
                 unit["kind"] = "voice"
                 print("   🎤 Reclassified image → voice (PTT bubble detected)")
