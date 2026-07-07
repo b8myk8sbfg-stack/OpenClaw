@@ -55,7 +55,7 @@ def is_equivalent_support_request(message_text: str) -> bool:
         return False
     return True
 
-VERSION = "v1.07-VOICE-VS-IMAGE-BALANCE"
+VERSION = "v1.08-VOICE-BEFORE-AVATAR-BLOB"
 
 VOICE_NOTE_SELECTORS = (
     '[data-testid="audio-play"]',
@@ -115,8 +115,45 @@ def is_voice_duration_line(line: str) -> bool:
     return bool(re.match(r"^\d{1,2}:[0-5]\d(\s*[×xX])?$", text))
 
 
+def bubble_has_explicit_voice_ui(bubble) -> bool:
+    """True when bubble has PTT/play/audio controls (not just a profile avatar)."""
+    bubble_for_scan = _resolve_message_bubble(bubble)
+    if bubble_for_scan is None:
+        return False
+    from selenium.webdriver.common.by import By as _By
+
+    try:
+        if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(VOICE_NOTE_SELECTORS)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if bubble_for_scan.find_elements(
+            _By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
+        ):
+            return False
+        bubble_text = (bubble_for_scan.text or "").strip()
+        if len(bubble_text) > 100:
+            return False
+        lines = [ln.strip() for ln in bubble_text.splitlines() if ln.strip()]
+        if any(is_voice_duration_line(ln) for ln in lines):
+            if bubble_for_scan.find_elements(
+                _By.CSS_SELECTOR, ", ".join(VOICE_WAVEFORM_SELECTORS)
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def bubble_has_photo_attachment(bubble) -> bool:
     """True for WhatsApp photo/RFQ image bubbles — not bare voice notes."""
+    if bubble is None:
+        return False
+    if bubble_has_explicit_voice_ui(bubble):
+        return False
+
     bubble_for_scan = _resolve_message_bubble(bubble)
     if bubble_for_scan is None:
         return False
@@ -147,27 +184,17 @@ def bubble_has_photo_attachment(bubble) -> bool:
 
 def bubble_looks_like_voice_note(bubble) -> bool:
     """True for WhatsApp voice/PTT bubbles (waveform + duration), not photo attachments."""
-    if bubble is None or bubble_has_photo_attachment(bubble):
+    if bubble is None:
+        return False
+    if bubble_has_explicit_voice_ui(bubble):
+        return True
+    if bubble_has_photo_attachment(bubble):
         return False
 
     bubble_for_scan = _resolve_message_bubble(bubble)
     if bubble_for_scan is None:
         return False
     from selenium.webdriver.common.by import By as _By
-
-    try:
-        if bubble_for_scan.find_elements(_By.CSS_SELECTOR, ", ".join(VOICE_NOTE_SELECTORS)):
-            return True
-    except Exception:
-        pass
-
-    try:
-        if bubble_for_scan.find_elements(
-            _By.CSS_SELECTOR, '[data-testid="video-thumb"], video[src]'
-        ):
-            return False
-    except Exception:
-        pass
 
     try:
         bubble_text = (bubble_for_scan.text or "").strip()
@@ -623,7 +650,9 @@ def detect_bubble_media(bubble, caption_text: str = "") -> MediaInfo:
         return info
 
     if info.has_voice and info.has_image:
-        if bubble_looks_like_voice_note(bubble_for_scan):
+        if bubble_has_explicit_voice_ui(bubble_for_scan) or bubble_looks_like_voice_note(
+            bubble_for_scan
+        ):
             info.has_image = False
             info.raw_indicators.append("voice:overrides-avatar-blob")
         elif bubble_has_photo_attachment(bubble_for_scan):

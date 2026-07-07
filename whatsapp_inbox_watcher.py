@@ -47,6 +47,7 @@ from openclaw_main import (
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     apply_rfq_routing_overrides,
+    bubble_has_explicit_voice_ui,
     bubble_has_photo_attachment,
     bubble_looks_like_voice_note,
     build_classification_monitor_message,
@@ -74,7 +75,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.53-VOICE-VS-IMAGE-BALANCE"
+VERSION = "v3.54-VOICE-BEFORE-AVATAR-BLOB"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -1829,16 +1830,29 @@ function isPlaybackSpeed(text) {
     return /^\\d+(?:\\.\\d+)?\\s*[×xX]$/.test(String(text || '').trim());
 }
 
+function isSmallAvatarImg(img) {
+    const w = img.naturalWidth || img.clientWidth || 0;
+    const h = img.naturalHeight || img.clientHeight || 0;
+    if (w > 0 && h > 0 && w <= 100 && h <= 100) return true;
+    const src = (img.getAttribute('src') || '').toLowerCase();
+    return src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile');
+}
+
 function hasRealImage(container) {
+    if (hasExplicitVoiceUi(container)) return false;
+    if (hasVoiceDurationLine(container) && container.querySelector(
+        'canvas, [data-icon="audio-play"], [data-icon="ptt"]'
+    )) {
+        return false;
+    }
     const imgs = container.querySelectorAll(
         '[data-testid="image-thumb"], [data-testid="media-url-provider"], '
         + 'img[src*="blob"]:not([src*="emoji"]), img[src*="mmg"], img[src*="cdn.whatsapp"]'
     );
     for (const img of imgs) {
+        if (isSmallAvatarImg(img)) continue;
         const src = (img.getAttribute('src') || '').toLowerCase();
-        if (src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile')) {
-            continue;
-        }
+        if (src.includes('emoji')) continue;
         return true;
     }
     return false;
@@ -1875,10 +1889,7 @@ function hasPhotoAttachment(container) {
 }
 
 function hasVoice(container) {
-    if (hasPhotoAttachment(container)) return false;
     if (hasExplicitVoiceUi(container)) return true;
-    const text = extractText(container);
-    if (text.length > 100) return false;
     if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
         return false;
     }
@@ -1888,6 +1899,7 @@ function hasVoice(container) {
     )) {
         return true;
     }
+    if (hasPhotoAttachment(container)) return false;
     return false;
 }
 
@@ -2010,16 +2022,29 @@ function isPlaybackSpeed(text) {
     return /^\\d+(?:\\.\\d+)?\\s*[×xX]$/.test(String(text || '').trim());
 }
 
+function isSmallAvatarImg(img) {
+    const w = img.naturalWidth || img.clientWidth || 0;
+    const h = img.naturalHeight || img.clientHeight || 0;
+    if (w > 0 && h > 0 && w <= 100 && h <= 100) return true;
+    const src = (img.getAttribute('src') || '').toLowerCase();
+    return src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile');
+}
+
 function hasRealImage(container) {
+    if (hasExplicitVoiceUi(container)) return false;
+    if (hasVoiceDurationLine(container) && container.querySelector(
+        'canvas, [data-icon="audio-play"], [data-icon="ptt"]'
+    )) {
+        return false;
+    }
     const imgs = container.querySelectorAll(
         '[data-testid="image-thumb"], [data-testid="media-url-provider"], '
         + 'img[src*="blob"]:not([src*="emoji"]), img[src*="mmg"], img[src*="cdn.whatsapp"]'
     );
     for (const img of imgs) {
+        if (isSmallAvatarImg(img)) continue;
         const src = (img.getAttribute('src') || '').toLowerCase();
-        if (src.includes('pps.whatsapp') || src.includes('avatar') || src.includes('profile')) {
-            continue;
-        }
+        if (src.includes('emoji')) continue;
         return true;
     }
     return false;
@@ -2056,10 +2081,7 @@ function hasPhotoAttachment(container) {
 }
 
 function hasVoice(container) {
-    if (hasPhotoAttachment(container)) return false;
     if (hasExplicitVoiceUi(container)) return true;
-    const text = extractText(container);
-    if (text.length > 100) return false;
     if (container.querySelector('[data-testid="video-thumb"], video[src]')) {
         return false;
     }
@@ -2069,6 +2091,7 @@ function hasVoice(container) {
     )) {
         return true;
     }
+    if (hasPhotoAttachment(container)) return false;
     return false;
 }
 
@@ -2336,17 +2359,18 @@ def scrape_incoming_units_js(driver, lookback=6):
         if container is not None:
             js_image = bool(item.get("hasImage"))
             js_voice = bool(item.get("hasVoice"))
+            explicit_voice = bubble_has_explicit_voice_ui(container)
+            looks_voice = bubble_looks_like_voice_note(container)
             has_photo = bubble_has_photo_attachment(container)
-            if has_photo or (js_image and not js_voice):
-                py_kind, py_text = classify_incoming_unit(container)
-                kind = py_kind if py_kind != "empty" else "image"
-                if py_text:
-                    text = normalize_unit_text(py_text)
-            elif js_voice or (
-                bubble_looks_like_voice_note(container) and not has_photo
-            ):
+
+            if js_voice or explicit_voice or looks_voice:
                 kind = "voice"
                 _py_kind, py_text = classify_incoming_unit(container)
+                if py_text:
+                    text = normalize_unit_text(py_text)
+            elif has_photo or js_image:
+                py_kind, py_text = classify_incoming_unit(container)
+                kind = py_kind if py_kind != "empty" else "image"
                 if py_text:
                     text = normalize_unit_text(py_text)
             else:
@@ -2857,6 +2881,8 @@ def container_has_real_image(container):
 def container_has_voice(container):
     if container is None:
         return False
+    if bubble_has_explicit_voice_ui(container):
+        return True
     if bubble_has_photo_attachment(container):
         return False
     if bubble_looks_like_voice_note(container):
@@ -2909,10 +2935,10 @@ def classify_incoming_unit(container):
     text = extract_text_from_message_container(container)
     if is_bot_noise_message(text):
         return "empty", ""
+    if bubble_has_explicit_voice_ui(container) or bubble_looks_like_voice_note(container):
+        return "voice", text
     if bubble_has_photo_attachment(container):
         return "image", text
-    if bubble_looks_like_voice_note(container):
-        return "voice", text
     if container_has_voice(container):
         if is_bot_noise_message(text) or (len(text) > 120 and "OpenClaw" in text):
             return "empty", ""
@@ -3070,7 +3096,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         unit_text = unit.get("text") or ""
 
         if kind == "image" and container is not None:
-            if bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container):
+            if bubble_has_explicit_voice_ui(container) or (
+                bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
+            ):
                 kind = "voice"
                 unit["kind"] = "voice"
                 print("   🎤 Reclassified image → voice (voice-note bubble detected)")
@@ -3111,7 +3139,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             if image_path_this_step:
                 image_path = image_path_this_step
                 print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
-            elif bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container):
+            elif bubble_has_explicit_voice_ui(container) or (
+                bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
+            ):
                 kind = "voice"
                 unit["kind"] = "voice"
                 print("   🎤 Image capture failed on voice-shaped bubble — switching to voice download")
