@@ -742,6 +742,23 @@ def classification_from_copilot_analysis(analysis: dict, media_info: Optional[Me
     )
 
 
+def _parse_copilot_confidence(value, default: float = 0.5) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        num = float(value)
+        return max(0.0, min(num / 100.0 if num > 1.0 else num, 1.0))
+    text = str(value).strip().lower()
+    labels = {"very high": 0.95, "high": 0.9, "medium": 0.75, "med": 0.75, "low": 0.6}
+    if text in labels:
+        return labels[text]
+    try:
+        num = float(text.rstrip("%"))
+        return max(0.0, min(num / 100.0 if num > 1.0 else num, 1.0))
+    except (TypeError, ValueError):
+        return default
+
+
 def _classify_with_copilot(message_text: str, media_info: MediaInfo) -> Optional[ClassificationResult]:
     if not str(message_text or "").strip() and media_info.media_type in ("text", "unknown"):
         return None
@@ -808,7 +825,7 @@ Learned examples:
         intent = str(parsed.get("intent") or "unknown").strip().lower()
         if intent not in INTENT_TYPES:
             intent = "unknown"
-        confidence = float(parsed.get("confidence") or 0.5)
+        confidence = _parse_copilot_confidence(parsed.get("confidence"), default=0.5)
         reasoning = str(parsed.get("reasoning") or "").strip()
         return ClassificationResult(
             media_type=media_info.media_type,

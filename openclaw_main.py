@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.17-RFQ-ROUTING-OVERRIDE"
+VERSION = "v1.18-COPILOT-CONFIDENCE-PARSE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -19,6 +19,46 @@ WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "whatsapp_inbox_watcher.py")
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
+
+
+def parse_copilot_confidence(value, default: float = 0.75) -> float:
+    """Accept Copilot confidence as 0.9, 90, 'high', etc."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        num = float(value)
+        if num > 1.0:
+            num = num / 100.0
+        return max(0.0, min(num, 1.0))
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    labels = {
+        "very high": 0.95,
+        "high": 0.9,
+        "medium": 0.75,
+        "med": 0.75,
+        "moderate": 0.75,
+        "low": 0.6,
+        "very low": 0.5,
+    }
+    if text in labels:
+        return labels[text]
+    try:
+        num = float(text.rstrip("%").strip())
+        if num > 1.0:
+            num = num / 100.0
+        return max(0.0, min(num, 1.0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_copilot_qty(value, default: int = 1) -> int:
+    try:
+        qty = int(float(str(value).strip()))
+        return max(1, qty)
+    except (TypeError, ValueError):
+        return max(1, int(default or 1))
 
 
 def _normalize_part_key(part_no: str) -> str:
@@ -234,6 +274,7 @@ def analyze_incoming_inquiry_with_copilot(
         "If a table or document in the image shows Qty, use that quantity. Default qty 1 if not stated.\n\n"
         "Return STRICTLY one raw JSON object with keys:\n"
         "intent, confidence, reasoning, items, technical_summary, is_industrial_automation, compatible_brands\n"
+        "confidence must be a number from 0.0 to 1.0 (example 0.9) — not words like high/medium.\n"
         "items = array of {part_no, qty, brand, product_type}\n"
         "technical_summary = concise specs suitable for a sales reply (plain text, no markdown links)\n"
         "compatible_brands = array of automation brands this item is commonly used with\n"
@@ -277,7 +318,7 @@ def analyze_incoming_inquiry_with_copilot(
             return {}
 
         intent = _normalize_copilot_intent(parsed.get("intent"))
-        confidence = float(parsed.get("confidence") or 0.75)
+        confidence = parse_copilot_confidence(parsed.get("confidence"), default=0.75)
         reasoning = str(parsed.get("reasoning") or "").strip()
         technical_summary = _sanitize_whatsapp_reply(str(parsed.get("technical_summary") or "").strip())
         is_ia = bool(parsed.get("is_industrial_automation", True))
@@ -294,7 +335,7 @@ def analyze_incoming_inquiry_with_copilot(
             if not part_no:
                 continue
             try:
-                qty = int(item.get("qty") or caption_qty or 1)
+                qty = _parse_copilot_qty(item.get("qty"), default=caption_qty or 1)
             except (TypeError, ValueError):
                 qty = caption_qty
             qty = max(1, qty)
