@@ -41,9 +41,11 @@ from whatsapp_message_classifier import (
 )
 from whatsapp_attachment_processor import (
     VOICE_LATEST_OPUS,
-    clear_wa_audio_workspace,
+    WA_IMAGE_DIR,
+    clear_wa_attachment_workspace,
     enrich_message_from_attachments,
     ensure_voice_transcript,
+    save_wa_image_manifest,
 )
 from message_learning_store import apply_feedback_command
 
@@ -62,7 +64,6 @@ PROCESS_CONTACT_FLAG = "/Users/evon/OpenClaw/whatsapp_process_contact.flag"
 WHATSAPP_WATCH_CONTACTS_FILE = "/Users/evon/OpenClaw/whatsapp_watch_contacts.txt"
 WHATSAPP_LAST_PROCESSED_FILE = "/Users/evon/OpenClaw/whatsapp_last_processed.json"
 WHATSAPP_CUSTOMER_REGISTRY_FILE = "/Users/evon/OpenClaw/whatsapp_customer_registry.json"
-IMAGE_CAPTURE_DIR = "/Users/evon/OpenClaw/logs/wa_image_capture"
 CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.txt"
 
 MAX_UNREAD_CHATS_PER_RUN = 1
@@ -3474,30 +3475,34 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     if bubble is None:
         return None
 
-    os.makedirs(IMAGE_CAPTURE_DIR, exist_ok=True)
+    os.makedirs(WA_IMAGE_DIR, exist_ok=True)
     safe_contact = re.sub(r"[^A-Za-z0-9._-]+", "_", str(contact_name or "contact"))[:60]
-    id_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(message_data_id or ""))[:24]
+    id_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(message_data_id or ""))[:48]
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = f"_{id_slug}" if id_slug else ""
     image_path = os.path.join(
-        IMAGE_CAPTURE_DIR,
-        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}_bubble.png",
+        WA_IMAGE_DIR,
+        f"{id_slug or safe_contact}_{stamp}_bubble.png",
     )
 
     bubble_path = capture_message_bubble_screenshot(driver, bubble, image_path)
     if bubble_path:
+        save_wa_image_manifest(bubble_path, message_data_id=message_data_id)
         return bubble_path
 
-    crop_path = image_path.replace("_bubble.png", "_media.png")
+    crop_path = os.path.join(WA_IMAGE_DIR, f"{id_slug or safe_contact}_{stamp}_media.png")
     crop_result = capture_bubble_media_crop(driver, bubble, crop_path)
     if crop_result:
+        save_wa_image_manifest(crop_result, message_data_id=message_data_id)
         return crop_result
 
-    viewer_path = image_path.replace("_bubble.png", "_viewer.png")
+    viewer_path = os.path.join(WA_IMAGE_DIR, f"{id_slug or safe_contact}_{stamp}_viewer.png")
     viewer_result = capture_image_via_media_viewer(driver, bubble, viewer_path)
     if viewer_result:
+        save_wa_image_manifest(viewer_result, message_data_id=message_data_id)
         return viewer_result
 
-    print("❌ Could not capture message-bubble screenshot for Copilot.")
+    print(f"❌ Could not capture message-bubble screenshot for Copilot ({WA_IMAGE_DIR}).")
     return None
 
 
@@ -4836,19 +4841,20 @@ def build_process_fingerprint(units, contact_name: str = "", contact_hint: str =
 
 def finalize_chat_processing(contact_name, plan, voice_ok: bool = True, contact_hint: str = ""):
     if not plan:
+        clear_wa_attachment_workspace()
         return
     if not voice_ok:
         print(
             "⚠️ Voice message not saved/transcribed — NOT marking processed "
             "(will retry on next scan)"
         )
-        clear_wa_audio_workspace()
+        clear_wa_attachment_workspace()
         return
     fingerprint = build_plan_fingerprint(plan)
     data_ids = [str(u.get("data_id") or "").strip() for u in plan if u.get("data_id")]
     store_key = contact_store_key(contact_name, contact_hint)
     mark_watch_contact_processed(store_key, fingerprint, data_ids)
-    clear_wa_audio_workspace()
+    clear_wa_attachment_workspace()
 
 
 def should_process_watch_contact(contact_name, fingerprint, plan=None, contact_hint: str = ""):

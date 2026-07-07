@@ -22,13 +22,16 @@ from openai import OpenAI
 
 BASE_DIR = "/Users/evon/OpenClaw"
 WA_AUDIO_DIR = os.path.join(BASE_DIR, "WA_Audio")
+WA_IMAGE_DIR = os.path.join(BASE_DIR, "WA_Image")
+WA_FILES_DIR = os.path.join(BASE_DIR, "WA_Files")
 VOICE_CAPTURE_DIR = WA_AUDIO_DIR
 VOICE_LATEST_OPUS = os.path.join(WA_AUDIO_DIR, "latest.opus")
 VOICE_LATEST_WAV = os.path.join(WA_AUDIO_DIR, "latest.whisper.wav")
-DOC_CAPTURE_DIR = os.path.join(BASE_DIR, "logs/wa_document_capture")
-DOC_PREVIEW_DIR = os.path.join(BASE_DIR, "logs/wa_document_preview")
+IMAGE_LATEST_PATH = os.path.join(WA_IMAGE_DIR, "latest.png")
+DOC_CAPTURE_DIR = WA_FILES_DIR
+DOC_PREVIEW_DIR = WA_IMAGE_DIR
 
-VERSION = "v1.20-VOICE-MENU-DOWNLOAD"
+VERSION = "v1.21-WA-IMAGE-FILES-WORKSPACE"
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
@@ -1483,13 +1486,13 @@ def transcribe_audio_via_copilot(audio_path: str) -> Tuple[str, str]:
         return "", ""
 
 
-def clear_wa_audio_workspace():
-    """Remove saved voice files after processing so the next message starts clean."""
-    if not os.path.isdir(WA_AUDIO_DIR):
+def _clear_workspace_dir(directory: str, label: str) -> None:
+    """Remove all files in a WA_* workspace after processing."""
+    if not os.path.isdir(directory):
         return
     removed = 0
-    for name in os.listdir(WA_AUDIO_DIR):
-        path = os.path.join(WA_AUDIO_DIR, name)
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
         if os.path.isfile(path):
             try:
                 os.remove(path)
@@ -1497,7 +1500,57 @@ def clear_wa_audio_workspace():
             except OSError:
                 pass
     if removed:
-        print(f"🧹 [VOICE] Cleared {removed} file(s) from {WA_AUDIO_DIR}")
+        print(f"🧹 [{label}] Cleared {removed} file(s) from {directory}")
+
+
+def clear_wa_audio_workspace():
+    """Remove saved voice files after processing so the next message starts clean."""
+    _clear_workspace_dir(WA_AUDIO_DIR, "VOICE")
+
+
+def clear_wa_image_workspace():
+    """Remove saved image screenshots after Copilot analysis."""
+    _clear_workspace_dir(WA_IMAGE_DIR, "IMAGE")
+
+
+def clear_wa_files_workspace():
+    """Remove downloaded document files after Copilot analysis."""
+    _clear_workspace_dir(WA_FILES_DIR, "FILES")
+
+
+def clear_wa_attachment_workspace():
+    """Clear all temporary WhatsApp attachment workspaces (audio, image, files)."""
+    clear_wa_audio_workspace()
+    clear_wa_image_workspace()
+    clear_wa_files_workspace()
+
+
+def save_wa_image_manifest(image_path: str, message_data_id: str = "") -> None:
+    """Track the current message image like latest.opus for voice."""
+    if not image_path or not os.path.exists(image_path):
+        return
+    os.makedirs(WA_IMAGE_DIR, exist_ok=True)
+    try:
+        shutil.copy2(image_path, IMAGE_LATEST_PATH)
+    except OSError as exc:
+        print(f"⚠️ [IMAGE] Could not update {IMAGE_LATEST_PATH}: {exc}")
+        return
+    manifest_path = os.path.join(WA_IMAGE_DIR, "latest.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "data_id": message_data_id,
+                    "named_path": image_path,
+                    "bytes": os.path.getsize(image_path),
+                },
+                f,
+                indent=2,
+            )
+    except Exception:
+        pass
+    print(f"✅ [IMAGE] Updated {IMAGE_LATEST_PATH}")
 
 
 def _read_voice_manifest() -> dict:
@@ -1632,7 +1685,7 @@ def download_document_from_bubble(
         downloaded = _pick_newest_download(safe_name)
         if downloaded:
             os.replace(downloaded, out_path)
-            print(f"📄 [DOC] Saved document: {out_path}")
+            print(f"📄 [DOC] Saved document → {WA_FILES_DIR}/{os.path.basename(out_path)}")
             return out_path
 
         b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, element)
@@ -1664,7 +1717,7 @@ def download_document_from_bubble(
 def _pick_newest_download(preferred_name: str) -> Optional[str]:
     download_dirs = [
         os.path.expanduser("~/Downloads"),
-        os.path.join(BASE_DIR, "logs/wa_document_capture"),
+        WA_FILES_DIR,
     ]
     candidates = []
     for directory in download_dirs:

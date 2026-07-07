@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.14-BUBBLE-SCREENSHOT-ONLY"
+VERSION = "v1.15-WA-IMAGE-FILES-WORKSPACE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
