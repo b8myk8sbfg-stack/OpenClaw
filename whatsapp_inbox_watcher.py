@@ -3020,9 +3020,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 driver, container, contact_name, message_data_id=message_data_id
             )
             if image_path:
-                print("   🖼️ Zoomed screenshot captured — unified Copilot analyze at end of plan")
+                print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
             else:
-                print("   ⚠️ Image step: zoomed screenshot capture failed.")
+                print("   ⚠️ Image step: message-bubble screenshot capture failed.")
 
         elif kind == "voice":
             processed_voice = True
@@ -3327,12 +3327,97 @@ def close_media_viewer(driver):
         pass
 
 
+def capture_message_bubble_screenshot(driver, bubble, image_path):
+    """Screenshot only the target WhatsApp message bubble — not the full screen or media gallery."""
+    bubble = resolve_message_container(bubble)
+    if bubble is None:
+        return None
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            bubble,
+        )
+        time.sleep(1.2)
+        bubble.screenshot(image_path)
+        size = bubble.size or {}
+        print(
+            f"🖼️ Saved exact message-bubble screenshot "
+            f"({int(size.get('width') or 0)}x{int(size.get('height') or 0)}): {image_path}"
+        )
+        return image_path
+    except Exception as exc:
+        print(f"❌ Message bubble screenshot failed: {exc}")
+        return None
+
+
+def _largest_media_in_bubble(bubble):
+    """Return the largest in-bubble media element (image/document preview)."""
+    bubble = resolve_message_container(bubble)
+    if bubble is None:
+        return None
+
+    best = None
+    best_area = 0
+    selectors = [
+        '[data-testid="image-thumb"] img',
+        '[data-testid="image-thumb"]',
+        '[data-testid="media-url-provider"] img',
+        'img[src]',
+    ]
+    for selector in selectors:
+        try:
+            for element in bubble.find_elements(By.CSS_SELECTOR, selector):
+                if not element.is_displayed():
+                    continue
+                src = (element.get_attribute("src") or "").lower()
+                if is_profile_or_ui_image_src(src):
+                    continue
+                size = element.size or {}
+                area = int(size.get("width") or 0) * int(size.get("height") or 0)
+                if area > best_area:
+                    best = element
+                    best_area = area
+        except Exception:
+            continue
+    return best if best_area >= 80 else None
+
+
+def capture_bubble_media_crop(driver, bubble, image_path):
+    """Screenshot only the media region inside the message bubble (still no gallery strip)."""
+    bubble = resolve_message_container(bubble)
+    media = _largest_media_in_bubble(bubble)
+    if media is None:
+        return None
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            media,
+        )
+        time.sleep(0.8)
+        wait_for_media_image_ready(driver, media)
+        media.screenshot(image_path)
+        size = media.size or {}
+        print(
+            f"🖼️ Saved in-bubble media crop "
+            f"({int(size.get('width') or 0)}x{int(size.get('height') or 0)}): {image_path}"
+        )
+        return image_path
+    except Exception as exc:
+        print(f"⚠️ In-bubble media crop failed: {exc}")
+        return None
+
+
 def capture_image_via_media_viewer(driver, bubble, image_path):
-    """Open WhatsApp full-screen viewer (click photo) and save a zoomed screenshot for Copilot."""
+    """Open viewer only when in-bubble media is tiny; screenshot the main image, never the full panel."""
     thumb = find_media_image_in_bubble(bubble)
     if thumb is None:
-        print("⚠️ No image thumb found in message bubble — cannot open media viewer.")
         return None
+    size = thumb.size or {}
+    width = int(size.get("width") or 0)
+    if width >= 220:
+        print("ℹ️ In-bubble media is large enough — skipping media viewer to avoid gallery thumbnails.")
+        return None
+
     try:
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
@@ -3341,25 +3426,6 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
         time.sleep(1.0)
         driver.execute_script("arguments[0].click();", thumb)
         time.sleep(2.5)
-
-        panel_selectors = [
-            '[data-testid="media-viewer-panel"]',
-            'div[data-animate-media-viewer="true"]',
-            'div[role="dialog"]',
-        ]
-        for selector in panel_selectors:
-            for panel in driver.find_elements(By.CSS_SELECTOR, selector):
-                try:
-                    if not panel.is_displayed():
-                        continue
-                    size = panel.size or {}
-                    if int(size.get("width") or 0) < 200:
-                        continue
-                    panel.screenshot(image_path)
-                    print(f"🖼️ Saved zoomed WhatsApp media-viewer screenshot: {image_path}")
-                    return image_path
-                except Exception:
-                    continue
 
         viewer_selectors = [
             '[data-testid="media-viewer-panel"] img[src]',
@@ -3377,8 +3443,13 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
                     src = (element.get_attribute("src") or "").lower()
                     if is_profile_or_ui_image_src(src):
                         continue
-                    size = element.size or {}
-                    area = int(size.get("width") or 0) * int(size.get("height") or 0)
+                    el_size = element.size or {}
+                    el_width = int(el_size.get("width") or 0)
+                    el_height = int(el_size.get("height") or 0)
+                    area = el_width * el_height
+                    # Skip bottom thumbnail-strip images (small tiles along the gallery bar).
+                    if el_height < 120 and el_width < 220:
+                        continue
                     if area > best_area:
                         best = element
                         best_area = area
@@ -3387,9 +3458,9 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
 
         if best is not None and wait_for_media_image_ready(driver, best, timeout=10):
             best.screenshot(image_path)
-            print(f"🖼️ Saved zoomed WhatsApp image from media viewer: {image_path}")
+            print(f"🖼️ Saved main viewer image only (no thumbnail strip): {image_path}")
             return image_path
-        print("⚠️ Media viewer opened but zoomed image was not ready in time.")
+        print("⚠️ Media viewer opened but main image was not ready in time.")
     except Exception as exc:
         print(f"⚠️ Media viewer capture failed: {exc}")
     finally:
@@ -3398,7 +3469,7 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
 
 
 def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
-    """Capture only a zoomed screenshot via WhatsApp media viewer — no chat-thumb fallbacks."""
+    """Capture the exact unread message bubble for Copilot — never the full screen or gallery strip."""
     bubble = resolve_message_container(bubble)
     if bubble is None:
         return None
@@ -3409,14 +3480,24 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     suffix = f"_{id_slug}" if id_slug else ""
     image_path = os.path.join(
         IMAGE_CAPTURE_DIR,
-        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}_zoom.png",
+        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_contact}{suffix}_bubble.png",
     )
 
-    viewer_path = capture_image_via_media_viewer(driver, bubble, image_path)
-    if viewer_path:
-        return viewer_path
+    bubble_path = capture_message_bubble_screenshot(driver, bubble, image_path)
+    if bubble_path:
+        return bubble_path
 
-    print("❌ Could not capture zoomed screenshot — Copilot will not guess from a tiny thumbnail.")
+    crop_path = image_path.replace("_bubble.png", "_media.png")
+    crop_result = capture_bubble_media_crop(driver, bubble, crop_path)
+    if crop_result:
+        return crop_result
+
+    viewer_path = image_path.replace("_bubble.png", "_viewer.png")
+    viewer_result = capture_image_via_media_viewer(driver, bubble, viewer_path)
+    if viewer_result:
+        return viewer_result
+
+    print("❌ Could not capture message-bubble screenshot for Copilot.")
     return None
 
 

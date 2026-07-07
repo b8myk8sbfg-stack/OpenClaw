@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI
 
-VERSION = "v1.13-COPILOT-ONLY-NO-FALLBACK"
+VERSION = "v1.14-BUBBLE-SCREENSHOT-ONLY"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -199,6 +199,9 @@ def analyze_incoming_inquiry_with_copilot(
         "Baumer, Mitsubishi, Panasonic, Yaskawa, ABB, and more).\n\n"
         "Read ALL provided inputs together — customer text, photo label, document text, and voice "
         "transcript. Treat this as a brand-new message; do not reuse parts from other conversations.\n\n"
+        "When a message-bubble screenshot is attached, analyze ONLY that single WhatsApp message bubble. "
+        "Ignore any other products, thumbnails, or media from earlier/later chat messages. "
+        "The customer caption text belongs to THIS message only.\n\n"
         "Classify the message intent as one of:\n"
         "- rfq_inquiry: customer asks price/availability/quote (e.g. 'quote me 1 pc')\n"
         "- technical_support: equivalent/replacement, specs, wiring, fault, how-to\n"
@@ -210,7 +213,8 @@ def analyze_incoming_inquiry_with_copilot(
         "Examples: ER6C 3.6V = lithium battery (NOT E2E/E3Z); H3JA-8A = timer (NOT E2E); "
         "E2E-X5E1 = proximity sensor only if label says E2E; E3Z-T61 = photoelectric sensor only if label says E3Z.\n"
         "If the label says LITHIUM or ER6C, product_type must be LITHIUM BATTERY and part_no must be ER6C (include 3.6V when printed).\n"
-        "Use customer text for quantity ('quote 1 pce' → qty 1). Default qty 1 if not stated.\n\n"
+        "Use customer text for quantity ('quote 1 pce' → qty 1). "
+        "If a table or document in the image shows Qty, use that quantity. Default qty 1 if not stated.\n\n"
         "Return STRICTLY one raw JSON object with keys:\n"
         "intent, confidence, reasoning, items, technical_summary, is_industrial_automation, compatible_brands\n"
         "items = array of {part_no, qty, brand, product_type}\n"
@@ -236,7 +240,7 @@ def analyze_incoming_inquiry_with_copilot(
 
     user_content = _copilot_user_content_with_image(user_text, image_path)
     if image_path and os.path.exists(image_path):
-        print(f"[COPILOT ANALYZE] Attaching zoomed message screenshot: {image_path}")
+        print(f"[COPILOT ANALYZE] Attaching exact message-bubble screenshot: {image_path}")
 
     try:
         response = client.chat.completions.create(
@@ -1051,6 +1055,8 @@ def build_technical_support_reply(
         "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
         "Answer customer technical support questions clearly and practically on WhatsApp. "
         "Read the attached zoomed product photo if provided — transcribe the label character-by-character. "
+        "If a message-bubble screenshot is attached, analyze ONLY that single message — "
+        "ignore other products from earlier/later chat media.\n"
         "Use ONLY the identified model from the label — never invent or substitute a different catalog number. "
         "NEVER mention E2E-X5E1 or E3Z-T61 unless those exact models are printed on the label. "
         "ER6C / LITHIUM = battery, not a sensor. H3JA / H3Y = timer, not E2E. "
@@ -1075,7 +1081,7 @@ def build_technical_support_reply(
     try:
         user_content = _copilot_user_content_with_image(user_prompt, image_path)
         if image_path and os.path.exists(image_path):
-            print(f"[COPILOT TECH SUPPORT] Attaching zoomed screenshot: {image_path}")
+            print(f"[COPILOT TECH SUPPORT] Attaching exact message-bubble screenshot: {image_path}")
 
         response = client.chat.completions.create(
             model=COPILOT_MODEL,
