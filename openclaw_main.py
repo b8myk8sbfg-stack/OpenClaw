@@ -10,12 +10,13 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.38-STRICT-JSON"
+VERSION = "v1.39-STRICT-JSON"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
 EMAIL_SCRIPT = os.path.join(BASE_DIR, "auto_claw.py")
 WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "whatsapp_inbox_watcher.py")
+COPILOT_EXTRACTION_LOG = os.path.join(BASE_DIR, "logs", "copilot_extraction.log")
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
@@ -156,10 +157,12 @@ single_product_photo / handheld (A):
 - Never read background equipment labels
 
 rfq_table (B):
+- If the image shows a grid/table with column headers (No, Item, Picture, Qty, Description, Model) → input_type MUST be rfq_table, NOT single_product_photo
+- Wide landscape screenshots of spreadsheet rows are almost always rfq_table
 - Every visible row = one item in items[]
 - qty: from Qty column — never default to 1 if Qty column shows another number
-- part_no: from Item/Model/Catalog column; use Picture column only to confirm unreadable text
-- Do NOT apply handheld/foreground rules to tables
+- part_no: from Item/Model/Catalog column; use Picture column nameplate to confirm
+- Do NOT apply handheld/foreground/battery rules to tables
 
 purchase_order (D): one item per PO line.
 panel_photo (E): only products the customer clearly intends to quote.
@@ -169,32 +172,47 @@ rfq_inquiry | purchase_order | technical_support | replacement_request | repair 
 
 part_no must be literal transcription. Never normalize. Never improve.
 
-Return ONLY this JSON object (no other text):
+Return ONLY this JSON object (no other text). Use YOUR OWN readings — do NOT copy example values:
 {
   "status": "success",
   "intent": "rfq_inquiry",
-  "input_type": "single_product_photo",
-  "primary_subject": "battery",
-  "confidence": 0.99,
+  "input_type": "rfq_table",
+  "primary_subject": "rfq table row",
+  "confidence": 0.0,
   "items": [
     {
       "brand": "",
-      "part_no": "ER6C (AA)-3.6V",
-      "description": "Lithium battery",
-      "product_type": "battery",
+      "part_no": "",
+      "description": "",
+      "product_type": "",
       "qty": 1,
-      "source": "foreground label",
-      "confidence": 0.99,
-      "reason": "Foreground label fully readable"
+      "source": "table row",
+      "confidence": 0.0,
+      "reason": ""
     }
   ],
-  "ignored": ["terminal block", "control panel"],
+  "ignored": [],
   "technical_summary": "",
   "reasoning": ""
 }
 
 If no products found: status="no_products", items=[]. If label unreadable: status="ocr_no_text", items=[].
 One product = one item. One RFQ row = one item. One PO line = one item.
+"""
+
+OPENCLAW_TABLE_RETRY_PROMPT = """CRITICAL RE-ANALYSIS — your previous classification was likely wrong.
+
+The attached image is a WIDE landscape RFQ / quotation TABLE (columns such as No, Item, Picture, Qty).
+You must NOT classify this as single_product_photo or a handheld battery.
+
+Rules:
+- input_type MUST be rfq_table
+- Read EVERY visible row
+- part_no from Item/Model column and/or nameplate in Picture column (literal transcription)
+- qty from Qty column (do not default to 1 if Qty shows 3)
+- Never substitute ER6C, E3Z-D61, H3JA-8A or any catalog number unless literally visible
+
+Return ONLY valid JSON. No markdown. No prose. Same schema as before with status, intent, input_type, items, ignored.
 """
 
 OPENCLAW_JSON_RETRY_PROMPT = """CRITICAL: Your previous response was NOT valid JSON or failed validation.
@@ -208,7 +226,7 @@ Schema:
 {
   "status": "success",
   "intent": "rfq_inquiry",
-  "input_type": "single_product_photo",
+  "input_type": "",
   "primary_subject": "",
   "confidence": 0.0,
   "items": [{"brand":"","part_no":"","description":"","product_type":"","qty":1,"source":"","confidence":0.0,"reason":""}],
@@ -423,6 +441,8 @@ def _build_extraction_user_prompt(
     document_text: str = "",
     voice_transcript: str = "",
     base_prompt: str = None,
+    image_path: str = None,
+    image_dims: tuple = None,
 ) -> str:
     prompt_parts = [base_prompt or OPENCLAW_UNIFIED_PROMPT]
     if voice_transcript:
@@ -434,7 +454,110 @@ def _build_extraction_user_prompt(
         prompt_parts.append(f"Attached customer message/caption:\n{message_text}")
     if document_text:
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
+    if image_path:
+        dim_label = (
+            f"{image_dims[0]}x{image_dims[1]}"
+            if image_dims and image_dims[0] and image_dims[1]
+            else "unknown"
+        )
+        landscape = (
+            image_dims
+            and image_dims[0] > 0
+            and image_dims[1] > 0
+            and image_dims[0] > image_dims[1] * 1.35
+        )
+        prompt_parts.append(
+            f"Attached image file: {image_path}\n"
+            f"Image dimensions: {dim_label}"
+            + (" (landscape — check for RFQ table with No/Item/Picture/Qty columns)" if landscape else "")
+        )
     return "\n\n".join(prompt_parts)
+
+
+def _suspect_table_misread(
+    parsed: dict,
+    image_dims: tuple = None,
+    message_text: str = "",
+) -> bool:
+    """Detect likely rfq_table misclassified as handheld/battery (no OCR — layout + JSON signals)."""
+    if not isinstance(parsed, dict) or not image_dims:
+        return False
+    width, height = image_dims
+    if width <= 0 or height <= 0:
+        return False
+    input_type = str(parsed.get("input_type") or "").strip().lower()
+    if input_type == "rfq_table":
+        return False
+    if width <= height * 1.35:
+        return False
+    caption_u = str(message_text or "").upper()
+    quote_caption = bool(re.search(r"\b(QUOTE|RFQ|QUOTATION|PLS QUOTE)\b", caption_u))
+    primary = str(parsed.get("primary_subject") or "").strip().lower()
+    items = parsed.get("items") or []
+    battery_item = any(
+        isinstance(it, dict)
+        and (
+            str(it.get("product_type") or "").lower() == "battery"
+            or "ER6C" in str(it.get("part_no") or "").upper()
+        )
+        for it in items
+    )
+    handheld = input_type in ("single_product_photo", "multiple_product_photo", "", "unknown")
+    return handheld and (quote_caption or primary == "battery" or battery_item)
+
+
+def _append_copilot_extraction_log(
+    pass_label: str,
+    message_text: str = "",
+    image_path: str = None,
+    image_dims: tuple = None,
+    raw: str = "",
+    parsed: dict = None,
+    result: dict = None,
+    note: str = "",
+) -> None:
+    """Single consolidated log for every Copilot extraction pass."""
+    try:
+        os.makedirs(os.path.dirname(COPILOT_EXTRACTION_LOG), exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        dim_label = (
+            f"{image_dims[0]}x{image_dims[1]}"
+            if image_dims and image_dims[0] and image_dims[1]
+            else "n/a"
+        )
+        lines = [
+            "=" * 88,
+            f"{stamp} | {pass_label} | engine={VERSION}",
+            f"image: {image_path or 'none'}",
+            f"dimensions: {dim_label}",
+            f"caption: {(message_text or '')[:240]}",
+        ]
+        if note:
+            lines.append(f"note: {note}")
+        lines.append("RAW:")
+        lines.append(str(raw or ""))
+        if parsed is not None:
+            lines.append("PARSED:")
+            try:
+                lines.append(json.dumps(parsed, indent=2, ensure_ascii=False))
+            except (TypeError, ValueError):
+                lines.append(str(parsed))
+        if result is not None:
+            item_summary = ", ".join(
+                f"{it.get('part_no')} x{it.get('qty', 1)}"
+                for it in (result.get("items") or [])[:6]
+            )
+            lines.append(
+                f"RESULT: ok={result.get('ok')} intent={result.get('intent')} "
+                f"input_type={result.get('input_type')} items={len(result.get('items') or [])} "
+                f"error={result.get('extraction_error')} | {item_summary}"
+            )
+        lines.append("")
+        with open(COPILOT_EXTRACTION_LOG, "a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        print(f"[COPILOT LOG] → {COPILOT_EXTRACTION_LOG} ({pass_label})")
+    except OSError as exc:
+        print(f"[COPILOT LOG] Could not write {COPILOT_EXTRACTION_LOG}: {exc}")
 
 
 def _copilot_extraction_result_from_parsed(
@@ -669,6 +792,8 @@ def analyze_incoming_inquiry_with_copilot(
         return {"attempted": False, "ok": False, "items": []}
 
     print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
+    print(f"[COPILOT LOG] Consolidated log: {COPILOT_EXTRACTION_LOG}")
+    image_dims = None
     if image_path:
         if os.path.exists(image_path):
             from whatsapp_attachment_processor import validate_image_file, read_image_dimensions
@@ -676,6 +801,7 @@ def analyze_incoming_inquiry_with_copilot(
             img_ok, img_reason = validate_image_file(image_path)
             img_size = os.path.getsize(image_path)
             dims = read_image_dimensions(image_path)
+            image_dims = dims
             dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
             print(
                 f"[COPILOT ANALYZE] Image file size: {img_size} bytes, "
@@ -709,8 +835,9 @@ def analyze_incoming_inquiry_with_copilot(
         message_text=message_text,
         document_text=document_text,
         voice_transcript=voice_transcript,
+        image_path=image_path,
+        image_dims=image_dims,
     )
-    user_content = _copilot_user_content_with_image(user_text, image_path)
     if image_path and os.path.exists(image_path):
         print(f"[COPILOT ANALYZE] Fresh chat — attached image: {image_path}")
 
@@ -724,6 +851,15 @@ def analyze_incoming_inquiry_with_copilot(
         response_raw = (response.choices[0].message.content or "").strip()
         print(f"[COPILOT ANALYZE RAW/{label}] {response_raw[:500]}")
         parsed_obj, parse_err, parse_detail = parse_copilot_json_response(response_raw)
+        _append_copilot_extraction_log(
+            pass_label=label,
+            message_text=message_text,
+            image_path=image_path,
+            image_dims=image_dims,
+            raw=response_raw,
+            parsed=parsed_obj,
+            note=parse_detail or parse_err or "",
+        )
         return response_raw, parsed_obj, parse_err, parse_detail
 
     raw = ""
@@ -738,6 +874,8 @@ def analyze_incoming_inquiry_with_copilot(
                     document_text=document_text,
                     voice_transcript=voice_transcript,
                     base_prompt=OPENCLAW_JSON_RETRY_PROMPT,
+                    image_path=image_path,
+                    image_dims=image_dims,
                 )
                 + f"\n\nYour invalid response was:\n{raw[:1200]}"
             )
@@ -745,7 +883,7 @@ def analyze_incoming_inquiry_with_copilot(
 
         if parsed is None:
             print(f"[COPILOT ANALYZE] PARSER_ERROR after retry: {parse_detail}")
-            return _minimal_copilot_analysis_result(
+            fail = _minimal_copilot_analysis_result(
                 message_text=message_text,
                 analysis_text=raw,
                 raw=raw,
@@ -753,25 +891,82 @@ def analyze_incoming_inquiry_with_copilot(
                 http_status=200,
                 extraction_error="PARSER_ERROR",
             )
+            _append_copilot_extraction_log(
+                pass_label="final",
+                message_text=message_text,
+                image_path=image_path,
+                image_dims=image_dims,
+                raw=raw,
+                parsed=None,
+                result=fail,
+                note="PARSER_ERROR",
+            )
+            return fail
 
         valid, missing = _validate_copilot_extraction_json(parsed)
         if not valid:
             print(f"[COPILOT ANALYZE] JSON_INVALID — missing/invalid fields: {missing}")
-            return _minimal_copilot_analysis_result(
+            fail = _minimal_copilot_analysis_result(
                 message_text=message_text,
                 raw=raw,
                 parse_warning=f"JSON validation failed: {', '.join(missing)}",
                 http_status=200,
                 extraction_error="JSON_INVALID",
             )
+            _append_copilot_extraction_log(
+                pass_label="final",
+                message_text=message_text,
+                image_path=image_path,
+                image_dims=image_dims,
+                raw=raw,
+                parsed=parsed,
+                result=fail,
+                note=f"JSON_INVALID: {missing}",
+            )
+            return fail
 
-        return _copilot_extraction_result_from_parsed(
+        if _suspect_table_misread(parsed, image_dims=image_dims, message_text=message_text):
+            prev_type = parsed.get("input_type")
+            prev_part = ""
+            items_in = parsed.get("items") or []
+            if items_in and isinstance(items_in[0], dict):
+                prev_part = items_in[0].get("part_no", "")
+            print(
+                f"[COPILOT ANALYZE] Suspect table misread "
+                f"(landscape {image_dims}, got {prev_type} / {prev_part}) — rfq_table retry"
+            )
+            table_prompt = (
+                _build_extraction_user_prompt(
+                    message_text=message_text,
+                    document_text=document_text,
+                    voice_transcript=voice_transcript,
+                    base_prompt=OPENCLAW_TABLE_RETRY_PROMPT,
+                    image_path=image_path,
+                    image_dims=image_dims,
+                )
+                + f"\n\nYour incorrect prior classification: input_type={prev_type}, part_no={prev_part}"
+            )
+            raw2, parsed2, err2, det2 = _call_and_parse(table_prompt, "pass3-table-retry")
+            if parsed2 is not None and _validate_copilot_extraction_json(parsed2)[0]:
+                raw, parsed = raw2, parsed2
+
+        result = _copilot_extraction_result_from_parsed(
             parsed,
             raw,
             message_text=message_text,
             voice_transcript=voice_transcript,
             image_path=image_path,
         )
+        _append_copilot_extraction_log(
+            pass_label="final",
+            message_text=message_text,
+            image_path=image_path,
+            image_dims=image_dims,
+            raw=raw,
+            parsed=parsed,
+            result=result,
+        )
+        return result
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[WARN] Copilot analyze parse issue (HTTP 200): {exc}")
         return _minimal_copilot_analysis_result(
