@@ -110,7 +110,14 @@ def load_warehouse_map():
     return rows, exact_lookup
 
 
-load_warehouse_map()
+_WAREHOUSE_LOADED = False
+
+
+def _ensure_warehouse_loaded() -> None:
+    global _WAREHOUSE_LOADED
+    if not _WAREHOUSE_LOADED:
+        load_warehouse_map()
+        _WAREHOUSE_LOADED = True
 
 
 def part_aliases(part_no):
@@ -193,6 +200,7 @@ def warehouse_match_trusted(customer_part, match) -> bool:
 
 def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source=""):
     """Resolve warehouse stock for a part, with stricter rules for visual extraction."""
+    _ensure_warehouse_loaded()
     part_no = str(part_no or "").strip().upper()
     source = str(source or "").upper()
 
@@ -260,6 +268,7 @@ def extract_part_references_from_text(message_text: str) -> list:
 
 def search_warehouse_stock_rows(part_no, brand="UNKNOWN", limit=8):
     """Return warehouse rows whose stock name/model matches the part family."""
+    _ensure_warehouse_loaded()
     part_no = str(part_no or "").upper().strip()
     part_norm = normalize_part(part_no)
     if not part_norm:
@@ -502,6 +511,7 @@ def _pick_best_warehouse_candidate(candidates, part_no, qty):
 
 
 def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
+    _ensure_warehouse_loaded()
     part_no = str(part_no or "").strip().upper()
     declared_brand = str(declared_brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
 
@@ -729,6 +739,7 @@ def get_store_qty_from_product(obm):
 
 
 def build_rows_from_api(api_id, qty, customer_part=None):
+    _ensure_warehouse_loaded()
     print(f"⚙️ [ENGINE] Checking OBM API for: {api_id}")
 
     obm = get_product(api_id)

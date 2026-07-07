@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.24-VALIDATE-WA-IMAGE"
+VERSION = "v1.25-RFQ-TABLE-VISION"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -211,6 +211,14 @@ Omron, SMC, Burkert, Parker, Legris, Keyence, Siemens, Noeding, Hohner, Baumer, 
 
 5. Provide technical specifications.
 
+If the attached image shows an RFQ / enquiry table (columns such as No, Item, Picture, Qty):
+- The customer caption may only say "PLS QUOTE" — part numbers and quantities are IN THE IMAGE.
+- Read the Item column text AND any product label/nameplate in the Picture column.
+- Read the Qty column for quantity (default 1 if not shown).
+- Example row: Item "Allen-Bradley Soft Starter Model 150-C25NBD", Qty 3
+  → part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
+- Transcribe model codes character-by-character from labels (e.g. CAT 150-C25NBD).
+
 Return the result in plain text.
 
 On the very last line only (after your plain-text analysis), append one JSON object with no markdown fences:
@@ -220,6 +228,43 @@ intent must be one of: rfq_inquiry, technical_support, purchase_order, junk_ad, 
 confidence must be a number from 0.0 to 1.0
 items must be an array of objects with keys part_no, qty, brand, product_type
 """
+
+RFQ_TABLE_FOCUS_PROMPT = """NEW INQUIRY
+
+Analyze ONLY the attached RFQ / enquiry table image.
+Do NOT use information from previous conversations.
+
+The WhatsApp caption may only say "please quote". All part numbers are IN THIS IMAGE.
+
+Read every table row (columns: No, Item, Picture, Qty):
+- part_no from the Item column and/or the product label in the Picture column
+- qty from the Qty column
+- brand from Item text or the nameplate (e.g. ALLEN-BRADLEY, OMRON)
+
+Example: Allen-Bradley Soft Starter 150-C25NBD, Qty 3
+→ part_no=150-C25NBD, brand=ALLEN-BRADLEY, qty=3, product_type=SOFT STARTER
+
+Return plain-text analysis, then on the last line only append JSON (no markdown):
+{"items":[{"part_no":"150-C25NBD","qty":3,"brand":"ALLEN-BRADLEY","product_type":"SOFT STARTER"}],"technical_summary":"..."}
+"""
+
+
+def _parse_caption_qty(text: str, default: int = 1) -> int:
+    """Parse qty from caption without loading the warehouse engine."""
+    text_u = str(text or "").upper()
+    for pattern in (
+        r"\b(?:QTY|QUANTITY)\s*[:;]?\s*(\d{1,4})\b",
+        r"\b(\d{1,4})\s*(?:PCS|PC|PCE|PIECES|PIECE|UNIT|UNITS|EA|EACH)\b",
+    ):
+        match = re.search(pattern, text_u)
+        if match:
+            qty = int(match.group(1))
+            if qty > 0:
+                return qty
+    try:
+        return max(1, int(default or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _extract_balanced_json_object(text: str) -> str:
@@ -412,6 +457,74 @@ def _copilot_user_content_with_image(user_text: str, image_path: str = None):
     return user_text
 
 
+def _parse_copilot_items_from_dict(parsed: dict, message_text: str = "", voice_transcript: str = "") -> list:
+    """Normalize items array from Copilot JSON."""
+    caption_qty = _parse_caption_qty(message_text or voice_transcript, default=1)
+    items_out = []
+    for item in parsed.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        part_no = str(item.get("part_no") or "").strip().upper()
+        if not part_no:
+            continue
+        try:
+            qty = _parse_copilot_qty(item.get("qty"), default=caption_qty or 1)
+        except (TypeError, ValueError):
+            qty = caption_qty
+        qty = max(1, qty)
+        brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+        product_type = str(item.get("product_type") or "").strip()
+        item_out = {"part_no": part_no, "qty": qty, "brand": brand, "source": "COPILOT_UNIFIED"}
+        if product_type:
+            item_out["product_type"] = product_type
+        items_out.append(item_out)
+    return items_out
+
+
+def _copilot_rfq_table_focus_pass(
+    client,
+    message_text: str = "",
+    image_path: str = None,
+    voice_transcript: str = "",
+) -> list:
+    """Fresh Copilot call focused on reading RFQ table rows from the image only."""
+    if not image_path or not os.path.exists(image_path):
+        return []
+
+    from whatsapp_attachment_processor import validate_image_file
+
+    ok_img, reason = validate_image_file(image_path)
+    if not ok_img:
+        print(f"[COPILOT RFQ TABLE] Skipping focus pass — invalid image: {reason}")
+        return []
+
+    parts = [RFQ_TABLE_FOCUS_PROMPT]
+    if message_text:
+        parts.append(f"Customer caption (quote request only):\n{message_text}")
+    user_text = "\n\n".join(parts)
+    user_content = _copilot_user_content_with_image(user_text, image_path)
+
+    print("[COPILOT RFQ TABLE] Focus pass — read RFQ table / nameplate from image...")
+    try:
+        response = _copilot_fresh_chat(
+            client,
+            [{"role": "user", "content": user_content}],
+            timeout=120.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        print(f"[COPILOT RFQ TABLE RAW] {raw[:400]}")
+        _prose, parsed = _extract_json_from_copilot_text(raw)
+        if not isinstance(parsed, dict):
+            return []
+        items = _parse_copilot_items_from_dict(parsed, message_text, voice_transcript)
+        if items:
+            print(f"[COPILOT RFQ TABLE] Extracted {len(items)} item(s) from table focus pass")
+        return items
+    except Exception as exc:
+        print(f"[WARN] Copilot RFQ table focus pass failed: {exc}")
+        return []
+
+
 def analyze_incoming_inquiry_with_copilot(
     message_text: str = "",
     image_path: str = None,
@@ -468,7 +581,11 @@ def analyze_incoming_inquiry_with_copilot(
     if document_text:
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
     if image_path and os.path.exists(image_path):
-        prompt_parts.append("Attached image: see screenshot above (this message bubble only).")
+        prompt_parts.append(
+            "IMPORTANT: The attached image is the customer's RFQ photo. "
+            "Read ALL text visible in the image — tables, labels, nameplates. "
+            "The caption may only ask for a quote; part numbers are in the image."
+        )
     elif not message_text and not voice_transcript and not document_text:
         prompt_parts.append("Attached image: see screenshot (analyze this message only).")
 
@@ -482,7 +599,7 @@ def analyze_incoming_inquiry_with_copilot(
         response = _copilot_fresh_chat(
             client,
             [{"role": "user", "content": user_content}],
-            timeout=90.0 if image_path else 60.0,
+            timeout=120.0 if image_path else 60.0,
         )
         raw = (response.choices[0].message.content or "").strip()
         print(f"[COPILOT ANALYZE RAW] {raw[:500]}")
@@ -524,27 +641,20 @@ def analyze_incoming_inquiry_with_copilot(
         is_ia = bool(parsed.get("is_industrial_automation", True))
         compatible_brands = parsed.get("compatible_brands") or []
 
-        from openclaw_inquiry_engine import parse_qty_from_caption
+        items_out = _parse_copilot_items_from_dict(
+            parsed, message_text=message_text, voice_transcript=voice_transcript
+        )
 
-        caption_qty = parse_qty_from_caption(message_text or voice_transcript, default=1)
-        items_out = []
-        for item in parsed.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            part_no = str(item.get("part_no") or "").strip().upper()
-            if not part_no:
-                continue
-            try:
-                qty = _parse_copilot_qty(item.get("qty"), default=caption_qty or 1)
-            except (TypeError, ValueError):
-                qty = caption_qty
-            qty = max(1, qty)
-            brand = str(item.get("brand") or "UNKNOWN").strip().upper()
-            product_type = str(item.get("product_type") or "").strip()
-            item_out = {"part_no": part_no, "qty": qty, "brand": brand, "source": "COPILOT_UNIFIED"}
-            if product_type:
-                item_out["product_type"] = product_type
-            items_out.append(item_out)
+        if not items_out and image_path and os.path.exists(image_path):
+            items_out = _copilot_rfq_table_focus_pass(
+                client,
+                message_text=message_text,
+                image_path=image_path,
+                voice_transcript=voice_transcript,
+            )
+            if items_out:
+                for item in items_out:
+                    item["source"] = "COPILOT_RFQ_TABLE"
 
         result = {
             "attempted": True,

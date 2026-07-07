@@ -109,10 +109,28 @@ def busy_info() -> dict:
 def wait_until_idle(poll_seconds: float = 2.0, label: str = "") -> None:
     import time
 
+    last_log = 0.0
     while is_busy():
         info = busy_info()
         task = info.get("task") or "-"
         channel = info.get("channel") or "-"
         suffix = f" ({label})" if label else ""
-        print(f"⏸️ [BUSY] Waiting{suffix} — {channel} busy: {task}")
+        now = time.time()
+        if now - last_log >= 30.0:
+            print(f"⏸️ [BUSY] Waiting{suffix} — {channel} busy: {task}")
+            last_log = now
         time.sleep(max(0.5, float(poll_seconds)))
+
+
+_throttle_log_times: dict = {}
+
+
+def throttled_log(key: str, message: str, interval: float = 30.0) -> None:
+    """Print at most once per interval to avoid log spam during channel turns."""
+    import time
+
+    now = time.time()
+    last = _throttle_log_times.get(key, 0.0)
+    if now - last >= interval:
+        print(message)
+        _throttle_log_times[key] = now

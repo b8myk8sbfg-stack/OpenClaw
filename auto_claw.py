@@ -23,6 +23,7 @@ from openclaw_busy import (
     is_busy,
     is_channel_turn,
     set_busy,
+    throttled_log,
     wait_until_idle,
 )
 from email_message_classifier import classify_email, log_email_classification
@@ -1614,7 +1615,10 @@ if __name__ == "__main__":
                 wait_until_idle(poll_seconds=IDLE_POLL, label="email-engine")
                 continue
             if not is_channel_turn("email"):
-                print(f"⏸️ Not email turn (current={get_channel_turn()}) — waiting...")
+                throttled_log(
+                    "email-not-turn",
+                    f"⏸️ Not email turn (current={get_channel_turn()}) — waiting...",
+                )
                 time.sleep(IDLE_POLL)
                 continue
 

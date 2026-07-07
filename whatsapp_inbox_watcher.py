@@ -26,6 +26,7 @@ from openclaw_busy import (
     is_busy,
     is_channel_turn,
     set_busy,
+    throttled_log,
     wait_until_idle,
 )
 from openclaw_inquiry_engine import (
@@ -70,7 +71,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.46-WA-IMAGE-VALIDATION"
+VERSION = "v3.47-RFQ-TABLE-VISION"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3624,6 +3625,35 @@ try {
 """
 
 
+def _save_viewer_panel_screenshot(driver, dest_path: str) -> Optional[str]:
+    """Screenshot the whole media viewer panel (better for RFQ tables than tiny <img>)."""
+    for selector in (
+        '[data-testid="media-viewer-panel"]',
+        'div[data-animate-media-viewer="true"]',
+    ):
+        try:
+            panel = driver.find_element(By.CSS_SELECTOR, selector)
+            if not panel.is_displayed():
+                continue
+            tmp_path = dest_path if dest_path.endswith(".png") else f"{dest_path}.png"
+            panel.screenshot(tmp_path)
+            ok, reason = validate_image_file(tmp_path)
+            if ok:
+                print(
+                    f"🖼️ Saved viewer panel screenshot → {tmp_path} "
+                    f"({os.path.getsize(tmp_path)} bytes)"
+                )
+                return tmp_path
+            print(f"⚠️ Viewer panel screenshot rejected: {reason}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        except Exception:
+            continue
+    return None
+
+
 def download_full_resolution_image(driver, bubble, image_path):
     """
     Open the WhatsApp image viewer and save a readable product image to WA_Image.
@@ -3682,6 +3712,9 @@ def download_full_resolution_image(driver, bubble, image_path):
                 continue
 
         if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX:
+            saved = _save_viewer_panel_screenshot(driver, image_path)
+            if saved:
+                return saved
             saved = _save_element_screenshot(main_img, image_path)
             if saved:
                 return saved
@@ -5486,7 +5519,10 @@ def run_persistent_watcher():
                     wait_until_idle(poll_seconds=CHECK_INTERVAL_SECONDS, label="whatsapp-watcher")
                     continue
                 if not is_channel_turn("whatsapp"):
-                    print(f"⏸️ Not WhatsApp turn (current={get_channel_turn()}) — waiting...")
+                    throttled_log(
+                        "whatsapp-not-turn",
+                        f"⏸️ Not WhatsApp turn (current={get_channel_turn()}) — waiting...",
+                    )
                     time.sleep(CHECK_INTERVAL_SECONDS)
                     continue
 
