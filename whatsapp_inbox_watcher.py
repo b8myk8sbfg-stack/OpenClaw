@@ -79,7 +79,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.54-VOICE-BEFORE-AVATAR-BLOB"
+VERSION = "v3.55-PLACEHOLDER-BLOB-RETRY"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3740,6 +3740,73 @@ try {
 }
 """
 
+IMAGE_DISPLAY_CANVAS_EXPORT_JS = """
+var img = arguments[0];
+var callback = arguments[arguments.length - 1];
+try {
+  var w = img.clientWidth || img.naturalWidth || img.width || 0;
+  var h = img.clientHeight || img.naturalHeight || img.height || 0;
+  if (w < 200 || h < 80) {
+    callback(null);
+    return;
+  }
+  var canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  var ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  var data = canvas.toDataURL('image/jpeg', 0.92);
+  callback(data && data.indexOf(',') >= 0 ? data.split(',')[1] : null);
+} catch (e) {
+  callback(null);
+}
+"""
+
+
+def _try_save_placeholder_viewer_image(driver, main_img, image_path: str, natural: dict) -> Optional[str]:
+    """
+  When naturalWidth stays tiny (72x32) but display is large, the CDN URL may still
+  serve full resolution — try blob fetch and display-size canvas before panel screenshot.
+    """
+    nw = int(natural.get("w") or 0)
+    nh = int(natural.get("h") or 0)
+    dw = int(natural.get("dw") or 0)
+    dh = int(natural.get("dh") or 0)
+    if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+        return None
+    if dw < MIN_WA_IMAGE_DISPLAY_PX or dh < 120:
+        return None
+
+    print(
+        f"🖼️ Placeholder natural {nw}x{nh} but display {dw}x{dh} — "
+        "trying blob fetch + display canvas before panel screenshot"
+    )
+    try:
+        b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
+        if b64:
+            saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+            if saved:
+                dims = read_image_dimensions(saved)
+                dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
+                if dims and dims[0] >= MIN_WA_IMAGE_NATURAL_PX and dims[1] >= 80:
+                    print(f"🖼️ Saved full-resolution image (blob fetch, placeholder natural) → {saved} ({dim_label})")
+                    return saved
+                print(f"🖼️ Blob fetch returned {dim_label} — keeping for Copilot")
+                return saved
+    except Exception as exc:
+        print(f"⚠️ Placeholder blob fetch failed: {exc}")
+
+    try:
+        b64 = _execute_async_js(driver, IMAGE_DISPLAY_CANVAS_EXPORT_JS, main_img, timeout=20)
+        if b64:
+            saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+            if saved:
+                print(f"🖼️ Saved display-size canvas export → {saved}")
+                return saved
+    except Exception as exc:
+        print(f"⚠️ Display canvas export failed: {exc}")
+    return None
+
 
 def _save_viewer_panel_screenshot(driver, dest_path: str) -> Optional[str]:
     """Screenshot the whole media viewer panel (better for RFQ tables than tiny <img>)."""
@@ -3807,7 +3874,7 @@ def download_full_resolution_image(driver, bubble, image_path):
             print(
                 f"🖼️ Viewer still loading — natural {nw}x{nh}, waiting for full resolution..."
             )
-            extra_end = time.time() + 12.0
+            extra_end = time.time() + 20.0
             while time.time() < extra_end:
                 time.sleep(1.0)
                 natural = driver.execute_script(
@@ -3848,6 +3915,11 @@ def download_full_resolution_image(driver, bubble, image_path):
 
         if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX and int(natural.get("dh") or 0) >= 150:
             if nw < 120 or nh < 80:
+                placeholder_saved = _try_save_placeholder_viewer_image(
+                    driver, main_img, image_path, natural,
+                )
+                if placeholder_saved:
+                    return placeholder_saved
                 print(
                     f"⚠️ Natural {nw}x{nh} still placeholder — "
                     f"using viewer panel screenshot at display size"

@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.41-STRICT-JSON"
+VERSION = "v1.42-OCR-NO-TEXT-FIX"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -122,6 +122,14 @@ def _normalize_copilot_intent(intent: str) -> str:
 EXTRACTION_ERRORS = frozenset({
     "PARSER_ERROR",
     "JSON_INVALID",
+    "OCR_NO_TEXT",
+    "NO_PRODUCT_FOUND",
+    "NO_FOREGROUND_OBJECT",
+    "LOW_CONFIDENCE",
+})
+
+# Copilot returned valid JSON but could not read products — not an API outage.
+BUSINESS_EXTRACTION_ERRORS = frozenset({
     "OCR_NO_TEXT",
     "NO_PRODUCT_FOUND",
     "NO_FOREGROUND_OBJECT",
@@ -315,8 +323,14 @@ def is_copilot_transport_failure(analysis: dict) -> bool:
         return False
     if analysis.get("ok") is not False:
         return False
+    err = str(analysis.get("extraction_error") or "").upper()
+    if err in BUSINESS_EXTRACTION_ERRORS:
+        return False
     status = analysis.get("http_status")
     if status is None:
+        # Successful API round-trip without http_status — treat as extraction failure, not outage.
+        if err or analysis.get("raw_excerpt"):
+            return False
         return True
     try:
         code = int(status)
@@ -772,6 +786,7 @@ def _copilot_extraction_result_from_parsed(
         "ignored": ignored,
         "raw_excerpt": raw[:800],
         "parse_warning": extraction_error or None,
+        "http_status": 200,
     }
     print(
         f"[COPILOT ANALYZE] intent={intent} ({confidence:.0%}) | "
