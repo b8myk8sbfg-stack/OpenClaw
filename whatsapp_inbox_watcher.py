@@ -31,6 +31,7 @@ from openclaw_busy import (
 )
 from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
+    build_voltage_selection_reply,
     parse_qty_from_caption,
     process_structured_items,
     MARKUP_DIVISOR,
@@ -104,7 +105,18 @@ CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.tx
 MAX_UNREAD_CHATS_PER_RUN = 1
 CHECK_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "2"))
 INCOMING_LOOKBACK = 6
-MONITOR_WHATSAPP_PHONE = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONE", "+60167222208")
+MONITOR_WHATSAPP_PHONES = [
+    phone.strip()
+    for phone in (
+        os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONES")
+        or os.getenv(
+            "OPENCLAW_MONITOR_WHATSAPP_PHONE",
+            "+60167222208,+60167108883",
+        )
+    ).split(",")
+    if phone.strip()
+]
+MONITOR_WHATSAPP_PHONE = MONITOR_WHATSAPP_PHONES[0]
 
 WHATSAPP_SESSION_READY = False
 CHAT_PROCESSING_LOCK = False
@@ -598,7 +610,34 @@ def looks_like_group_chat_name(name):
 
 
 def is_monitor_phone(phone):
-    return normalize_phone(phone) == normalize_phone(MONITOR_WHATSAPP_PHONE)
+    digits = normalize_phone(phone)
+    if not digits:
+        return False
+    for monitor_phone in MONITOR_WHATSAPP_PHONES:
+        monitor = normalize_phone(monitor_phone)
+        if not monitor:
+            continue
+        if digits == monitor or digits.endswith(monitor[-9:]):
+            return True
+    return False
+
+
+def deliver_to_monitor_whatsapp(driver, message, image_path=None, image_caption="OpenClaw analyzed image"):
+    """Send the same monitor alert to every configured monitor WhatsApp number."""
+    ok = False
+    for monitor_phone in MONITOR_WHATSAPP_PHONES:
+        print(f"📣 Opening monitor chat: {monitor_phone}")
+        if not open_whatsapp_chat_by_phone(driver, monitor_phone, chat_label="monitor"):
+            print(f"❌ Monitor WhatsApp chat did not open: {monitor_phone}")
+            continue
+        if send_monitor_notification(
+            driver,
+            message,
+            image_path=image_path,
+            image_caption=image_caption,
+        ):
+            ok = True
+    return ok
 
 
 def format_customer_phone_display(phone, allow_monitor_match: bool = False):
@@ -1749,14 +1788,6 @@ def is_monitor_noise_unit(unit) -> bool:
     if kind == "voice" and len(text) > 120 and ("OpenClaw" in text or "Classification:" in text):
         return True
     return False
-
-
-def is_monitor_phone(phone: str) -> bool:
-    digits = re.sub(r"\D", "", str(phone or ""))
-    monitor = re.sub(r"\D", "", MONITOR_WHATSAPP_PHONE)
-    if not digits or not monitor:
-        return False
-    return digits == monitor or digits.endswith(monitor[-9:])
 
 
 def get_processed_data_ids(contact_name: str = "", contact_hint: str = "") -> set:
@@ -4595,13 +4626,9 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
                         image_path=None, copilot_items=None, backend_comparison=None):
     if customer_replies_go_to_monitor():
         print(
-            "🧪 Monitor mode active. Redirecting alert to your monitor number "
-            f"{MONITOR_WHATSAPP_PHONE} (OPENCLAW_MONITOR_WHATSAPP_PHONE)."
+            "🧪 Monitor mode active. Redirecting alert to monitor number(s): "
+            f"{', '.join(MONITOR_WHATSAPP_PHONES)}."
         )
-
-        if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
-            print("❌ Monitor WhatsApp chat did not open.")
-            return False
 
         monitor_message = build_monitor_reply(
             context=context,
@@ -4614,7 +4641,7 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
             copilot_items=copilot_items,
             backend_comparison=backend_comparison,
         )
-        return send_monitor_notification(
+        return deliver_to_monitor_whatsapp(
             driver,
             monitor_message,
             image_path=image_path,
@@ -4670,15 +4697,15 @@ def send_copilot_malfunction_alert(
     print("🚨 COPILOT MALFUNCTION — alerting monitor")
     print(alert[:500])
     print("=" * 90)
-    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
-        print("❌ Could not open monitor chat for Copilot malfunction alert.")
-        return False
-    return send_monitor_notification(
+    if not deliver_to_monitor_whatsapp(
         driver,
         alert,
         image_path=image_path if image_path and os.path.exists(image_path) else None,
         image_caption=f"OpenClaw malfunction: {operation}",
-    )
+    ):
+        print("❌ Could not deliver Copilot malfunction alert to monitor chat(s).")
+        return False
+    return True
 
 
 def send_classification_alert(
@@ -4695,46 +4722,47 @@ def send_classification_alert(
     print(classification.summary())
     print("=" * 90)
 
-    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
-        print("❌ Could not open monitor chat for classification alert.")
-        return False
-
-    return send_monitor_notification(
+    if not deliver_to_monitor_whatsapp(
         driver,
         alert,
         image_path=image_path if image_path and os.path.exists(image_path) else None,
         image_caption="OpenClaw classification image",
-    )
+    ):
+        print("❌ Could not deliver classification alert to monitor chat(s).")
+        return False
+    return True
 
 
 def process_monitor_feedback(driver):
-    """Check monitor chat for teaching commands like: correct: purchase_order"""
-    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
-        return False
+    """Check monitor chats for teaching commands like: correct: purchase_order"""
+    for monitor_phone in MONITOR_WHATSAPP_PHONES:
+        if not open_whatsapp_chat_by_phone(driver, monitor_phone, chat_label="monitor"):
+            continue
 
-    feedback_text = get_latest_incoming_message(driver)
-    if not feedback_text:
-        return False
+        feedback_text = get_latest_incoming_message(driver)
+        if not feedback_text:
+            continue
 
-    result = apply_feedback_command(feedback_text, INTENT_TYPES)
-    if not result:
-        return False
+        result = apply_feedback_command(feedback_text, INTENT_TYPES)
+        if not result:
+            continue
 
-    ack = (
-        "[OpenClaw Learning Updated]\n"
-        f"Intent: {result['intent']}\n"
-        f"Match text: {result['match_text'][:200] or '(from last message)'}\n"
-        f"Previous intent: {result.get('previous_intent') or '-'}\n"
-        f"Customer context: {result.get('contact_name') or '-'}\n\n"
-        "Saved to corrections + confirmed training examples."
-    )
-    print("")
-    print("=" * 90)
-    print("🎓 WHATSAPP FEEDBACK LEARNED")
-    print(ack)
-    print("=" * 90)
-    send_reply_in_current_chat(driver, ack)
-    return True
+        ack = (
+            "[OpenClaw Learning Updated]\n"
+            f"Intent: {result['intent']}\n"
+            f"Match text: {result['match_text'][:200] or '(from last message)'}\n"
+            f"Previous intent: {result.get('previous_intent') or '-'}\n"
+            f"Customer context: {result.get('contact_name') or '-'}\n\n"
+            "Saved to corrections + confirmed training examples."
+        )
+        print("")
+        print("=" * 90)
+        print("🎓 WHATSAPP FEEDBACK LEARNED")
+        print(ack)
+        print("=" * 90)
+        send_reply_in_current_chat(driver, ack)
+        return True
+    return False
 
 
 def load_supplier_pending():
@@ -4927,6 +4955,25 @@ def process_supplier_reply(driver, contact_name, latest_message):
     return True
 
 
+def _build_item_search_context(item, latest_message="", voice_enrichment=None):
+    """Combine customer text and Copilot specs so voltage is available for OBM lookup."""
+    specs = item.get("technical_specs") or []
+    if isinstance(specs, str):
+        specs = [specs]
+    transcript = ""
+    if voice_enrichment:
+        transcript = str(voice_enrichment.get("transcript") or "").strip()
+    return " ".join(
+        chunk.strip()
+        for chunk in [
+            latest_message or "",
+            transcript,
+            " ".join(str(spec) for spec in specs if spec),
+        ]
+        if chunk and str(chunk).strip()
+    )
+
+
 def process_customer_inquiry(
     driver, contact_name, latest_message, image_analysis=None, customer_contact=None,
     classification=None, document_items=None, pre_extracted_copilot_items=None,
@@ -5036,17 +5083,24 @@ def process_customer_inquiry(
                 "norm": part_norm,
                 "source": item_source,
                 "product_type": str(item.get("product_type") or "").strip(),
+                "technical_specs": item.get("technical_specs") or [],
+                "search_context": _build_item_search_context(
+                    item,
+                    latest_message=latest_message,
+                    voice_enrichment=voice_enrichment,
+                ),
             })
             existing_norms.add(part_norm)
             print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {qty}")
 
-        formatted_rows, tbc_by_brand, skipped = process_structured_items(structured_items)
+        formatted_rows, tbc_by_brand, skipped, voltage_selections = process_structured_items(structured_items)
         result = {
             "formatted_rows": formatted_rows,
             "tbc_by_brand": tbc_by_brand,
             "has_partial": False,
             "missing_layer2_items": [],
             "skipped": skipped,
+            "voltage_selections": voltage_selections,
         }
     elif document_items:
         print(f"📄 Document extraction primary: processing {len(document_items)} item(s).")
@@ -5066,13 +5120,14 @@ def process_customer_inquiry(
                 "source": "DOCUMENT_EXTRACT",
             })
             existing_norms.add(part_norm)
-        formatted_rows, tbc_by_brand, skipped = process_structured_items(structured_items)
+        formatted_rows, tbc_by_brand, skipped, voltage_selections = process_structured_items(structured_items)
         result = {
             "formatted_rows": formatted_rows,
             "tbc_by_brand": tbc_by_brand,
             "has_partial": False,
             "missing_layer2_items": [],
             "skipped": skipped,
+            "voltage_selections": voltage_selections,
         }
     else:
         print("⚠️ Copilot found no usable item — not using regex or legacy OCR fallback.")
@@ -5082,11 +5137,13 @@ def process_customer_inquiry(
             "has_partial": False,
             "missing_layer2_items": [],
             "skipped": [],
+            "voltage_selections": [],
         }
 
     formatted_rows = result["formatted_rows"]
     tbc_by_brand = result["tbc_by_brand"]
     skipped = result.get("skipped", [])
+    voltage_selections = result.get("voltage_selections") or []
 
     log_message = latest_message
     if image_analysis:
@@ -5223,6 +5280,37 @@ def process_customer_inquiry(
             [],
             [],
             f"{image_prefix}{no_items_context}_REPLIED" if sent else f"{image_prefix}{no_items_context}_REPLY_FAILED"
+        )
+        return
+
+    if voltage_selections:
+        print(
+            f"⚡ Voltage selection required for {len(voltage_selections)} item(s) — "
+            "asking customer to choose exact model/voltage."
+        )
+        customer_reply = build_voltage_selection_reply(
+            voltage_selections,
+            customer_message=latest_message,
+        )
+        sent = send_customer_reply(
+            driver,
+            customer_reply,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            original_message=latest_message,
+            context=f"{image_prefix}VOLTAGE_SELECTION",
+            customer_chat_is_open=True,
+            classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_items,
+            backend_comparison=backend_comparison,
+        )
+        append_log(
+            contact_name,
+            log_message,
+            [],
+            [],
+            f"{image_prefix}VOLTAGE_SELECTION_REPLIED" if sent else f"{image_prefix}VOLTAGE_SELECTION_FAILED",
         )
         return
 

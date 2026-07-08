@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.09-CATALOG-BASE-LOOKUP"
+VERSION = "v1.10-VOLTAGE-AWARE-MATCH"
 
 # Customer sell price = purchase cost / MARKUP_DIVISOR (0.72 → ~38.9% markup on cost, ~28% margin).
 MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
@@ -212,28 +212,59 @@ def warehouse_match_trusted(customer_part, match) -> bool:
     return False
 
 
-def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source=""):
-    """Resolve warehouse stock for a part, with stricter rules for visual extraction."""
+def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source="", search_context=""):
+    """Resolve warehouse stock for a part, with voltage-aware matching and variant prompts."""
     _ensure_warehouse_loaded()
     part_no = str(part_no or "").strip().upper()
     source = str(source or "").upper()
+    requested_voltage = resolve_requested_voltage(part_no, search_context)
+
+    if not requested_voltage:
+        variants = collect_voltage_variants(part_no, declared_brand=declared_brand, qty=qty)
+        if len(variants) > 1:
+            print(
+                f"   ⚠️ [ENGINE] Multiple voltage variants for {part_no} — "
+                f"customer selection required ({len(variants)} options)"
+            )
+            return None, variants
 
     exact = EXACT_LOOKUP.get(normalize_part(part_no))
-    if exact:
-        return exact
+    if exact and requested_voltage:
+        stock_voltage = extract_voltage_signature(
+            f"{exact.get('stock_name') or ''} {exact.get('model_no') or ''}"
+        )
+        if stock_voltage and voltage_values_overlap(requested_voltage[1], stock_voltage[1]):
+            return exact, None
+        exact = None
+    elif exact and not requested_voltage:
+        variants = collect_voltage_variants(part_no, declared_brand=declared_brand, qty=qty)
+        if len(variants) <= 1:
+            return exact, None
+        return None, variants
 
     if source in ("COPILOT_VISUAL", "COPILOT_UNIFIED", "COPILOT_LABEL_OCR"):
-        partial = find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
+        partial = find_best_warehouse_match(
+            part_no,
+            declared_brand=declared_brand,
+            qty=qty,
+            search_context=search_context,
+        )
         if partial and warehouse_match_trusted(part_no, partial):
-            return partial
+            return partial, None
         if partial:
             print(
                 f"   ⚠️ [ENGINE] Rejected warehouse remap for visual part {part_no} "
                 f"→ {partial.get('stock_name') or partial.get('api_id')} (different product family)"
             )
-        return None
+        return None, None
 
-    return find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
+    partial = find_best_warehouse_match(
+        part_no,
+        declared_brand=declared_brand,
+        qty=qty,
+        search_context=search_context,
+    )
+    return partial, None
 
 
 def infer_brand_from_part(part_no):
@@ -391,8 +422,20 @@ def build_warehouse_support_context(message_text: str, part_refs=None, max_lines
 
 
 def extract_voltage_signature(text):
-    """Return (AC/DC, voltage values) while treating DC24 and 24VDC equally."""
-    value = str(text or "").upper().replace(" ", "")
+    """Return (AC/DC, voltage values) from text like AC100-240, AC-100-240, DC24."""
+    value = re.sub(r"\s+", "", str(text or "").upper())
+
+    range_match = re.search(
+        r"(AC|DC)[\-/]?(\d{2,4})[\-/](\d{2,4})",
+        value,
+    )
+    if range_match:
+        current_type = range_match.group(1)
+        return current_type, (
+            int(range_match.group(2)),
+            int(range_match.group(3)),
+        )
+
     patterns = (
         ("DC", r"DC(\d+(?:/\d+)*)"),
         ("DC", r"(\d+(?:/\d+)*)VDC"),
@@ -400,10 +443,43 @@ def extract_voltage_signature(text):
         ("AC", r"(\d+(?:/\d+)*)VAC"),
     )
     for current_type, pattern in patterns:
-        match = re.search(pattern, value)
+        match = re.search(pattern, value.replace("-", ""))
         if match:
             return current_type, tuple(int(part) for part in match.group(1).split("/"))
     return None
+
+
+def voltage_values_overlap(req_vals, stock_vals):
+    """True when requested and warehouse voltage ranges share a value or overlap."""
+    if not req_vals or not stock_vals:
+        return False
+    if set(req_vals) & set(stock_vals):
+        return True
+    return min(req_vals) <= max(stock_vals) and min(stock_vals) <= max(req_vals)
+
+
+def resolve_requested_voltage(part_no, search_context=""):
+    """Read voltage from part number and/or customer transcript, caption, or Copilot specs."""
+    chunks = [str(part_no or ""), str(search_context or "")]
+    for chunk in chunks:
+        signature = extract_voltage_signature(chunk)
+        if signature:
+            return signature
+    return None
+
+
+def _format_voltage_label(row):
+    stock_text = " ".join(
+        str(row.get(key) or "")
+        for key in ("stock_name", "model_no", "alt_model")
+    )
+    signature = extract_voltage_signature(stock_text)
+    if signature:
+        current_type, values = signature
+        if len(values) >= 2:
+            return f"{current_type}{values[0]}-{values[1]}"
+        return f"{current_type}{values[0]}"
+    return str(row.get("stock_name") or row.get("model_no") or row.get("api_id") or "").strip()
 
 
 def get_usable_store_qty(api_id, warehouse_row=None):
@@ -455,7 +531,7 @@ def _score_warehouse_candidate(row, part_no, qty, declared_brand, requested_volt
     if requested_voltage:
         if not stock_voltage or stock_voltage[0] != requested_voltage[0]:
             return None
-        if not set(requested_voltage[1]).intersection(stock_voltage[1]):
+        if not voltage_values_overlap(requested_voltage[1], stock_voltage[1]):
             return None
 
     score = 0
@@ -525,7 +601,45 @@ def _pick_best_warehouse_candidate(candidates, part_no, qty):
     return best
 
 
-def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
+def collect_voltage_variants(part_no, declared_brand="UNKNOWN", qty=1):
+    """List distinct warehouse SKUs for the same catalog part with different voltages."""
+    _ensure_warehouse_loaded()
+    part_no = str(part_no or "").strip().upper()
+    declared_brand = str(declared_brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
+    if declared_brand == "UNKNOWN":
+        declared_brand = infer_brand_from_part(part_no)
+
+    candidate_voltages = set()
+    candidates = []
+    for row in WAREHOUSE_ROWS:
+        if not row.get("api_id") or not row.get("stock_name"):
+            continue
+        scored = _score_warehouse_candidate(
+            row, part_no, qty, declared_brand, None, candidate_voltages
+        )
+        if scored and startswith_part_boundary(row.get("stock_name"), part_no) >= 4000:
+            candidates.append(scored)
+
+    if not candidates:
+        return []
+
+    seen = set()
+    variants = []
+    for row in sorted(candidates, key=lambda item: item.get("score") or 0, reverse=True):
+        stock_name = str(row.get("stock_name") or "").strip().upper()
+        if not stock_name or stock_name in seen:
+            continue
+        seen.add(stock_name)
+        variants.append({
+            "api_id": row.get("api_id"),
+            "stock_name": row.get("stock_name"),
+            "model_no": row.get("model_no"),
+            "voltage_label": _format_voltage_label(row),
+        })
+    return variants
+
+
+def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, search_context=""):
     _ensure_warehouse_loaded()
     part_no = str(part_no or "").strip().upper()
     declared_brand = str(declared_brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
@@ -534,15 +648,23 @@ def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
     if not norm:
         return None
 
+    requested_voltage = resolve_requested_voltage(part_no, search_context)
     exact = EXACT_LOOKUP.get(norm)
     if exact:
-        print(f"   ✅ [ENGINE] Exact lookup match: {part_no} → {exact['api_id']}")
-        return exact
+        if requested_voltage:
+            stock_voltage = extract_voltage_signature(
+                f"{exact.get('stock_name') or ''} {exact.get('model_no') or ''}"
+            )
+            if stock_voltage and voltage_values_overlap(requested_voltage[1], stock_voltage[1]):
+                print(f"   ✅ [ENGINE] Exact lookup match: {part_no} → {exact['api_id']}")
+                return exact
+        elif len(collect_voltage_variants(part_no, declared_brand=declared_brand, qty=qty)) <= 1:
+            print(f"   ✅ [ENGINE] Exact lookup match: {part_no} → {exact['api_id']}")
+            return exact
 
     if declared_brand == "UNKNOWN":
         declared_brand = infer_brand_from_part(part_no)
 
-    requested_voltage = extract_voltage_signature(part_no)
     candidate_voltages = set()
     candidates = []
 
@@ -562,7 +684,7 @@ def find_best_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1):
     if not requested_voltage and len(candidate_voltages) > 1:
         print(
             f"   ⚠️ [ENGINE] Ambiguous voltage variants for {part_no}: "
-            f"{sorted(candidate_voltages)}. Refusing to guess."
+            f"{sorted(candidate_voltages)}. Customer must choose."
         )
         return None
 
@@ -898,18 +1020,30 @@ def process_structured_items(structured_items):
     formatted_rows = []
     tbc_by_brand = {}
     skipped = []
+    voltage_selections = []
 
     for item in structured_items:
         part_no = item["part_no"]
         qty = item["qty"]
         declared_brand = item.get("brand") or "UNKNOWN"
+        search_context = item.get("search_context") or ""
 
-        match = resolve_warehouse_match(
+        match, variants = resolve_warehouse_match(
             part_no,
             declared_brand=declared_brand,
             qty=qty,
             source=item.get("source") or "",
+            search_context=search_context,
         )
+
+        if variants:
+            voltage_selections.append({
+                "part_no": part_no,
+                "brand": declared_brand,
+                "qty": qty,
+                "variants": variants,
+            })
+            continue
 
         if match:
             rows, supplier_item = build_rows_from_api(match["api_id"], qty, customer_part=part_no)
@@ -952,7 +1086,7 @@ def process_structured_items(structured_items):
                 })
                 print(f"   🧩 [ENGINE] Unknown-brand item skipped to technical: {desc} | Qty: {qty}")
 
-    return formatted_rows, tbc_by_brand, skipped
+    return formatted_rows, tbc_by_brand, skipped, voltage_selections
 
 
 def process_inquiry_text(inquiry_text):
@@ -972,7 +1106,7 @@ def process_inquiry_text(inquiry_text):
                 f"Brand: {item['brand']} | Source: {item['source']}"
             )
 
-        formatted_rows, tbc_by_brand, skipped = process_structured_items(structured_items)
+        formatted_rows, tbc_by_brand, skipped, _voltage_selections = process_structured_items(structured_items)
 
         print("=" * 90)
         print("✅ [ENGINE] END INQUIRY PROCESSING")
@@ -1010,6 +1144,38 @@ def infer_customer_greeting(customer_message: str = "") -> str:
     if re.search(r"\b(GOOD\s+)?EVENING\b", text):
         return "Good evening"
     return "Hello"
+
+
+def build_voltage_selection_reply(voltage_selections, customer_message=None):
+    """Ask the customer to pick a voltage-specific warehouse SKU when the base part is ambiguous."""
+    company = os.getenv("OPENCLAW_COMPANY_NAME", "Robomatics").strip() or "Robomatics"
+    greeting = infer_customer_greeting(customer_message)
+    msg = f"{greeting},\n\nThank you for your enquiry.\n\n"
+
+    for selection in voltage_selections or []:
+        part_no = str(selection.get("part_no") or "").strip()
+        brand = str(selection.get("brand") or "").strip()
+        label = f"{brand} {part_no}".strip() if brand and brand != "UNKNOWN" else part_no
+        msg += (
+            f"For {label}, we stock more than one voltage option. "
+            f"Please confirm which exact model you need:\n\n"
+        )
+        for index, variant in enumerate(selection.get("variants") or [], start=1):
+            stock_name = str(
+                variant.get("stock_name")
+                or variant.get("model_no")
+                or variant.get("voltage_label")
+                or ""
+            ).strip()
+            msg += f"{index}. {stock_name}\n"
+        msg += "\n"
+
+    msg += (
+        "Please reply with the exact model/voltage from the list above "
+        "(for example, copy option 1).\n\n"
+        f"Best regards,\n{company}"
+    )
+    return msg
 
 
 def _copilot_item_for_part(copilot_items: list, part_no: str) -> dict:
