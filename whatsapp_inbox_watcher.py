@@ -82,7 +82,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.56-FULL-DOWNLOAD-FIRST"
+VERSION = "v3.57-KEEP-WHATSAPP-DOWNLOAD"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3691,22 +3691,29 @@ def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
 
 
 def _save_downloaded_image(downloaded: str, dest_path: str) -> Optional[str]:
-    if not downloaded:
+    """Copy WhatsApp viewer download byte-for-byte into WA_Image (no re-encode)."""
+    if not downloaded or not os.path.exists(downloaded):
         return None
+    ok, reason = validate_image_file(downloaded)
+    if not ok:
+        print(f"⚠️ Downloaded file rejected: {reason} ({downloaded})")
+        return None
+    _, dl_ext = os.path.splitext(downloaded)
+    base, _ = os.path.splitext(dest_path)
+    final_path = f"{base}{dl_ext or '.jpeg'}"
     try:
-        with open(downloaded, "rb") as handle:
-            data = handle.read()
-    except OSError:
+        shutil.copy2(downloaded, final_path)
+    except OSError as exc:
+        print(f"⚠️ Could not copy download → WA_Image: {exc}")
         return None
-    saved = save_validated_image_bytes(data, dest_path)
-    if saved:
-        dims = read_image_dimensions(saved)
-        dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
-        print(
-            f"🖼️ Saved full-resolution image → {saved} "
-            f"({os.path.getsize(saved)} bytes, {dim_label})"
-        )
-    return saved
+    size = os.path.getsize(final_path)
+    dims = read_image_dimensions(final_path)
+    dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
+    print(
+        f"🖼️ Copied WhatsApp download → {final_path} "
+        f"({size} bytes, {dim_label}) from {downloaded}"
+    )
+    return final_path
 
 
 def _better_image_path(path_a: str, path_b: str) -> Optional[str]:
@@ -3825,7 +3832,8 @@ def _try_save_placeholder_viewer_image(driver, main_img, image_path: str, natura
     try:
         b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
         if b64:
-            saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+            blob_dest = f"{os.path.splitext(image_path)[0]}_blob.png"
+            saved = save_validated_image_bytes(base64.b64decode(b64), blob_dest)
             if saved:
                 dims = read_image_dimensions(saved)
                 dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
@@ -3840,7 +3848,8 @@ def _try_save_placeholder_viewer_image(driver, main_img, image_path: str, natura
     try:
         b64 = _execute_async_js(driver, IMAGE_DISPLAY_CANVAS_EXPORT_JS, main_img, timeout=20)
         if b64:
-            saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+            canvas_dest = f"{os.path.splitext(image_path)[0]}_canvas.png"
+            saved = save_validated_image_bytes(base64.b64decode(b64), canvas_dest)
             if saved:
                 print(f"🖼️ Saved display-size canvas export → {saved}")
                 return saved
@@ -3960,10 +3969,12 @@ def download_full_resolution_image(driver, bubble, image_path):
                         saved = _save_downloaded_image(downloaded, image_path)
                         if saved:
                             degraded, reason = is_degraded_wa_capture(saved)
-                            _note_saved(saved)
-                            if not degraded:
-                                return saved
-                            print(f"⚠️ Download saved but degraded ({reason}) — trying other methods")
+                            if degraded:
+                                print(
+                                    f"🖼️ WhatsApp download ready ({reason}) — "
+                                    "keeping original download (not canvas/screenshot)"
+                                )
+                            return saved
             except Exception:
                 continue
 
@@ -4036,10 +4047,12 @@ def download_full_resolution_image(driver, bubble, image_path):
                             saved = _save_downloaded_image(downloaded, image_path)
                             if saved:
                                 degraded, reason = is_degraded_wa_capture(saved)
-                                _note_saved(saved)
-                                if not degraded:
-                                    return saved
-                                print(f"⚠️ Save-as download degraded ({reason})")
+                                if degraded:
+                                    print(
+                                        f"🖼️ Save-as download ready ({reason}) — "
+                                        "keeping original download"
+                                    )
+                                return saved
                 except Exception:
                     continue
             ActionChains(driver).send_keys(Keys.ESCAPE).perform()
@@ -4126,24 +4139,11 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     if full_result:
         degraded, reason = is_degraded_wa_capture(full_result)
         if degraded:
-            print(f"⚠️ First capture degraded ({reason}) — retrying full download once...")
-            retry_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_full_retry.png")
-            retry_result = download_full_resolution_image(driver, bubble, retry_path)
-            if retry_result:
-                retry_degraded, retry_reason = is_degraded_wa_capture(retry_result)
-                if not retry_degraded:
-                    full_result = retry_result
-                    degraded = False
-                else:
-                    print(f"⚠️ Retry still degraded ({retry_reason}) — using best available")
-                    size_a, _, _ = describe_image_file(full_result)
-                    size_b, _, _ = describe_image_file(retry_result)
-                    if size_b > size_a:
-                        full_result = retry_result
+            print(f"🖼️ WA_Image capture ({reason}) — using WhatsApp download copy")
         save_wa_image_manifest(
             full_result,
             message_data_id=message_data_id,
-            capture_method="download_full_resolution",
+            capture_method="whatsapp_download",
         )
         return full_result
 
