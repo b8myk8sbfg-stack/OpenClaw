@@ -10,7 +10,12 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.40-STRICT-JSON"
+VERSION = "v1.41-STRICT-JSON"
+
+# Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
+COMMON_CATALOG_DEFAULT_PREFIXES = (
+    "E3Z", "E2E", "E39", "ER6C", "H3JA", "H3CR", "H3Y", "MY2", "MY4", "3RH", "G3NA",
+)
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -129,7 +134,7 @@ OPENCLAW_UNIFIED_PROMPT = """CRITICAL RULES (override every other instruction):
 1. Never guess. Never autocomplete. Never correct spelling.
 2. Never use previous conversations or warehouse/catalog memory.
 3. Literal transcription only. If unreadable use ?.
-4. Never substitute familiar catalog numbers (e.g. E3Z-D61, H3JA-8A) unless literally visible.
+4. Never substitute familiar catalog numbers from model memory unless those exact characters are visible in the image.
 5. Output ONLY valid JSON. No markdown. No prose. No analysis. No code fences. No text before or after JSON.
 
 You are an Industrial RFQ Extraction Engine. Extract literal evidence only — do NOT identify products from memory.
@@ -213,11 +218,26 @@ Rules:
 - Never invent extra rows that are not visible in the image
 - part_no: literal transcription from Item/Model column and/or nameplate in Picture column
 - qty: from Qty column for that row
-- brand: from Item text or nameplate (e.g. Allen-Bradley)
-- Read only what is visible — never substitute from memory or examples
+- brand: from Item text or nameplate (manufacturer name visible in table or label)
+- Read only characters visible in the image — never substitute from memory, training data, or prompt examples
 
 Required JSON fields: status, intent, input_type, items (array), ignored (array).
 
+Return ONLY valid JSON. No markdown. No prose.
+"""
+
+OPENCLAW_LITERAL_RETRY_PROMPT = """CRITICAL — your part_no values look like catalog defaults, not image transcription.
+
+Re-read the attached image from scratch. Transcribe ONLY characters printed in the table cells and nameplate photo.
+
+Rules:
+- Do NOT return common Omron/Siemens/Mitsubishi default part numbers unless literally visible
+- For RFQ tables: read Item column Model line and Qty column exactly
+- If the nameplate shows CAT/Catalog number, transcribe that exact string
+- part_no must match visible text — use ? for unreadable characters
+- Return exactly ONE item if only one table row is visible
+
+Required JSON fields: status, intent, input_type, items, ignored.
 Return ONLY valid JSON. No markdown. No prose.
 """
 
@@ -532,7 +552,8 @@ def _suspect_table_misread(
         isinstance(it, dict)
         and (
             str(it.get("product_type") or "").lower() == "battery"
-            or "ER6C" in str(it.get("part_no") or "").upper()
+            or _part_looks_like_catalog_default(str(it.get("part_no") or ""))
+            and str(it.get("part_no") or "").upper().startswith("ER6C")
         )
         for it in items
     )
@@ -560,6 +581,76 @@ def _should_adopt_table_retry(parsed_handheld: dict, parsed_table: dict) -> bool
     return len(items) >= 1
 
 
+def _part_looks_like_catalog_default(part_no: str) -> bool:
+    part_u = str(part_no or "").strip().upper()
+    if not part_u:
+        return False
+    return any(part_u.startswith(prefix) for prefix in COMMON_CATALOG_DEFAULT_PREFIXES)
+
+
+def _suspect_catalog_default_extraction(parsed: dict, message_text: str = "") -> bool:
+    """Detect when Copilot likely returned a familiar catalog part instead of reading the image."""
+    if not isinstance(parsed, dict):
+        return False
+    input_type = str(parsed.get("input_type") or "").strip().lower()
+    items = [i for i in (parsed.get("items") or []) if isinstance(i, dict)]
+    if not items:
+        return False
+    caption_u = str(message_text or "").upper()
+    for item in items:
+        part_no = str(item.get("part_no") or "").strip()
+        brand = str(item.get("brand") or "").strip().upper()
+        if not _part_looks_like_catalog_default(part_no):
+            continue
+        if input_type == "rfq_table":
+            return True
+        if brand and brand not in caption_u and input_type in ("single_product_photo", "unknown", ""):
+            return True
+    return False
+
+
+def _append_extraction_trace(
+    lines: list,
+    pass_label: str,
+    raw: str,
+    parsed: dict,
+    adopted: bool = False,
+    note: str = "",
+) -> None:
+    lines.append(f"  [{pass_label}] adopted={adopted}" + (f" | {note}" if note else ""))
+    if isinstance(parsed, dict):
+        items = parsed.get("items") or []
+        parts = [
+            f"{i.get('part_no')} x{i.get('qty', 1)}"
+            for i in items[:4]
+            if isinstance(i, dict)
+        ]
+        lines.append(
+            f"    input_type={parsed.get('input_type')} items={len(items)} "
+            f"parts={', '.join(parts) or '-'}"
+        )
+        if _suspect_catalog_default_extraction(parsed):
+            lines.append("    ⚠️ SUSPECTED_CATALOG_DEFAULT (common part prefix without image evidence)")
+
+
+def _prune_table_retry_items(items: list, misread_part: str = "") -> list:
+    """Drop obvious catalog-hallucination rows when table retry returns too many items."""
+    if len(items) <= 1:
+        return items
+    misread_u = str(misread_part or "").strip().upper()
+    kept = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        part_u = str(item.get("part_no") or "").strip().upper()
+        if misread_u and part_u == misread_u:
+            continue
+        if _part_looks_like_catalog_default(part_u):
+            continue
+        kept.append(item)
+    return kept if kept else items
+
+
 def _append_copilot_extraction_log(
     pass_label: str,
     message_text: str = "",
@@ -569,6 +660,7 @@ def _append_copilot_extraction_log(
     parsed: dict = None,
     result: dict = None,
     note: str = "",
+    trace_lines: list = None,
 ) -> None:
     """Single consolidated log for every Copilot extraction pass."""
     try:
@@ -586,6 +678,9 @@ def _append_copilot_extraction_log(
             f"dimensions: {dim_label}",
             f"caption: {(message_text or '')[:240]}",
         ]
+        if trace_lines:
+            lines.append("TRACE:")
+            lines.extend(trace_lines)
         if note:
             lines.append(f"note: {note}")
         lines.append("RAW:")
@@ -919,8 +1014,10 @@ def analyze_incoming_inquiry_with_copilot(
         return response_raw, parsed_obj, parse_err, parse_detail
 
     raw = ""
+    trace_lines = []
     try:
         raw, parsed, parse_error, parse_detail = _call_and_parse(user_text, "pass1")
+        _append_extraction_trace(trace_lines, "pass1", raw, parsed, adopted=True, note="initial")
 
         if parsed is None:
             print(f"[COPILOT ANALYZE] JSON parse failed ({parse_error}): {parse_detail}")
@@ -936,6 +1033,10 @@ def analyze_incoming_inquiry_with_copilot(
                 + f"\n\nYour invalid response was:\n{raw[:1200]}"
             )
             raw, parsed, parse_error, parse_detail = _call_and_parse(retry_prompt, "pass2-json-retry")
+            _append_extraction_trace(
+                trace_lines, "pass2-json-retry", raw, parsed,
+                adopted=bool(parsed), note=parse_detail or parse_error or "",
+            )
 
         if parsed is None:
             print(f"[COPILOT ANALYZE] PARSER_ERROR after retry: {parse_detail}")
@@ -1004,16 +1105,82 @@ def analyze_incoming_inquiry_with_copilot(
             )
             raw2, parsed2, err2, det2 = _call_and_parse(table_prompt, "pass3-table-retry")
             if parsed2 is not None and _should_adopt_table_retry(parsed, parsed2):
+                pruned = _prune_table_retry_items(
+                    parsed2.get("items") or [],
+                    misread_part=prev_part,
+                )
+                if len(pruned) != len(parsed2.get("items") or []):
+                    print(
+                        f"[COPILOT ANALYZE] Pruned table retry items "
+                        f"{len(parsed2.get('items') or [])} → {len(pruned)}"
+                    )
+                    parsed2["items"] = pruned
                 print(
                     f"[COPILOT ANALYZE] Adopting pass3-table-retry: "
                     f"rfq_table with {len(parsed2.get('items') or [])} item(s)"
                 )
                 raw, parsed = raw2, parsed2
+                _append_extraction_trace(
+                    trace_lines, "pass3-table-retry", raw2, parsed2,
+                    adopted=True, note=f"replaced pass1 {prev_part}",
+                )
             elif parsed2 is not None:
                 print(
                     "[COPILOT ANALYZE] pass3-table-retry not adopted — "
                     f"input_type={parsed2.get('input_type')}, items={len(parsed2.get('items') or [])}"
                 )
+                _append_extraction_trace(trace_lines, "pass3-table-retry", raw2, parsed2, adopted=False)
+
+        if _suspect_catalog_default_extraction(parsed, message_text=message_text):
+            bad_parts = [
+                str(i.get("part_no") or "")
+                for i in (parsed.get("items") or [])
+                if isinstance(i, dict)
+            ]
+            print(
+                f"[COPILOT ANALYZE] Suspected catalog-default hallucination "
+                f"({', '.join(bad_parts)}) — literal transcription retry"
+            )
+            trace_lines.append(
+                f"  WHY: part(s) {bad_parts} match common Copilot catalog defaults "
+                f"(E3Z/ER6C/H3JA prefixes) — likely NOT read from image"
+            )
+            literal_prompt = _build_extraction_user_prompt(
+                message_text=message_text,
+                document_text=document_text,
+                voice_transcript=voice_transcript,
+                base_prompt=OPENCLAW_LITERAL_RETRY_PROMPT,
+                image_path=image_path,
+                image_dims=image_dims,
+            )
+            raw4, parsed4, err4, det4 = _call_and_parse(literal_prompt, "pass4-literal-retry")
+            if parsed4 is not None and not _suspect_catalog_default_extraction(parsed4, message_text):
+                raw, parsed = raw4, parsed4
+                _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=True)
+            elif parsed4 is not None:
+                kept = [
+                    i for i in (parsed4.get("items") or [])
+                    if isinstance(i, dict)
+                    and not _part_looks_like_catalog_default(str(i.get("part_no") or ""))
+                ]
+                if kept:
+                    parsed4["items"] = kept
+                    raw, parsed = raw4, parsed4
+                    _append_extraction_trace(
+                        trace_lines, "pass4-literal-retry", raw4, parsed4,
+                        adopted=True, note="pruned catalog defaults",
+                    )
+                else:
+                    parsed["items"] = []
+                    parsed["status"] = "no_products"
+                    trace_lines.append(
+                        "  pass4-literal-retry still returned catalog defaults — cleared items"
+                    )
+                    _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=False)
+            else:
+                parsed["items"] = []
+                parsed["status"] = "no_products"
+                trace_lines.append("  pass4-literal-retry failed — cleared items")
 
         valid, missing = _validate_copilot_extraction_json(parsed)
         if not valid:
@@ -1052,6 +1219,7 @@ def analyze_incoming_inquiry_with_copilot(
             raw=raw,
             parsed=parsed,
             result=result,
+            trace_lines=trace_lines,
         )
         return result
     except (json.JSONDecodeError, ValueError) as exc:
@@ -1245,7 +1413,7 @@ def build_extraction_failure_customer_reply(
             "Hi, thank you for your inquiry.\n\n"
             "We received your message and our team is reviewing it now. "
             "To speed up the quotation, please also type the part number(s) and quantity, for example:\n"
-            "150-C25NBD Qty:3",
+            "ABC-12345 Qty:2",
             "PARSER_ERROR",
         )
 
@@ -1258,7 +1426,7 @@ def build_extraction_failure_customer_reply(
         return (
             "Hi, I received your message but could not detect part numbers.\n\n"
             "Please send in this format:\n"
-            "150-C25NBD Qty:3",
+            "ABC-12345 Qty:2",
             err or "NO_PRODUCT_FOUND",
         )
 
@@ -1267,7 +1435,7 @@ def build_extraction_failure_customer_reply(
             "Hi, thank you for your inquiry.\n\n"
             "We received your photo but are not fully confident in the part numbers read. "
             "Please confirm by typing the exact part number(s) and quantity, for example:\n"
-            "ER6C (AA)-3.6V Qty:1",
+            "ABC-12345 Qty:2",
             "LOW_CONFIDENCE",
         )
 
@@ -1286,7 +1454,7 @@ def _ask_for_clearer_photo_reply(caption: str = "") -> str:
         "Hi, thank you for your message.\n\n"
         "I received your photo but could not read the product label clearly enough to quote accurately.\n\n"
         "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
-        "ER6C 3.6V Qty:1"
+        "ABC-12345 Qty:2"
     )
 
 
