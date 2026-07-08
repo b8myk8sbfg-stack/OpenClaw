@@ -22,13 +22,16 @@ from openai import OpenAI
 
 BASE_DIR = "/Users/evon/OpenClaw"
 WA_AUDIO_DIR = os.path.join(BASE_DIR, "WA_Audio")
+WA_IMAGE_DIR = os.path.join(BASE_DIR, "WA_Image")
+WA_FILES_DIR = os.path.join(BASE_DIR, "WA_Files")
 VOICE_CAPTURE_DIR = WA_AUDIO_DIR
 VOICE_LATEST_OPUS = os.path.join(WA_AUDIO_DIR, "latest.opus")
 VOICE_LATEST_WAV = os.path.join(WA_AUDIO_DIR, "latest.whisper.wav")
-DOC_CAPTURE_DIR = os.path.join(BASE_DIR, "logs/wa_document_capture")
-DOC_PREVIEW_DIR = os.path.join(BASE_DIR, "logs/wa_document_preview")
+IMAGE_LATEST_PATH = os.path.join(WA_IMAGE_DIR, "latest.png")
+DOC_CAPTURE_DIR = WA_FILES_DIR
+DOC_PREVIEW_DIR = WA_IMAGE_DIR
 
-VERSION = "v1.20-VOICE-MENU-DOWNLOAD"
+VERSION = "v1.22-WA-IMAGE-VALIDATION"
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
@@ -676,7 +679,7 @@ def capture_document_preview_image(driver, bubble, contact_name: str) -> Optiona
         )
         time.sleep(0.5)
         bubble.screenshot(out_path)
-        print(f"📄 [DOC] Saved document preview screenshot: {out_path}")
+        print(f"📄 [DOC] Saved document preview screenshot → {WA_IMAGE_DIR}/{os.path.basename(out_path)}")
         return out_path
     except Exception as exc:
         print(f"⚠️ [DOC] Preview screenshot failed: {exc}")
@@ -1483,13 +1486,13 @@ def transcribe_audio_via_copilot(audio_path: str) -> Tuple[str, str]:
         return "", ""
 
 
-def clear_wa_audio_workspace():
-    """Remove saved voice files after processing so the next message starts clean."""
-    if not os.path.isdir(WA_AUDIO_DIR):
+def _clear_workspace_dir(directory: str, label: str) -> None:
+    """Remove all files in a WA_* workspace after processing."""
+    if not os.path.isdir(directory):
         return
     removed = 0
-    for name in os.listdir(WA_AUDIO_DIR):
-        path = os.path.join(WA_AUDIO_DIR, name)
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
         if os.path.isfile(path):
             try:
                 os.remove(path)
@@ -1497,7 +1500,70 @@ def clear_wa_audio_workspace():
             except OSError:
                 pass
     if removed:
-        print(f"🧹 [VOICE] Cleared {removed} file(s) from {WA_AUDIO_DIR}")
+        print(f"🧹 [{label}] Cleared {removed} file(s) from {directory}")
+
+
+def clear_wa_audio_workspace():
+    """Remove saved voice files after processing so the next message starts clean."""
+    _clear_workspace_dir(WA_AUDIO_DIR, "VOICE")
+
+
+def clear_wa_image_workspace():
+    """Remove saved image screenshots after Copilot analysis."""
+    _clear_workspace_dir(WA_IMAGE_DIR, "IMAGE")
+
+
+def clear_wa_files_workspace():
+    """Remove downloaded document files after Copilot analysis."""
+    _clear_workspace_dir(WA_FILES_DIR, "FILES")
+
+
+def clear_wa_attachment_workspace():
+    """Clear all temporary WhatsApp attachment workspaces (audio, image, files)."""
+    clear_wa_audio_workspace()
+    clear_wa_image_workspace()
+    clear_wa_files_workspace()
+
+
+def save_wa_image_manifest(
+    image_path: str,
+    message_data_id: str = "",
+    capture_method: str = "",
+) -> None:
+    """Track the current message image like latest.opus for voice."""
+    if not image_path or not os.path.exists(image_path):
+        return
+    os.makedirs(WA_IMAGE_DIR, exist_ok=True)
+    try:
+        shutil.copy2(image_path, IMAGE_LATEST_PATH)
+    except OSError as exc:
+        print(f"⚠️ [IMAGE] Could not update {IMAGE_LATEST_PATH}: {exc}")
+        return
+    size, dims, dim_label = describe_image_file(image_path)
+    degraded, degrade_reason = is_degraded_wa_capture(image_path)
+    manifest_path = os.path.join(WA_IMAGE_DIR, "latest.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "data_id": message_data_id,
+                    "named_path": image_path,
+                    "bytes": size,
+                    "dimensions": dim_label,
+                    "capture_method": capture_method or "unknown",
+                    "degraded": degraded,
+                    "degrade_reason": degrade_reason if degraded else "",
+                },
+                f,
+                indent=2,
+            )
+    except Exception:
+        pass
+    quality = "DEGRADED" if degraded else "OK"
+    print(f"✅ [IMAGE] Updated {IMAGE_LATEST_PATH} ({dim_label}, {size} bytes, {quality})")
+    if degraded:
+        print(f"⚠️ [IMAGE] Degraded capture — monitor + Copilot get this same low-res file: {degrade_reason}")
 
 
 def _read_voice_manifest() -> dict:
@@ -1604,7 +1670,7 @@ def download_document_from_bubble(
             downloaded = _pick_newest_download(safe_name)
             if downloaded:
                 os.replace(downloaded, out_path)
-                print(f"📄 [DOC] Saved document (inline download): {out_path}")
+                print(f"📄 [DOC] Saved document (inline download) → {out_path}")
                 return out_path
 
         element.click()
@@ -1632,7 +1698,7 @@ def download_document_from_bubble(
         downloaded = _pick_newest_download(safe_name)
         if downloaded:
             os.replace(downloaded, out_path)
-            print(f"📄 [DOC] Saved document: {out_path}")
+            print(f"📄 [DOC] Saved document → {WA_FILES_DIR}/{os.path.basename(out_path)}")
             return out_path
 
         b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, element)
@@ -1661,10 +1727,181 @@ def download_document_from_bubble(
             pass
 
 
+MIN_WA_IMAGE_BYTES = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_BYTES", "8000"))
+MIN_WA_IMAGE_DISPLAY_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_DISPLAY_PX", "400"))
+MIN_WA_IMAGE_NATURAL_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_NATURAL_PX", "250"))
+MIN_WA_IMAGE_FULL_WIDTH = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_FULL_WIDTH", "900"))
+
+
+def describe_image_file(path: str) -> Tuple[int, Optional[Tuple[int, int]], str]:
+    """Return (bytes, (w,h)|None, human label) for a saved image."""
+    if not path or not os.path.exists(path):
+        return 0, None, "missing"
+    size = os.path.getsize(path)
+    dims = read_image_dimensions(path)
+    dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
+    return size, dims, dim_label
+
+
+def is_degraded_wa_capture(path: str) -> Tuple[bool, str]:
+    """
+    True when WA_Image file is a low-res viewer screenshot, not a true download.
+    Degraded captures often look like stickers when re-sent on WhatsApp monitor chat.
+    """
+    size, dims, dim_label = describe_image_file(path)
+    if not dims:
+        return True, f"unknown dimensions ({size} bytes)"
+    width, height = dims
+    longest = max(width, height)
+    if longest < MIN_WA_IMAGE_FULL_WIDTH:
+        return True, (
+            f"{dim_label}, {size} bytes "
+            f"(need longest side >= {MIN_WA_IMAGE_FULL_WIDTH}px)"
+        )
+    if size < 50000 and width * height < 500_000:
+        return True, f"{dim_label}, {size} bytes (small file for Copilot vision)"
+    return False, f"{dim_label}, {size} bytes"
+
+
+def detect_image_format(data: bytes) -> Tuple[Optional[str], str]:
+    """Return (mime_type, file_extension) from image bytes."""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", ".png"
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        return "image/jpeg", ".jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None, ""
+
+
+def read_image_dimensions(path: str) -> Optional[Tuple[int, int]]:
+    """Return (width, height) from PNG/JPEG/WebP header without Pillow."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(256 * 1024)
+    except OSError:
+        return None
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        if w > 0 and h > 0:
+            return w, h
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h = int.from_bytes(data[idx + 5:idx + 7], "big")
+                w = int.from_bytes(data[idx + 7:idx + 9], "big")
+                if w > 0 and h > 0:
+                    return w, h
+                break
+            if marker in (0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0x01):
+                idx += 4
+                continue
+            if idx + 3 >= len(data):
+                break
+            seg_len = int.from_bytes(data[idx + 2:idx + 4], "big")
+            idx += 2 + max(seg_len, 2)
+    if len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8 " and len(data) >= 30:
+            w = int.from_bytes(data[26:28], "little") & 0x3FFF
+            h = int.from_bytes(data[28:30], "little") & 0x3FFF
+            if w > 0 and h > 0:
+                return w, h
+        if chunk == b"VP8L" and len(data) >= 25:
+            bits = int.from_bytes(data[21:25], "little")
+            w = (bits & 0x3FFF) + 1
+            h = ((bits >> 14) & 0x3FFF) + 1
+            if w > 0 and h > 0:
+                return w, h
+    return None
+
+
+def validate_image_file(path: str, min_bytes: int = None) -> Tuple[bool, str]:
+    """Reject corrupt placeholders / tiny thumbnails before Copilot vision."""
+    min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
+    if not path or not os.path.exists(path):
+        return False, "file missing"
+    size = os.path.getsize(path)
+    if size < min_bytes:
+        return False, f"too small ({size} bytes, need >= {min_bytes})"
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+    except OSError as exc:
+        return False, str(exc)
+    mime, _ext = detect_image_format(head)
+    if not mime:
+        return False, "not a valid PNG/JPEG/WebP image"
+    return True, mime
+
+
+def save_validated_image_bytes(data: bytes, dest_path: str, min_bytes: int = None) -> Optional[str]:
+    """Write image bytes with correct extension; return path or None if invalid."""
+    min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
+    mime, ext = detect_image_format(data)
+    if not mime or len(data) < min_bytes:
+        return None
+    base, _ = os.path.splitext(dest_path)
+    final_path = f"{base}{ext}"
+    with open(final_path, "wb") as handle:
+        handle.write(data)
+    ok, reason = validate_image_file(final_path, min_bytes=min_bytes)
+    if not ok:
+        try:
+            os.remove(final_path)
+        except OSError:
+            pass
+        print(f"⚠️ [IMAGE] Rejected saved image: {reason}")
+        return None
+    return final_path
+
+
+def pick_newest_image_download(baseline_mtime: float = 0, min_bytes: int = None) -> Optional[str]:
+    """Find a freshly downloaded image in ~/Downloads (Save Image As / viewer download)."""
+    download_dirs = [
+        os.path.expanduser("~/Downloads"),
+        WA_IMAGE_DIR,
+    ]
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+    candidates = []
+    for directory in download_dirs:
+        if not os.path.isdir(directory):
+            continue
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            if not name.lower().endswith(image_exts):
+                continue
+            mtime = os.path.getmtime(path)
+            if baseline_mtime and mtime <= baseline_mtime:
+                continue
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    min_bytes = MIN_WA_IMAGE_BYTES if min_bytes is None else min_bytes
+    for path in candidates:
+        if time.time() - os.path.getmtime(path) > 120:
+            continue
+        ok, _reason = validate_image_file(path, min_bytes=min_bytes)
+        if ok:
+            return path
+    return None
+
+
 def _pick_newest_download(preferred_name: str) -> Optional[str]:
     download_dirs = [
         os.path.expanduser("~/Downloads"),
-        os.path.join(BASE_DIR, "logs/wa_document_capture"),
+        WA_FILES_DIR,
     ]
     candidates = []
     for directory in download_dirs:
