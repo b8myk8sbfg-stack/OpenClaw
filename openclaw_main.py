@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.42-OCR-NO-TEXT-FIX"
+VERSION = "v1.43-OCR-TABLE-RETRY"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -178,6 +178,8 @@ rfq_table (B):
 - qty: from Qty column — never default to 1 if Qty column shows another number
 - part_no: from Item/Model/Catalog column; use Picture column nameplate to confirm
 - Do NOT apply handheld/foreground/battery rules to tables
+- Do NOT return status ocr_no_text for rfq_table when ANY column header or cell text is visible
+- If some characters are unclear, use ? in part_no — still return status success with items[]
 
 purchase_order (D): one item per PO line.
 panel_photo (E): only products the customer clearly intends to quote.
@@ -211,7 +213,9 @@ Return ONLY this JSON object (no other text). Use YOUR OWN readings — do NOT c
   "reasoning": ""
 }
 
-If no products found: status="no_products", items=[]. If label unreadable: status="ocr_no_text", items=[].
+If no products found: status="no_products", items=[].
+For rfq_table with ANY visible cell or header text: status MUST be "success" with items[] — never ocr_no_text.
+For nameplate-only photos with zero readable characters: status="ocr_no_text", items=[].
 One product = one item. One RFQ row = one item. One PO line = one item.
 """
 
@@ -231,6 +235,25 @@ Rules:
 
 Required JSON fields: status, intent, input_type, items (array), ignored (array).
 
+Return ONLY valid JSON. No markdown. No prose.
+"""
+
+OPENCLAW_OCR_TABLE_RETRY_PROMPT = """CRITICAL — you returned ocr_no_text or zero items, but the image IS a readable RFQ table.
+
+The attached image shows a landscape spreadsheet/table with columns such as No, Item, Picture, Qty.
+The text in the table cells and nameplate IS readable. Do NOT return ocr_no_text.
+
+Rules:
+- input_type MUST be rfq_table
+- status MUST be "success" if any table text is visible
+- Count visible rows — if only ONE row is visible, return exactly ONE item
+- part_no: transcribe Model/Catalog from Item column AND confirm from Picture nameplate
+- qty: from Qty column for that row (never default to 1 if Qty shows another number)
+- brand: from Item text or nameplate manufacturer name
+- Use ? only for individual unreadable characters — not as an excuse to return empty items[]
+- Read only characters visible in the image — never substitute from memory
+
+Required JSON fields: status, intent, input_type, items (array), ignored (array).
 Return ONLY valid JSON. No markdown. No prose.
 """
 
@@ -542,6 +565,57 @@ def _build_extraction_user_prompt(
     return "\n\n".join(prompt_parts)
 
 
+def _is_landscape_rfq_image(image_dims: tuple = None, message_text: str = "") -> bool:
+    """True when image layout or caption suggests an RFQ table screenshot."""
+    if not image_dims or len(image_dims) < 2:
+        return False
+    width, height = int(image_dims[0] or 0), int(image_dims[1] or 0)
+    if width > 0 and height > 0 and width > height * 1.35:
+        return True
+    caption_u = str(message_text or "").upper()
+    return bool(re.search(r"\b(QUOTE|RFQ|QUOTATION|PLS QUOTE)\b", caption_u)) and width > height
+
+
+def _parsed_items_with_part_no(parsed: dict) -> list:
+    if not isinstance(parsed, dict):
+        return []
+    return [
+        item for item in (parsed.get("items") or [])
+        if isinstance(item, dict) and str(item.get("part_no") or "").strip()
+    ]
+
+
+def _should_retry_empty_table_extraction(
+    parsed: dict,
+    image_dims: tuple = None,
+    image_path: str = None,
+    message_text: str = "",
+) -> bool:
+    """Retry when Copilot classifies a table but returns ocr_no_text / zero items."""
+    if not image_path or not isinstance(parsed, dict):
+        return False
+    if _parsed_items_with_part_no(parsed):
+        return False
+    status = str(parsed.get("status") or "").strip().lower()
+    input_type = str(parsed.get("input_type") or "").strip().lower()
+    landscape = _is_landscape_rfq_image(image_dims, message_text)
+    if input_type == "rfq_table":
+        return True
+    if landscape and status in ("ocr_no_text", "no_products", "no_text", ""):
+        return True
+    return False
+
+
+def _should_adopt_ocr_table_retry(parsed_retry: dict) -> bool:
+    """Adopt OCR table retry when it returns at least one part_no."""
+    if not isinstance(parsed_retry, dict):
+        return False
+    status = str(parsed_retry.get("status") or "").strip().lower()
+    if status in ("ocr_no_text", "no_products", "error"):
+        return False
+    return len(_parsed_items_with_part_no(parsed_retry)) >= 1
+
+
 def _suspect_table_misread(
     parsed: dict,
     image_dims: tuple = None,
@@ -685,11 +759,13 @@ def _append_copilot_extraction_log(
             if image_dims and image_dims[0] and image_dims[1]
             else "n/a"
         )
+        img_bytes = os.path.getsize(image_path) if image_path and os.path.exists(image_path) else 0
         lines = [
             "=" * 88,
             f"{stamp} | {pass_label} | engine={VERSION}",
             f"image: {image_path or 'none'}",
             f"dimensions: {dim_label}",
+            f"image_bytes: {img_bytes}",
             f"caption: {(message_text or '')[:240]}",
         ]
         if trace_lines:
@@ -1145,6 +1221,47 @@ def analyze_incoming_inquiry_with_copilot(
                     f"input_type={parsed2.get('input_type')}, items={len(parsed2.get('items') or [])}"
                 )
                 _append_extraction_trace(trace_lines, "pass3-table-retry", raw2, parsed2, adopted=False)
+
+        if _should_retry_empty_table_extraction(
+            parsed,
+            image_dims=image_dims,
+            image_path=image_path,
+            message_text=message_text,
+        ):
+            prev_status = parsed.get("status")
+            print(
+                f"[COPILOT ANALYZE] Empty table / ocr_no_text on readable landscape image "
+                f"(status={prev_status}, input_type={parsed.get('input_type')}) — OCR table retry"
+            )
+            ocr_prompt = (
+                _build_extraction_user_prompt(
+                    message_text=message_text,
+                    document_text=document_text,
+                    voice_transcript=voice_transcript,
+                    base_prompt=OPENCLAW_OCR_TABLE_RETRY_PROMPT,
+                    image_path=image_path,
+                    image_dims=image_dims,
+                )
+                + f"\n\nYour prior empty response: status={prev_status}, "
+                f"input_type={parsed.get('input_type')}, items=[]"
+            )
+            raw3b, parsed3b, err3b, det3b = _call_and_parse(ocr_prompt, "pass3b-ocr-table-retry")
+            if parsed3b is not None and _should_adopt_ocr_table_retry(parsed3b):
+                print(
+                    f"[COPILOT ANALYZE] Adopting pass3b-ocr-table-retry: "
+                    f"{len(_parsed_items_with_part_no(parsed3b))} item(s)"
+                )
+                raw, parsed = raw3b, parsed3b
+                _append_extraction_trace(
+                    trace_lines, "pass3b-ocr-table-retry", raw3b, parsed3b,
+                    adopted=True, note=f"replaced empty status={prev_status}",
+                )
+            elif parsed3b is not None:
+                print(
+                    "[COPILOT ANALYZE] pass3b-ocr-table-retry not adopted — "
+                    f"status={parsed3b.get('status')}, items={len(parsed3b.get('items') or [])}"
+                )
+                _append_extraction_trace(trace_lines, "pass3b-ocr-table-retry", raw3b, parsed3b, adopted=False)
 
         if _suspect_catalog_default_extraction(parsed, message_text=message_text):
             bad_parts = [
