@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.45-LOW-CONF-TABLE-VERIFY"
+VERSION = "v1.46-PASS3D-UNIFIED-RETRY"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -270,6 +270,7 @@ Rules:
 - IGNORE your previous part_no completely — do NOT return it again
 - Do NOT return common default parts (E3Z*, ER6C, H3JA*, 3G3MX*, MY2*, etc.) unless those EXACT characters are visible
 - part_no: transcribe the Model/Catalog line in the Item column character-by-character
+- part_no must NOT be empty — use ? for individual unreadable characters
 - Confirm part_no against the nameplate photo in the Picture column
 - qty: read the Qty column for that row — never default to 1 if another number is visible
 - brand: manufacturer name visible in Item text or nameplate (e.g. Allen-Bradley, Omron, Siemens)
@@ -673,31 +674,6 @@ def _should_verify_rfq_table_extraction(
     return False
 
 
-def _should_adopt_table_verification_retry(parsed_before: dict, parsed_retry: dict) -> bool:
-    """Adopt table verify retry when it beats a weak or hallucinated pass1."""
-    if not _should_adopt_ocr_table_retry(parsed_retry):
-        return False
-    if _suspect_catalog_default_extraction(parsed_retry):
-        return False
-    retry_parts = _bad_part_numbers_from_parsed(parsed_retry)
-    if not retry_parts:
-        return False
-    for part in retry_parts:
-        if _part_looks_like_catalog_default(part):
-            return False
-    if _suspect_catalog_default_extraction(parsed_before):
-        return _should_adopt_table_hallucination_retry(parsed_before, parsed_retry)
-    before_parts = _bad_part_numbers_from_parsed(parsed_before)
-    before_conf = _max_table_confidence(parsed_before)
-    retry_conf = _max_table_confidence(parsed_retry)
-    if before_conf < RFQ_TABLE_VERIFY_CONFIDENCE:
-        if retry_conf > before_conf:
-            return True
-        if set(retry_parts) != set(before_parts):
-            return True
-    return False
-
-
 def _bad_part_numbers_from_parsed(parsed: dict) -> list:
     if not isinstance(parsed, dict):
         return []
@@ -706,6 +682,89 @@ def _bad_part_numbers_from_parsed(parsed: dict) -> list:
         for item in (parsed.get("items") or [])
         if isinstance(item, dict) and str(item.get("part_no") or "").strip()
     ]
+
+
+def _is_adoptable_table_extraction(parsed_retry: dict) -> bool:
+    """True when retry JSON has real part_no values that are not catalog-default guesses."""
+    if not _should_adopt_ocr_table_retry(parsed_retry):
+        return False
+    if _suspect_catalog_default_extraction(parsed_retry):
+        return False
+    for part in _bad_part_numbers_from_parsed(parsed_retry):
+        if _part_looks_like_catalog_default(part):
+            return False
+    return True
+
+
+def _should_adopt_fresh_unified_table_retry(parsed_before: dict, parsed_retry: dict) -> bool:
+    """Adopt a fresh unified-prompt re-read after a failed correction pass."""
+    if not _is_adoptable_table_extraction(parsed_retry):
+        return False
+    before_parts = set(_bad_part_numbers_from_parsed(parsed_before))
+    retry_parts = set(_bad_part_numbers_from_parsed(parsed_retry))
+    if not retry_parts or retry_parts == before_parts:
+        return False
+    return True
+
+
+def _should_adopt_table_verification_retry(parsed_before: dict, parsed_retry: dict) -> bool:
+    """Adopt table verify retry when it beats a weak or hallucinated pass1."""
+    if not _is_adoptable_table_extraction(parsed_retry):
+        return False
+    if _suspect_catalog_default_extraction(parsed_before):
+        return _should_adopt_table_hallucination_retry(parsed_before, parsed_retry)
+    before_parts = _bad_part_numbers_from_parsed(parsed_before)
+    before_conf = _max_table_confidence(parsed_before)
+    retry_conf = _max_table_confidence(parsed_retry)
+    if before_conf < RFQ_TABLE_VERIFY_CONFIDENCE:
+        if retry_conf > before_conf:
+            return True
+        if set(_bad_part_numbers_from_parsed(parsed_retry)) != set(before_parts):
+            return True
+    return False
+
+
+def _run_pass3d_unified_table_retry(
+    parsed_before: dict,
+    *,
+    message_text: str,
+    document_text: str,
+    voice_transcript: str,
+    image_path: str,
+    image_dims: tuple,
+    trace_lines: list,
+    _call_and_parse,
+) -> tuple:
+    """Fresh unified-prompt re-read — mirrors manual Copilot UI test (no negative prior context)."""
+    print("[COPILOT ANALYZE] pass3c failed — pass3d fresh unified prompt (manual-test parity)")
+    unified_prompt = _build_extraction_user_prompt(
+        message_text=message_text,
+        document_text=document_text,
+        voice_transcript=voice_transcript,
+        base_prompt=OPENCLAW_UNIFIED_PROMPT,
+        image_path=image_path,
+        image_dims=image_dims,
+    )
+    raw3d, parsed3d, err3d, det3d = _call_and_parse(unified_prompt, "pass3d-unified-table-retry")
+    if parsed3d is not None and _should_adopt_fresh_unified_table_retry(parsed_before, parsed3d):
+        print(
+            f"[COPILOT ANALYZE] Adopting pass3d-unified-table-retry: "
+            f"{', '.join(_bad_part_numbers_from_parsed(parsed3d))}"
+        )
+        _append_extraction_trace(
+            trace_lines, "pass3d-unified-table-retry", raw3d, parsed3d,
+            adopted=True,
+        )
+        return raw3d, parsed3d
+    if parsed3d is not None:
+        print(
+            "[COPILOT ANALYZE] pass3d-unified-table-retry not adopted — "
+            f"parts={_bad_part_numbers_from_parsed(parsed3d)}"
+        )
+        _append_extraction_trace(trace_lines, "pass3d-unified-table-retry", raw3d, parsed3d, adopted=False)
+    else:
+        trace_lines.append("  pass3d-unified-table-retry failed")
+    return None, None
 
 
 def _should_adopt_table_hallucination_retry(parsed_before: dict, parsed_retry: dict) -> bool:
@@ -1422,15 +1481,43 @@ def analyze_incoming_inquiry_with_copilot(
                     trace_lines, "pass3c-hallucination-table-retry", raw3c, parsed3c,
                     adopted=False,
                 )
-                parsed["items"] = []
-                parsed["status"] = "no_products"
-                trace_lines.append(
-                    "  Cleared items — verify retry did not beat weak pass1"
+                pass1_snapshot = dict(parsed)
+                raw3d, parsed3d = _run_pass3d_unified_table_retry(
+                    pass1_snapshot,
+                    message_text=message_text,
+                    document_text=document_text,
+                    voice_transcript=voice_transcript,
+                    image_path=image_path,
+                    image_dims=image_dims,
+                    trace_lines=trace_lines,
+                    _call_and_parse=_call_and_parse,
                 )
+                if parsed3d is not None:
+                    raw, parsed = raw3d, parsed3d
+                else:
+                    parsed["items"] = []
+                    parsed["status"] = "no_products"
+                    trace_lines.append(
+                        "  Cleared items — pass3c and pass3d did not produce adoptable parts"
+                    )
             else:
-                parsed["items"] = []
-                parsed["status"] = "no_products"
-                trace_lines.append("  pass3c-hallucination-table-retry failed — cleared items")
+                pass1_snapshot = dict(parsed)
+                raw3d, parsed3d = _run_pass3d_unified_table_retry(
+                    pass1_snapshot,
+                    message_text=message_text,
+                    document_text=document_text,
+                    voice_transcript=voice_transcript,
+                    image_path=image_path,
+                    image_dims=image_dims,
+                    trace_lines=trace_lines,
+                    _call_and_parse=_call_and_parse,
+                )
+                if parsed3d is not None:
+                    raw, parsed = raw3d, parsed3d
+                else:
+                    parsed["items"] = []
+                    parsed["status"] = "no_products"
+                    trace_lines.append("  pass3c failed — pass3d also failed; cleared items")
 
         elif _suspect_catalog_default_extraction(parsed, message_text=message_text):
             bad_parts = _bad_part_numbers_from_parsed(parsed)
