@@ -4434,8 +4434,19 @@ def send_monitor_notification(
     image_path: str = None,
     image_caption: str = "OpenClaw analyzed image",
 ) -> bool:
-    """Send analyzed image first, then text — so monitor sees photo before long reply."""
+    """Send monitor alert. Pre-production format sends quotation text first, image after."""
     ok = True
+    text_first = get_monitor_message_format() != "debug"
+    if text_first:
+        if not send_reply_in_current_chat(driver, message):
+            return False
+        if image_path and os.path.exists(image_path):
+            time.sleep(2)
+            if not send_image_attachment_in_current_chat(driver, image_path, caption=image_caption):
+                print("⚠️ Monitor image attach failed — text was sent.")
+                ok = False
+        return ok
+
     if image_path and os.path.exists(image_path):
         if not send_image_attachment_in_current_chat(driver, image_path, caption=image_caption):
             print("⚠️ Monitor image attach failed — continuing with text only.")
@@ -4465,9 +4476,23 @@ def format_backend_comparison_lines(backend_comparison: dict) -> list:
     return lines
 
 
-def build_monitor_reply(context, customer_name, customer_contact, original_message, reply_message,
-                        classification_summary=None, image_path=None, copilot_items=None,
-                        backend_comparison=None):
+def get_monitor_message_format():
+    """Monitor WhatsApp layout: preproduction (forwardable) or debug (verbose diagnostics)."""
+    env_mode = os.getenv("OPENCLAW_MONITOR_FORMAT", "").strip().lower()
+    if env_mode in ("debug", "verbose", "development"):
+        return "debug"
+    if env_mode in ("preproduction", "preprod", "forward", "production"):
+        return "preproduction"
+    reply_mode = get_customer_reply_mode()
+    if reply_mode in ("preproduction", "preprod", "forward"):
+        return "preproduction"
+    return "preproduction"
+
+
+def build_monitor_reply_debug(context, customer_name, customer_contact, original_message, reply_message,
+                              classification_summary=None, image_path=None, copilot_items=None,
+                              backend_comparison=None):
+    """Verbose monitor layout with engine, classification, and extraction diagnostics."""
     lines = [
         "[OpenClaw Monitor Mode]",
         f"Engine: {OPENCLAW_ENGINE_VERSION}",
@@ -4517,6 +4542,51 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
     ])
 
     return "\n".join(lines)
+
+
+def build_monitor_reply_preproduction(context, customer_name, customer_contact, original_message,
+                                      reply_message):
+    """Forward-friendly monitor layout: quotation on top, customer context below a separator."""
+    phone_display = format_customer_phone_display(customer_contact)
+    lines = [
+        reply_message or "(empty)",
+        "",
+        "──────────────────────────────",
+        "Original Message:",
+        f"Context: {context or 'Customer reply'}",
+        f"Customer: {customer_name or '-'}",
+    ]
+    if phone_display:
+        lines.append(f"Customer Contact: {phone_display}")
+    lines.extend([
+        "",
+        original_message or "(empty)",
+    ])
+    return "\n".join(lines)
+
+
+def build_monitor_reply(context, customer_name, customer_contact, original_message, reply_message,
+                        classification_summary=None, image_path=None, copilot_items=None,
+                        backend_comparison=None):
+    if get_monitor_message_format() == "debug":
+        return build_monitor_reply_debug(
+            context=context,
+            customer_name=customer_name,
+            customer_contact=customer_contact,
+            original_message=original_message,
+            reply_message=reply_message,
+            classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=copilot_items,
+            backend_comparison=backend_comparison,
+        )
+    return build_monitor_reply_preproduction(
+        context=context,
+        customer_name=customer_name,
+        customer_contact=customer_contact,
+        original_message=original_message,
+        reply_message=reply_message,
+    )
 
 
 def send_customer_reply(driver, reply_message, customer_name=None, customer_contact=None,
@@ -5178,6 +5248,8 @@ def process_customer_inquiry(
         formatted_rows,
         ai_research=ai_research,
         photo_confirmation=photo_confirmation,
+        customer_message=latest_message,
+        copilot_items=copilot_items,
     )
     sent = send_customer_reply(
         driver,

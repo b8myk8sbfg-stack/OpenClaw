@@ -985,11 +985,72 @@ def process_inquiry_text(inquiry_text):
     }
 
 
-def build_plain_quotation_reply(rows, ai_research=None, photo_confirmation=None):
-    msg = "Hi, thank you for your inquiry.\n\n"
-    if photo_confirmation:
+def infer_customer_greeting(customer_message: str = "") -> str:
+    """Match customer's time-of-day greeting when present."""
+    text = str(customer_message or "").upper()
+    if re.search(r"\b(GOOD\s+)?MORNING\b", text):
+        return "Good morning"
+    if re.search(r"\b(GOOD\s+)?AFTERNOON\b", text):
+        return "Good afternoon"
+    if re.search(r"\b(GOOD\s+)?EVENING\b", text):
+        return "Good evening"
+    return "Hello"
+
+
+def _copilot_item_for_part(copilot_items: list, part_no: str) -> dict:
+    target = normalize_part(part_no)
+    if not target:
+        return {}
+    for item in copilot_items or []:
+        if not isinstance(item, dict):
+            continue
+        if normalize_part(item.get("part_no")) == target:
+            return item
+    return {}
+
+
+def _display_product_name(row: dict, copilot_items: list = None) -> str:
+    """Prefer a readable product label from extraction, then warehouse row."""
+    customer_part = str(row.get("customer_part") or "").strip()
+    copilot_item = _copilot_item_for_part(copilot_items, customer_part or row.get("desc", ""))
+    description = str(copilot_item.get("description") or "").strip()
+    if description:
+        first_line = next((line.strip() for line in description.splitlines() if line.strip()), "")
+        if first_line:
+            return first_line
+    desc = str(row.get("desc") or "").strip()
+    brand = str(copilot_item.get("brand") or row.get("brand") or "").strip()
+    part_no = customer_part or desc
+    if brand and brand.upper() not in ("UNKNOWN", ""):
+        if normalize_part(brand) not in normalize_part(part_no):
+            return f"{brand} {part_no}".strip()
+    return desc or part_no
+
+
+def build_plain_quotation_reply(
+    rows,
+    ai_research=None,
+    photo_confirmation=None,
+    customer_message=None,
+    copilot_items=None,
+):
+    company = os.getenv("OPENCLAW_COMPANY_NAME", "Robomatics").strip() or "Robomatics"
+    greeting = infer_customer_greeting(customer_message)
+    msg = f"{greeting},\n\nThank you for your enquiry.\n\n"
+
+    if photo_confirmation and not copilot_items:
         msg += f"{str(photo_confirmation).strip()}\n\n"
-    msg += "Here is the initial status:\n\n"
+
+    if len(rows) == 1:
+        product_name = _display_product_name(rows[0], copilot_items=copilot_items)
+        qty = int(rows[0].get("qty", 1))
+        unit = "pc" if qty == 1 else "pcs"
+        msg += (
+            f"Please find below our preliminary quotation for "
+            f"{product_name} — quantity {qty} {unit}:\n\n"
+        )
+    else:
+        msg += "Please find below our preliminary quotation:\n\n"
 
     total = 0.0
     has_total = False
@@ -997,11 +1058,7 @@ def build_plain_quotation_reply(rows, ai_research=None, photo_confirmation=None)
     has_tbc_balance = False
 
     for row in rows:
-        desc = row.get("desc", "")
-        customer_part = str(row.get("customer_part") or "").strip()
-        if customer_part and customer_part.upper() not in desc.upper():
-            desc = customer_part
-
+        desc = _display_product_name(row, copilot_items=copilot_items)
         qty = int(row.get("qty", 1))
         price = row.get("price", "[TBC]")
         lt = row.get("lt", "[TBC]")
@@ -1011,10 +1068,16 @@ def build_plain_quotation_reply(rows, ai_research=None, photo_confirmation=None)
         if price == "[TBC]" and str(lt) == "[TBC]":
             has_tbc_balance = True
 
-        msg += f"- {desc}\n"
-        msg += f"  Qty: {qty}\n"
-        msg += f"  Unit Price: RM {price}\n"
-        msg += f"  Lead Time: {lt}\n"
+        msg += f"• {desc}\n"
+        msg += f"  Quantity: {qty} {'pc' if qty == 1 else 'pcs'}\n"
+        if price == "[TBC]":
+            msg += "  Unit price: Pending verification\n"
+        else:
+            msg += f"  Unit price: RM {price}\n"
+        if lt == "[TBC]":
+            msg += "  Lead time: Pending verification\n"
+        else:
+            msg += f"  Lead time: {lt}\n"
 
         if price != "[TBC]":
             price_val = float(str(price).replace(",", ""))
@@ -1026,18 +1089,23 @@ def build_plain_quotation_reply(rows, ai_research=None, photo_confirmation=None)
         msg += "\n"
 
     if has_total:
-        msg += f"Total available quoted amount: RM {total:,.2f}\n\n"
+        msg += f"Total quoted amount: RM {total:,.2f}\n\n"
 
     if has_ex_stock and has_tbc_balance:
         msg += (
-            "Available STORE quantity is quoted Ex-Stock above. "
-            "Any remaining quantity is marked [TBC] and will be verified shortly.\n\n"
+            "Available store quantity is quoted Ex-Stock above. "
+            "Any remaining quantity is pending verification and will be updated shortly.\n\n"
+        )
+    elif has_tbc_balance:
+        msg += (
+            "We are confirming stock availability and final pricing with our supplier "
+            "and will update you shortly.\n\n"
         )
 
-    msg += "Items marked [TBC] will be verified and updated shortly."
+    msg += f"Best regards,\n{company}"
 
     if ai_research:
-        msg += "\n\nProduct information:\n"
+        msg += "\n\n"
         msg += str(ai_research).strip()
 
     return msg
