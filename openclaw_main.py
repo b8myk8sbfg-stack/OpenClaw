@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.48-MANUAL-PARITY-TEST"
+VERSION = "v1.49-VISION-DIAGNOSE"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -268,7 +268,7 @@ The attached image is a landscape RFQ table (No, Item, Picture, Qty columns).
 Rules:
 - input_type MUST be rfq_table
 - IGNORE your previous part_no completely — do NOT return it again
-- Do NOT return common default parts (E3Z*, ER6C, H3JA*, 3G3MX*, MY2*, etc.) unless those EXACT characters are visible
+- Do NOT return parts from memory or training — only characters visible in the image
 - part_no: transcribe the Model/Catalog line in the Item column character-by-character
 - part_no must NOT be empty — use ? for individual unreadable characters
 - Confirm part_no against the nameplate photo in the Picture column
@@ -1110,16 +1110,15 @@ def _copilot_user_content_with_image(user_text: str, image_path: str = None):
         if not mime:
             mime = mimetypes.guess_type(image_path)[0] or "image/jpeg"
         image_b64 = base64.b64encode(raw).decode("ascii")
-        return [
-            {"type": "text", "text": user_text},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{image_b64}",
-                    "detail": "high",
-                },
+        image_part = {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime};base64,{image_b64}",
+                "detail": "high",
             },
-        ]
+        }
+        # Match Copilot native protocol: image content before text prompt.
+        return [image_part, {"type": "text", "text": user_text}]
     return user_text
 
 
@@ -1400,6 +1399,21 @@ def analyze_incoming_inquiry_with_copilot(
             return fail
 
         if single_pass:
+            catalog_parts = _bad_part_numbers_from_parsed(parsed)
+            if _suspect_catalog_default_extraction(parsed, message_text) or any(
+                _part_looks_like_catalog_default(p) for p in catalog_parts
+            ):
+                print(
+                    f"[COPILOT ANALYZE] SINGLE_PASS rejected catalog hallucination "
+                    f"({', '.join(catalog_parts)}) — Copilot likely did not read the image"
+                )
+                trace_lines.append(
+                    f"  REJECTED catalog guess: {catalog_parts} (confidence "
+                    f"{_max_table_confidence(parsed):.0%})"
+                )
+                parsed = dict(parsed)
+                parsed["items"] = []
+                parsed["status"] = "no_products"
             result = _copilot_extraction_result_from_parsed(
                 parsed,
                 raw,

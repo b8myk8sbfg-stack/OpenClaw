@@ -123,6 +123,14 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=400,
             content={"error": {"message": str(exc), "type": "invalid_request_error"}},
         )
+    if image is not None:
+        print(
+            f"[copilot] chat/completions image: {len(image)} bytes, prompt_chars={len(prompt)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(f"[copilot] chat/completions text-only, prompt_chars={len(prompt)}", file=sys.stderr, flush=True)
     if not prompt.strip():
         return JSONResponse(
             status_code=400,
