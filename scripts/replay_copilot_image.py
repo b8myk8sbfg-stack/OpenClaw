@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Replay a saved WA_Image file through Copilot extraction (for debugging)."""
+"""Replay a saved WA_Image file through Copilot extraction (for debugging).
+
+Run with OpenClaw's environment (not system python3):
+
+  bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --caption "PLS QUOTE"
+
+  # or:
+  cd /Users/evon/OpenClaw && uv run python scripts/replay_copilot_image.py /path/to/image_full.jpg
+"""
 
 import argparse
 import json
@@ -10,8 +18,18 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from openclaw_main import analyze_incoming_inquiry_with_copilot
-from whatsapp_attachment_processor import read_image_dimensions, validate_image_file
+try:
+    from openclaw_main import analyze_incoming_inquiry_with_copilot
+    from whatsapp_attachment_processor import read_image_dimensions, validate_image_file
+except ModuleNotFoundError as exc:
+    print(
+        "ERROR: Missing Python dependency for OpenClaw.\n"
+        "Do not use system python3. Run instead:\n"
+        "  bash scripts/replay_copilot_image.sh <image> [--caption ...]\n"
+        "  cd /Users/evon/OpenClaw && uv run python scripts/replay_copilot_image.py <image>",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from exc
 
 
 def main():
