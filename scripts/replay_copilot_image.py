@@ -9,6 +9,10 @@ Run with OpenClaw's environment (not system python3):
   # Manual Copilot UI parity (single pass, minimal prompt — use this to match your UI test):
   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --manual
 
+  # OpenAI vision (uses OPENAI_API_KEY from .env — recommended for images):
+  bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --openai \\
+    --expect-part 150-C25NBD --expect-qty 3
+
   # Expect Allen-Bradley table row:
   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --manual \\
     --expect-part 150-C25NBD --expect-qty 3
@@ -82,6 +86,11 @@ def main():
         help="Pass1 only — skip verify/retries (keeps default prompt unless --manual)",
     )
     parser.add_argument(
+        "--openai",
+        action="store_true",
+        help="Use OpenAI vision (OPENAI_API_KEY) instead of local Copilot proxy for this image",
+    )
+    parser.add_argument(
         "--expect-part",
         default="",
         help="Fail unless extracted part_no matches (e.g. 150-C25NBD)",
@@ -108,7 +117,9 @@ def main():
     print(f"Image: {image_path}")
     print(f"Bytes: {size} | dimensions: {dim_label} | valid: {ok} ({reason})")
     print(f"Caption: {caption!r}")
-    if args.manual:
+    if args.openai:
+        print("Mode: OPENAI vision (OPENAI_API_KEY — set OPENCLAW_IMAGE_BACKEND=openai in .env for production)")
+    elif args.manual:
         print("Mode: MANUAL parity (single pass + minimal prompt — same as Copilot UI test)")
     elif args.single_pass:
         print("Mode: SINGLE_PASS (pass1 only)")
@@ -122,6 +133,7 @@ def main():
         image_path=image_path,
         single_pass=args.manual or args.single_pass,
         minimal_prompt=args.manual,
+        image_backend="openai" if args.openai else None,
     )
     print(json.dumps(result, indent=2, default=str))
 

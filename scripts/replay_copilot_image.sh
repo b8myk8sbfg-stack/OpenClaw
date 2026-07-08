@@ -5,6 +5,10 @@
 #   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --manual \\
 #     --expect-part 150-C25NBD --expect-qty 3
 #
+# OpenAI vision (uses OPENAI_API_KEY from .env):
+#   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --openai \\
+#     --expect-part 150-C25NBD --expect-qty 3
+#
 # Full OpenClaw pipeline:
 #   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --caption "PLS QUOTE"
 

@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.50-DEGRADED-HONEST"
+VERSION = "v1.51-OPENAI-IMAGE"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -28,6 +28,7 @@ COPILOT_EXTRACTION_LOG = os.path.join(BASE_DIR, "logs", "copilot_extraction.log"
 RFQ_TABLE_VERIFY_CONFIDENCE = float(os.getenv("OPENCLAW_RFQ_TABLE_VERIFY_CONFIDENCE", "0.55"))
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
 
 
 def parse_copilot_confidence(value, default: float = 0.75) -> float:
@@ -564,6 +565,27 @@ def _copilot_manual_parity_prompt_enabled(override: bool = None) -> bool:
     return os.getenv("OPENCLAW_COPILOT_MANUAL_PARITY", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def _image_analysis_backend(override: str = None) -> str:
+    """Which backend handles image attachments: copilot (local proxy) or openai."""
+    if override:
+        return str(override).strip().lower()
+    raw = os.getenv("OPENCLAW_IMAGE_BACKEND", "copilot").strip().lower()
+    if raw in ("openai", "gpt", "gpt-4o", "gpt-4.1", "gpt-4.1-mini"):
+        return "openai"
+    return "copilot"
+
+
+def _use_openai_for_image(image_path: str = None, backend: str = None) -> bool:
+    if not image_path or not os.path.exists(image_path):
+        return False
+    if _image_analysis_backend(backend) != "openai":
+        return False
+    if not os.getenv("OPENAI_API_KEY"):
+        print("[OPENAI ANALYZE] OPENAI_API_KEY not set — cannot use OpenAI image backend")
+        return False
+    return True
 
 
 def _build_extraction_user_prompt(
@@ -1236,6 +1258,152 @@ def _build_copilot_reasoning(parsed: dict, items_out: list) -> str:
     return reasoning or (f"Copilot input_type={input_type}" if input_type else "")
 
 
+def analyze_incoming_inquiry_with_openai_vision(
+    message_text: str = "",
+    image_path: str = None,
+    document_text: str = None,
+    voice_transcript: str = None,
+    minimal_prompt: bool = False,
+) -> dict:
+    """Extract RFQ items from an image using OpenAI vision (OPENAI_API_KEY), not Copilot proxy."""
+    message_text = str(message_text or "").strip()
+    document_text = str(document_text or "").strip()
+    voice_transcript = str(voice_transcript or "").strip()
+
+    if not image_path or not os.path.exists(image_path):
+        return _minimal_copilot_analysis_result(
+            message_text=message_text,
+            parse_warning="image file not found for OpenAI vision",
+            http_status=200,
+        )
+
+    from whatsapp_attachment_processor import read_image_dimensions, validate_image_file
+
+    img_ok, img_reason = validate_image_file(image_path)
+    dims = read_image_dimensions(image_path)
+    image_dims = dims
+    dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
+    img_size = os.path.getsize(image_path)
+
+    print("[OPENAI ANALYZE] Image inquiry via OpenAI vision (text/pdf/voice still use Copilot)...")
+    print(f"[OPENAI ANALYZE] Model: {OPENAI_VISION_MODEL}")
+    print(
+        f"[OPENAI ANALYZE] Image: {img_size} bytes, {dim_label} "
+        f"({'valid' if img_ok else 'INVALID: ' + img_reason})"
+    )
+    if not img_ok:
+        return _minimal_copilot_analysis_result(
+            message_text=message_text,
+            parse_warning=f"invalid image: {img_reason}",
+            http_status=200,
+        )
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=120.0, max_retries=1)
+    user_text = _build_extraction_user_prompt(
+        message_text=message_text,
+        document_text=document_text,
+        voice_transcript=voice_transcript,
+        image_path=image_path,
+        image_dims=image_dims,
+        minimal=minimal_prompt,
+    )
+    content = _copilot_user_content_with_image(user_text, image_path)
+
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_VISION_MODEL,
+            messages=[{"role": "user", "content": content}],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        print(f"[OPENAI ANALYZE RAW] {raw[:500]}")
+        parsed, parse_error, parse_detail = parse_copilot_json_response(raw)
+        if parsed is not None:
+            parsed = _normalize_copilot_extraction_json(parsed)
+        _append_copilot_extraction_log(
+            pass_label="openai-vision",
+            message_text=message_text,
+            image_path=image_path,
+            image_dims=image_dims,
+            raw=raw,
+            parsed=parsed,
+            note=parse_detail or parse_error or "",
+        )
+        if parsed is None:
+            fail = _minimal_copilot_analysis_result(
+                message_text=message_text,
+                raw=raw,
+                parse_warning=f"JSON parse failed: {parse_detail}",
+                http_status=200,
+                extraction_error="PARSER_ERROR",
+            )
+            fail["analysis_backend"] = "openai_vision"
+            return fail
+        valid, missing = _validate_copilot_extraction_json(parsed)
+        if not valid:
+            fail = _minimal_copilot_analysis_result(
+                message_text=message_text,
+                raw=raw,
+                parse_warning=f"JSON validation failed: {', '.join(missing)}",
+                http_status=200,
+                extraction_error="JSON_INVALID",
+            )
+            fail["analysis_backend"] = "openai_vision"
+            return fail
+        result = _copilot_extraction_result_from_parsed(
+            parsed,
+            raw,
+            message_text=message_text,
+            voice_transcript=voice_transcript,
+            image_path=image_path,
+        )
+        result["analysis_backend"] = "openai_vision"
+        for item in result.get("items") or []:
+            item["source"] = "OPENAI_VISION"
+        _append_copilot_extraction_log(
+            pass_label="openai-final",
+            message_text=message_text,
+            image_path=image_path,
+            image_dims=image_dims,
+            raw=raw,
+            parsed=parsed,
+            result=result,
+            note="openai_vision",
+        )
+        return result
+    except (APIConnectionError, APITimeoutError) as exc:
+        print(f"[OPENAI ANALYZE] connection/timeout: {exc}")
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "http_status": None,
+            "items": [],
+            "analysis_backend": "openai_vision",
+        }
+    except APIStatusError as exc:
+        print(f"[OPENAI ANALYZE] API error {exc.status_code}: {exc}")
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "http_status": getattr(exc, "status_code", None),
+            "items": [],
+            "analysis_backend": "openai_vision",
+        }
+    except Exception as exc:
+        print(f"[OPENAI ANALYZE] failed: {exc}")
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": str(exc),
+            "http_status": None,
+            "items": [],
+            "analysis_backend": "openai_vision",
+        }
+
+
 def analyze_incoming_inquiry_with_copilot(
     message_text: str = "",
     image_path: str = None,
@@ -1243,13 +1411,11 @@ def analyze_incoming_inquiry_with_copilot(
     voice_transcript: str = None,
     single_pass: bool = None,
     minimal_prompt: bool = None,
+    image_backend: str = None,
 ) -> dict:
     """Copilot-first unified analysis: classify intent + extract parts from text/image/voice/doc together."""
     if os.getenv("OPENCLAW_COPILOT_FIRST", "1").strip().lower() in ("0", "false", "no", "off"):
         return {"attempted": False, "ok": False, "items": []}
-
-    single_pass = _copilot_single_pass_enabled(single_pass)
-    minimal_prompt = _copilot_manual_parity_prompt_enabled(minimal_prompt)
 
     message_text = str(message_text or "").strip()
     document_text = str(document_text or "").strip()
@@ -1257,6 +1423,19 @@ def analyze_incoming_inquiry_with_copilot(
 
     if not any([message_text, image_path, document_text, voice_transcript]):
         return {"attempted": False, "ok": False, "items": []}
+
+    # Images → OpenAI vision when OPENCLAW_IMAGE_BACKEND=openai (saves Copilot tokens; better vision).
+    if _use_openai_for_image(image_path, backend=image_backend):
+        return analyze_incoming_inquiry_with_openai_vision(
+            message_text=message_text,
+            image_path=image_path,
+            document_text=document_text,
+            voice_transcript=voice_transcript,
+            minimal_prompt=_copilot_manual_parity_prompt_enabled(minimal_prompt),
+        )
+
+    single_pass = _copilot_single_pass_enabled(single_pass)
+    minimal_prompt = _copilot_manual_parity_prompt_enabled(minimal_prompt)
 
     print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
     if single_pass:
