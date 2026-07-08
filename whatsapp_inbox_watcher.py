@@ -72,14 +72,17 @@ from whatsapp_attachment_processor import (
     save_validated_image_bytes,
     validate_image_file,
     read_image_dimensions,
+    describe_image_file,
+    is_degraded_wa_capture,
     MIN_WA_IMAGE_DISPLAY_PX,
     MIN_WA_IMAGE_NATURAL_PX,
+    MIN_WA_IMAGE_FULL_WIDTH,
     BLOB_TO_BASE64_JS,
     _execute_async_js,
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.55-PLACEHOLDER-BLOB-RETRY"
+VERSION = "v3.56-FULL-DOWNLOAD-FIRST"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -3146,7 +3149,11 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             )
             if image_path_this_step:
                 image_path = image_path_this_step
-                print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
+                degraded, reason = is_degraded_wa_capture(image_path)
+                if degraded:
+                    print(f"   🖼️ Image captured (DEGRADED {reason}) — same file goes to Copilot + monitor")
+                else:
+                    print("   🖼️ Full-resolution image captured — unified Copilot analyze at end of plan")
             elif bubble_has_explicit_voice_ui(container) or (
                 bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
             ):
@@ -3905,43 +3912,42 @@ def download_full_resolution_image(driver, bubble, image_path):
                 for btn in driver.find_elements(By.CSS_SELECTOR, selector):
                     if btn.is_displayed():
                         btn.click()
-                        time.sleep(4)
+                        time.sleep(6)
                         downloaded = pick_newest_image_download(baseline_mtime)
                         saved = _save_downloaded_image(downloaded, image_path)
                         if saved:
-                            return saved
+                            degraded, reason = is_degraded_wa_capture(saved)
+                            if not degraded:
+                                return saved
+                            print(f"⚠️ Download saved but degraded ({reason}) — trying other methods")
             except Exception:
                 continue
 
-        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX and int(natural.get("dh") or 0) >= 150:
-            if nw < 120 or nh < 80:
+        nw = int(natural.get("w") or 0)
+        nh = int(natural.get("h") or 0)
+        dw = int(natural.get("dw") or 0)
+        dh = int(natural.get("dh") or 0)
+        if nw < 120 or nh < 80:
+            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
                 placeholder_saved = _try_save_placeholder_viewer_image(
                     driver, main_img, image_path, natural,
                 )
                 if placeholder_saved:
-                    return placeholder_saved
-                print(
-                    f"⚠️ Natural {nw}x{nh} still placeholder — "
-                    f"using viewer panel screenshot at display size"
-                )
-            saved = _save_viewer_panel_screenshot(driver, image_path)
-            if saved:
-                return saved
-            if nw >= 80 and nh >= 80:
-                saved = _save_element_screenshot(main_img, image_path)
-                if saved:
-                    return saved
+                    degraded, reason = is_degraded_wa_capture(placeholder_saved)
+                    if not degraded:
+                        return placeholder_saved
+                    print(f"⚠️ Placeholder blob/canvas still degraded ({reason})")
 
-        nw = int(natural.get("w") or 0)
-        nh = int(natural.get("h") or 0)
         if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
             try:
                 b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
                 if b64:
                     saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
                     if saved:
-                        print(f"🖼️ Saved full-resolution image (blob fetch) → {saved}")
-                        return saved
+                        degraded, reason = is_degraded_wa_capture(saved)
+                        print(f"🖼️ Saved image (blob fetch) → {saved} ({reason})")
+                        if not degraded:
+                            return saved
             except Exception as exc:
                 print(f"⚠️ Blob fetch failed: {exc}")
 
@@ -3950,13 +3956,15 @@ def download_full_resolution_image(driver, bubble, image_path):
                 if b64:
                     saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
                     if saved:
-                        print(f"🖼️ Saved full-resolution image (canvas export) → {saved}")
-                        return saved
+                        degraded, reason = is_degraded_wa_capture(saved)
+                        print(f"🖼️ Saved image (canvas export) → {saved} ({reason})")
+                        if not degraded:
+                            return saved
             except Exception as exc:
                 print(f"⚠️ Canvas export failed: {exc}")
         else:
             print(
-                f"⚠️ Skipping blob/canvas — natural {nw}x{nh} looks like a loading placeholder."
+                f"⚠️ Skipping natural-size blob/canvas — natural {nw}x{nh} looks like a loading placeholder."
             )
 
         try:
@@ -3973,11 +3981,14 @@ def download_full_resolution_image(driver, bubble, image_path):
                     for item in items:
                         if item.is_displayed():
                             item.click()
-                            time.sleep(4)
+                            time.sleep(6)
                             downloaded = pick_newest_image_download(baseline_mtime)
                             saved = _save_downloaded_image(downloaded, image_path)
                             if saved:
-                                return saved
+                                degraded, reason = is_degraded_wa_capture(saved)
+                                if not degraded:
+                                    return saved
+                                print(f"⚠️ Save-as download degraded ({reason})")
                 except Exception:
                     continue
             ActionChains(driver).send_keys(Keys.ESCAPE).perform()
@@ -3987,7 +3998,20 @@ def download_full_resolution_image(driver, bubble, image_path):
 
         saved = _save_element_screenshot(main_img, image_path)
         if saved:
-            return saved
+            degraded, reason = is_degraded_wa_capture(saved)
+            if not degraded:
+                return saved
+            print(f"⚠️ Element screenshot degraded ({reason})")
+
+        if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+            print(
+                f"⚠️ Last resort — viewer panel screenshot (natural {nw}x{nh}, display {dw}x{dh})"
+            )
+            saved = _save_viewer_panel_screenshot(driver, image_path)
+            if saved:
+                degraded, reason = is_degraded_wa_capture(saved)
+                print(f"⚠️ Panel screenshot saved → {saved} ({reason})")
+                return saved
     except Exception as exc:
         print(f"⚠️ Full-resolution image download failed: {exc}")
     finally:
@@ -4039,7 +4063,27 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     full_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_full.png")
     full_result = download_full_resolution_image(driver, bubble, full_path)
     if full_result:
-        save_wa_image_manifest(full_result, message_data_id=message_data_id)
+        degraded, reason = is_degraded_wa_capture(full_result)
+        if degraded:
+            print(f"⚠️ First capture degraded ({reason}) — retrying full download once...")
+            retry_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_full_retry.png")
+            retry_result = download_full_resolution_image(driver, bubble, retry_path)
+            if retry_result:
+                retry_degraded, retry_reason = is_degraded_wa_capture(retry_result)
+                if not retry_degraded:
+                    full_result = retry_result
+                    degraded = False
+                else:
+                    print(f"⚠️ Retry still degraded ({retry_reason}) — using best available")
+                    size_a, _, _ = describe_image_file(full_result)
+                    size_b, _, _ = describe_image_file(retry_result)
+                    if size_b > size_a:
+                        full_result = retry_result
+        save_wa_image_manifest(
+            full_result,
+            message_data_id=message_data_id,
+            capture_method="download_full_resolution",
+        )
         return full_result
 
     viewer_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_viewer.png")
@@ -4237,7 +4281,15 @@ def send_image_attachment_in_current_chat(driver, image_path: str, caption: str 
         return False
 
     abs_path = os.path.abspath(image_path)
-    print(f"📷 Attaching image to WhatsApp chat: {abs_path}")
+    size, dims, dim_label = describe_image_file(abs_path)
+    degraded, degrade_reason = is_degraded_wa_capture(abs_path)
+    print(f"📷 Attaching image to WhatsApp chat: {abs_path} ({dim_label}, {size} bytes)")
+    if degraded:
+        print(f"⚠️ Monitor will receive DEGRADED capture (same file as Copilot): {degrade_reason}")
+        if caption:
+            caption = f"{caption}\n[OpenClaw image: {dim_label}, {size} bytes — DEGRADED capture]"
+        else:
+            caption = f"[OpenClaw image: {dim_label}, {size} bytes — DEGRADED capture]"
 
     try:
         attach_selectors = [
@@ -4357,9 +4409,16 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
             )
 
     if image_path:
+        size, dims, dim_label = describe_image_file(image_path)
+        degraded, degrade_reason = is_degraded_wa_capture(image_path)
         lines.append("")
         lines.append(f"Analyzed image file: {image_path}")
-        lines.append("(Photo attached below for verification)")
+        lines.append(f"Image on disk: {dim_label}, {size} bytes")
+        if degraded:
+            lines.append(f"⚠️ DEGRADED capture (NOT true full-res): {degrade_reason}")
+            lines.append("Monitor receives this SAME file — may look like a low-res sticker.")
+        else:
+            lines.append("(Photo attached below for verification)")
 
     lines.extend([
         "",

@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.46-PASS3D-UNIFIED-RETRY"
+VERSION = "v1.47-DEGRADED-CAPTURE-WARN"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -1205,7 +1205,11 @@ def analyze_incoming_inquiry_with_copilot(
     image_dims = None
     if image_path:
         if os.path.exists(image_path):
-            from whatsapp_attachment_processor import validate_image_file, read_image_dimensions
+            from whatsapp_attachment_processor import (
+                validate_image_file,
+                read_image_dimensions,
+                is_degraded_wa_capture,
+            )
 
             img_ok, img_reason = validate_image_file(image_path)
             img_size = os.path.getsize(image_path)
@@ -1221,6 +1225,12 @@ def analyze_incoming_inquiry_with_copilot(
                 print(
                     f"[COPILOT ANALYZE] Image dimensions {dim_label} — "
                     "resolution alone does not block extraction"
+                )
+            degraded, degrade_reason = is_degraded_wa_capture(image_path)
+            if degraded:
+                print(
+                    f"[COPILOT ANALYZE] ⚠️ DEGRADED WA_Image capture ({degrade_reason}) — "
+                    "same file sent to Copilot and monitor; vision may hallucinate"
                 )
             if not img_ok:
                 print("[COPILOT ANALYZE] Skipping corrupt/thumbnail image — analyzing caption/text only.")

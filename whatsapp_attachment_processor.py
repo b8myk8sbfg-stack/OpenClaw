@@ -1525,7 +1525,11 @@ def clear_wa_attachment_workspace():
     clear_wa_files_workspace()
 
 
-def save_wa_image_manifest(image_path: str, message_data_id: str = "") -> None:
+def save_wa_image_manifest(
+    image_path: str,
+    message_data_id: str = "",
+    capture_method: str = "",
+) -> None:
     """Track the current message image like latest.opus for voice."""
     if not image_path or not os.path.exists(image_path):
         return
@@ -1535,6 +1539,8 @@ def save_wa_image_manifest(image_path: str, message_data_id: str = "") -> None:
     except OSError as exc:
         print(f"⚠️ [IMAGE] Could not update {IMAGE_LATEST_PATH}: {exc}")
         return
+    size, dims, dim_label = describe_image_file(image_path)
+    degraded, degrade_reason = is_degraded_wa_capture(image_path)
     manifest_path = os.path.join(WA_IMAGE_DIR, "latest.json")
     try:
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1543,14 +1549,21 @@ def save_wa_image_manifest(image_path: str, message_data_id: str = "") -> None:
                     "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
                     "data_id": message_data_id,
                     "named_path": image_path,
-                    "bytes": os.path.getsize(image_path),
+                    "bytes": size,
+                    "dimensions": dim_label,
+                    "capture_method": capture_method or "unknown",
+                    "degraded": degraded,
+                    "degrade_reason": degrade_reason if degraded else "",
                 },
                 f,
                 indent=2,
             )
     except Exception:
         pass
-    print(f"✅ [IMAGE] Updated {IMAGE_LATEST_PATH}")
+    quality = "DEGRADED" if degraded else "OK"
+    print(f"✅ [IMAGE] Updated {IMAGE_LATEST_PATH} ({dim_label}, {size} bytes, {quality})")
+    if degraded:
+        print(f"⚠️ [IMAGE] Degraded capture — monitor + Copilot get this same low-res file: {degrade_reason}")
 
 
 def _read_voice_manifest() -> dict:
@@ -1717,6 +1730,33 @@ def download_document_from_bubble(
 MIN_WA_IMAGE_BYTES = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_BYTES", "8000"))
 MIN_WA_IMAGE_DISPLAY_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_DISPLAY_PX", "400"))
 MIN_WA_IMAGE_NATURAL_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_NATURAL_PX", "250"))
+MIN_WA_IMAGE_FULL_WIDTH = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_FULL_WIDTH", "900"))
+
+
+def describe_image_file(path: str) -> Tuple[int, Optional[Tuple[int, int]], str]:
+    """Return (bytes, (w,h)|None, human label) for a saved image."""
+    if not path or not os.path.exists(path):
+        return 0, None, "missing"
+    size = os.path.getsize(path)
+    dims = read_image_dimensions(path)
+    dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
+    return size, dims, dim_label
+
+
+def is_degraded_wa_capture(path: str) -> Tuple[bool, str]:
+    """
+    True when WA_Image file is a low-res viewer screenshot, not a true download.
+    Degraded captures often look like stickers when re-sent on WhatsApp monitor chat.
+    """
+    size, dims, dim_label = describe_image_file(path)
+    if not dims:
+        return True, f"unknown dimensions ({size} bytes)"
+    width, height = dims
+    if width < MIN_WA_IMAGE_FULL_WIDTH:
+        return True, f"{dim_label}, {size} bytes (need width >= {MIN_WA_IMAGE_FULL_WIDTH}px)"
+    if size < 50000 and width * height < 500_000:
+        return True, f"{dim_label}, {size} bytes (small file for Copilot vision)"
+    return False, f"{dim_label}, {size} bytes"
 
 
 def detect_image_format(data: bytes) -> Tuple[Optional[str], str]:
