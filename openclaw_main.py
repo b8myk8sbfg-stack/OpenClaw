@@ -15,7 +15,7 @@ from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 BASE_DIR = "/Users/evon/OpenClaw"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-VERSION = "v1.55-TECH-DETAILS"
+VERSION = "v1.56-MARKUP-072"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -208,6 +208,9 @@ Fill technical_summary (plain text, WhatsApp-friendly) covering the primary quot
 - Compatible sockets, bases, or accessories commonly ordered with this part
 - Typical applications (short bullet list)
 - Official catalog or datasheet URL on its own line: Catalog: https://... (manufacturer site only)
+- catalog_url MUST be from the SAME manufacturer as the part (e.g. Siemens 3VL → siemens.com only; never omron.com for non-Omron parts)
+- technical_summary MUST describe the exact part_no values in items[] — never internal stock IDs or substitute part numbers
+- Match product category to part family (3VL/5SY = circuit breaker, MY2/E3Z = relay/sensor — do not describe a breaker as a relay)
 
 Per item, also fill when known:
 - technical_specs: array of "Label: value" strings (key electrical/mechanical specs)
@@ -2272,21 +2275,191 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
     return list(analysis.get("items") or [])
 
 
+PART_PREFIX_BRANDS = (
+    (("3VL", "3VA", "5SY", "5SL", "5SP", "6ES", "6EP", "6SL", "3RT", "3RV"), "SIEMENS"),
+    (("E3Z", "E2E", "E39", "MY2", "MY4", "H3CR", "H3Y", "G2R", "G7T"), "OMRON"),
+    (("150-C", "1492-", "1734-", "1756-", "1769-"), "ALLEN BRADLEY"),
+    (("LC1D", "LC1F", "GV2", "GV3"), "SCHNEIDER"),
+    (("E3S", "E3X"), "OMRON"),
+)
+
+BRAND_CATALOG_DOMAINS = {
+    "SIEMENS": ("siemens.com", "mall.industry.siemens.com"),
+    "OMRON": ("omron.com", "ia.omron.com", "industrial.omron.com"),
+    "ALLEN BRADLEY": ("rockwellautomation.com", "ab.com"),
+    "ROCKWELL": ("rockwellautomation.com", "ab.com"),
+    "SCHNEIDER": ("se.com", "schneider-electric.com"),
+    "ABB": ("abb.com", "new.abb.com"),
+    "SMC": ("smcworld.com", "smc.eu"),
+    "FESTO": ("festo.com",),
+    "MITSUBISHI": ("mitsubishielectric.com",),
+}
+
+
+def _infer_brand_from_part_no(part_no: str) -> str:
+    upper = str(part_no or "").upper()
+    for prefixes, brand in PART_PREFIX_BRANDS:
+        for prefix in prefixes:
+            if upper.startswith(prefix):
+                return brand
+    return ""
+
+
+def _looks_like_obm_stock_id(part_no: str) -> bool:
+    """True when value is a numeric warehouse/OBM ID, not a catalog part number."""
+    text = str(part_no or "").strip()
+    return bool(text) and text.isdigit() and len(text) <= 8
+
+
+def _extract_catalog_part_from_text(text: str) -> str:
+    """Best-effort catalog part number from a description line."""
+    blob = str(text or "").upper()
+    patterns = (
+        r"\b([A-Z]{1,4}\d{1,4}[A-Z0-9]*(?:-[A-Z0-9]+){1,4})\b",
+        r"\b(\d{1,3}[A-Z]{1,3}\d{2,}[A-Z0-9\-]+)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, blob)
+        if match:
+            candidate = match.group(1).strip("-")
+            if len(_normalize_part_key(candidate)) >= 6:
+                return candidate
+    return ""
+
+
+def _research_part_no_from_row(row: dict, copilot_items: list = None) -> tuple:
+    """Resolve the customer catalog part number for product research (not OBM stock ID)."""
+    customer = str(row.get("customer_part") or "").strip().upper()
+    desc = str(row.get("desc") or "").strip()
+    brand = str(row.get("brand") or "UNKNOWN").strip().upper()
+
+    if customer and not _looks_like_obm_stock_id(customer):
+        return customer, brand if brand != "UNKNOWN" else _infer_brand_from_part_no(customer) or brand
+
+    for item in copilot_items or []:
+        if not isinstance(item, dict):
+            continue
+        part_no = str(item.get("part_no") or "").strip().upper()
+        if part_no and not _looks_like_obm_stock_id(part_no):
+            item_brand = str(item.get("brand") or brand or "UNKNOWN").strip().upper()
+            inferred = _infer_brand_from_part_no(part_no)
+            return part_no, item_brand if item_brand != "UNKNOWN" else (inferred or brand)
+
+    from_desc = _extract_catalog_part_from_text(desc)
+    if from_desc:
+        inferred = _infer_brand_from_part_no(from_desc)
+        return from_desc.upper(), inferred or brand
+
+    if customer:
+        return customer, brand
+    pid = str(row.get("pid") or "").strip().upper()
+    return pid, brand
+
+
+def _brand_catalog_domains(brand: str) -> tuple:
+    brand_u = str(brand or "").upper().strip()
+    if brand_u in BRAND_CATALOG_DOMAINS:
+        return BRAND_CATALOG_DOMAINS[brand_u]
+    for key, domains in BRAND_CATALOG_DOMAINS.items():
+        if key in brand_u or brand_u in key:
+            return domains
+    inferred = _infer_brand_from_part_no(brand_u)
+    if inferred:
+        return BRAND_CATALOG_DOMAINS.get(inferred, ())
+    return ()
+
+
+def _catalog_url_matches_brand(url: str, brand: str) -> bool:
+    url_l = str(url or "").lower()
+    if not url_l.startswith("http"):
+        return False
+    domains = _brand_catalog_domains(brand)
+    if not domains:
+        inferred = _infer_brand_from_part_no(brand)
+        domains = _brand_catalog_domains(inferred) if inferred else ()
+    if not domains:
+        return True
+    return any(domain in url_l for domain in domains)
+
+
+def _research_mentions_part(text: str, part_no: str) -> bool:
+    norm_part = _normalize_part_key(part_no)
+    norm_text = _normalize_part_key(text)
+    if not norm_part or not norm_text:
+        return False
+    if norm_part in norm_text:
+        return True
+    check_len = min(8, len(norm_part))
+    if check_len >= 5 and norm_part[:check_len] in norm_text:
+        return True
+    return False
+
+
+def _sanitize_product_research_text(text: str, part_no: str, brand: str = "UNKNOWN") -> str:
+    """Drop hallucinated catalog URLs and research that does not match the quoted part."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    brand_hint = str(brand or "UNKNOWN").strip().upper()
+    if brand_hint in ("UNKNOWN", ""):
+        brand_hint = _infer_brand_from_part_no(part_no) or brand_hint
+
+    cleaned_lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("catalog:") or lower.startswith("datasheet:") or "http://" in lower or "https://" in lower:
+            url_match = re.search(r"https?://\S+", stripped)
+            if url_match:
+                url = url_match.group(0).rstrip(".,)")
+                if brand_hint not in ("UNKNOWN", "") and not _catalog_url_matches_brand(url, brand_hint):
+                    print(
+                        f"[PRODUCT RESEARCH] Dropped off-brand catalog URL for {part_no} "
+                        f"({brand_hint}): {url[:80]}"
+                    )
+                    continue
+                cleaned_lines.append(f"Catalog: {url}")
+                continue
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    if not _research_mentions_part(cleaned, part_no):
+        if _looks_like_obm_stock_id(part_no):
+            print(f"[PRODUCT RESEARCH] Rejected research keyed on OBM stock ID {part_no}")
+            return ""
+        print(f"[PRODUCT RESEARCH] Rejected research — does not mention {part_no}")
+        return ""
+
+    return cleaned
+
+
 def _product_research_prompt(part_no: str, brand: str = "UNKNOWN") -> str:
     brand_line = f" by {brand}" if brand and brand != "UNKNOWN" else ""
+    inferred = _infer_brand_from_part_no(part_no)
+    brand_note = ""
+    if inferred and inferred != brand:
+        brand_note = f"\nManufacturer family: {inferred} (from part number prefix)."
+    elif inferred:
+        brand_note = f"\nManufacturer: {inferred}."
     return (
-        f"Research the industrial automation part {part_no}{brand_line}.\n"
+        f"Research the EXACT industrial automation catalog part number: {part_no}{brand_line}.\n"
+        f"Do NOT substitute a different part number, stock ID, or generic relay/sensor example.{brand_note}\n"
         "Write a technical summary for a sales quotation reply (plain text, WhatsApp-friendly).\n\n"
-        "Include when known:\n"
-        "- One-sentence product overview\n"
-        "- Specifications as 'Label: value' lines (model, voltage, contact rating, mounting, etc.)\n"
-        "- Part-number suffix meaning (e.g. what series letters indicate)\n"
-        "- Pin / terminal configuration if applicable\n"
-        "- Compatible sockets, bases, or accessories commonly ordered with this part\n"
+        "Include ONLY when accurate for THIS exact part number:\n"
+        "- One-sentence product overview (correct product category — breaker vs relay vs sensor)\n"
+        "- Specifications as 'Label: value' lines\n"
+        "- Part-number suffix notes when applicable\n"
+        "- Pin / terminal configuration only if relevant to this product type\n"
+        "- Compatible accessories commonly ordered with this exact part\n"
         "- Typical applications (short bullet list)\n"
-        "- Official manufacturer catalog or datasheet URL on its own line: Catalog: https://...\n\n"
+        "- Official manufacturer catalog URL on its own line: Catalog: https://...\n"
+        "  (must be the correct manufacturer domain for this brand — never cross-brand links)\n\n"
+        f"The summary MUST mention {part_no} by name.\n"
         "Keep under 280 words. Plain text only — no markdown, no ** bold.\n"
-        "Only include URLs you are confident are official manufacturer links."
+        "If unsure of a spec or URL, omit it — never invent links or substitute another part."
     )
 
 
@@ -2322,7 +2495,11 @@ def research_part_with_openai(part_no: str, brand: str = "UNKNOWN") -> str:
         )
         text = (response.choices[0].message.content or "").strip()
         print(f"[OPENAI RESEARCH] {len(text)} chars for {part_no}")
-        return _sanitize_whatsapp_reply(text, preserve_urls=True)
+        return _sanitize_product_research_text(
+            _sanitize_whatsapp_reply(text, preserve_urls=True),
+            part_no,
+            brand,
+        )
     except Exception as exc:
         print(f"[WARN] OpenAI research failed for {part_no}: {exc}")
         return ""
@@ -2366,7 +2543,11 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
             lines = text.splitlines()
             text = "\n".join(lines[1:-1]).strip()
         print(f"[COPILOT RESEARCH] {len(text)} chars for {part_no}")
-        return _sanitize_whatsapp_reply(text, preserve_urls=True)
+        return _sanitize_product_research_text(
+            _sanitize_whatsapp_reply(text, preserve_urls=True),
+            part_no,
+            brand,
+        )
     except Exception as exc:
         print(f"[WARN] Copilot research failed for {part_no}: {exc}")
         return ""
@@ -2384,20 +2565,35 @@ def research_part_for_quotation(part_no: str, brand: str = "UNKNOWN") -> str:
     return research_part_with_copilot(part_no, brand)
 
 
-def build_ai_research_summary(formatted_rows):
+def build_ai_research_summary(formatted_rows, copilot_items=None):
     """Build product research notes for the unique customer parts in a quote."""
     sections = []
     seen = set()
     for row in formatted_rows or []:
-        part_no = str(row.get("customer_part") or row.get("pid") or "").strip().upper()
+        part_no, brand = _research_part_no_from_row(row, copilot_items=copilot_items)
         if not part_no or part_no in seen:
             continue
+        if _looks_like_obm_stock_id(part_no):
+            print(f"[PRODUCT RESEARCH] Skipping OBM stock ID {part_no} — no catalog part resolved")
+            continue
         seen.add(part_no)
-        brand = str(row.get("brand") or "UNKNOWN").strip().upper()
         notes = research_part_for_quotation(part_no, brand)
         if notes:
-            sections.append(f"{part_no}\n{notes}")
+            sections.append(notes)
     return "\n\n".join(sections)
+
+
+def _sanitize_item_catalog_url(url: str, part_no: str, brand: str) -> str:
+    url = str(url or "").strip()
+    if not url.startswith("http"):
+        return ""
+    brand_hint = str(brand or "UNKNOWN").strip().upper()
+    if brand_hint in ("UNKNOWN", ""):
+        brand_hint = _infer_brand_from_part_no(part_no) or brand_hint
+    if brand_hint not in ("UNKNOWN", "") and not _catalog_url_matches_brand(url, brand_hint):
+        print(f"[PRODUCT RESEARCH] Dropped off-brand item catalog_url for {part_no}: {url[:80]}")
+        return ""
+    return url
 
 
 def build_product_details_for_reply(
@@ -2409,7 +2605,19 @@ def build_product_details_for_reply(
     sections = []
     summary = str(technical_summary or "").strip()
     if summary:
-        sections.append(summary)
+        primary_part = ""
+        primary_brand = "UNKNOWN"
+        if copilot_items:
+            primary_part = str(copilot_items[0].get("part_no") or "").strip().upper()
+            primary_brand = str(copilot_items[0].get("brand") or "UNKNOWN").strip().upper()
+        elif formatted_rows:
+            primary_part, primary_brand = _research_part_no_from_row(
+                formatted_rows[0], copilot_items=copilot_items
+            )
+        if primary_part:
+            summary = _sanitize_product_research_text(summary, primary_part, primary_brand)
+        if summary:
+            sections.append(summary)
 
     seen_parts = set()
     for item in copilot_items or []:
@@ -2419,6 +2627,9 @@ def build_product_details_for_reply(
         if not part_no or part_no in seen_parts:
             continue
         seen_parts.add(part_no)
+        brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+        if brand in ("UNKNOWN", ""):
+            brand = _infer_brand_from_part_no(part_no) or brand
 
         item_lines = []
         specs = item.get("technical_specs") or []
@@ -2437,23 +2648,26 @@ def build_product_details_for_reply(
                 if acc_text:
                     item_lines.append(f"• {acc_text}")
 
-        catalog_url = str(item.get("catalog_url") or "").strip()
-        if catalog_url.startswith("http"):
+        catalog_url = _sanitize_item_catalog_url(
+            str(item.get("catalog_url") or "").strip(),
+            part_no,
+            brand,
+        )
+        if catalog_url:
             item_lines.append(f"Catalog: {catalog_url}")
 
         if item_lines:
             header = f"{part_no}"
-            brand = str(item.get("brand") or "").strip()
             if brand and brand.upper() not in ("UNKNOWN", ""):
                 header = f"{brand} {part_no}"
             block = header + "\n" + "\n".join(item_lines)
-            if block not in summary:
+            if block not in "\n\n".join(sections):
                 sections.append(block)
 
     if sections:
         return "\n\n".join(sections).strip()
 
-    return build_ai_research_summary(formatted_rows)
+    return build_ai_research_summary(formatted_rows, copilot_items=copilot_items)
 
 
 def _is_equivalent_support_request(message_text: str) -> bool:

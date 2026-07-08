@@ -12,6 +12,9 @@ load_dotenv()
 
 VERSION = "v1.08-STORE-QTY-SPLIT-BALANCE"
 
+# Customer sell price = purchase cost / MARKUP_DIVISOR (0.72 → ~38.9% markup on cost, ~28% margin).
+MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
+
 WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
 
 OBM_API_URL = os.getenv("OBM_API_URL", "").rstrip("/")
@@ -794,7 +797,7 @@ def build_rows_from_api(api_id, qty, customer_part=None):
     if usable_store_qty > 0:
         quoted_qty = min(requested_qty, usable_store_qty)
         balance_qty = max(requested_qty - quoted_qty, 0)
-        sell_price = (cost / 0.8) if cost > 0 else None
+        sell_price = (cost / MARKUP_DIVISOR) if cost > 0 else None
 
         stock_source = "STORE_STOCK_AVAILABLE"
         stock_lead_time = "Ex-Stock"

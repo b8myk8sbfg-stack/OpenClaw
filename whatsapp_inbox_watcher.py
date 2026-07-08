@@ -33,6 +33,7 @@ from openclaw_inquiry_engine import (
     build_plain_quotation_reply,
     parse_qty_from_caption,
     process_structured_items,
+    MARKUP_DIVISOR,
 )
 from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
@@ -103,7 +104,6 @@ CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.tx
 MAX_UNREAD_CHATS_PER_RUN = 1
 CHECK_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "2"))
 INCOMING_LOOKBACK = 6
-MARKUP_DIVISOR = 0.8
 MONITOR_WHATSAPP_PHONE = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONE", "+60167222208")
 
 WHATSAPP_SESSION_READY = False

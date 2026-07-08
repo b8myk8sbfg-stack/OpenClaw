@@ -15,6 +15,7 @@ from O365 import Account
 from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
 from inquiry_extraction_helper import extract_clean_items_from_text
+from openclaw_inquiry_engine import MARKUP_DIVISOR
 from openclaw_main import extract_rfq_with_copilot
 from openclaw_busy import (
     clear_busy,
@@ -811,7 +812,7 @@ def process_supplier_replies(mailbox):
 
                     if cost_val:
                         try:
-                            sell_price = float(str(cost_val).replace(',', '')) / 0.8
+                            sell_price = float(str(cost_val).replace(',', '')) / MARKUP_DIVISOR
 
                             formatted_rows.append({
                                 'desc': desc,
@@ -1347,7 +1348,7 @@ def process_latest_inquiry():
                     if usable_store_qty > 0 and cost > 0:
                         quoted_qty = min(requested_qty, usable_store_qty)
                         balance_qty = max(requested_qty - quoted_qty, 0)
-                        sell_price = cost / 0.8
+                        sell_price = cost / MARKUP_DIVISOR
 
                         formatted_initial_rows.append({
                             'desc': full_desc,
