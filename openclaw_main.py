@@ -15,7 +15,7 @@ from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 BASE_DIR = "/Users/evon/OpenClaw"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-VERSION = "v1.57-VOICE-RFQ-FIX"
+VERSION = "v1.58-CATALOG-LINKS"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -147,7 +147,8 @@ REQUIRED_EXTRACTION_FIELDS = ("status", "intent", "input_type", "items")
 
 ITEM_EXTRACTION_FIELDS = (
     "brand", "part_no", "description", "product_type", "qty", "source",
-    "confidence", "reason", "technical_specs", "catalog_url", "compatible_accessories",
+    "confidence", "reason", "technical_specs", "catalog_url", "datasheet_url",
+    "product_page_url", "compatible_accessories",
 )
 
 
@@ -363,15 +364,27 @@ Fill technical_summary (plain text, WhatsApp-friendly) covering the primary quot
 - Pin / terminal configuration if relevant (relay, sensor, connector products)
 - Compatible sockets, bases, or accessories commonly ordered with this part
 - Typical applications (short bullet list)
-- Official catalog or datasheet URL on its own line: Catalog: https://... (manufacturer site only)
-- catalog_url MUST be from the SAME manufacturer as the part (e.g. Siemens 3VL → siemens.com only; never omron.com for non-Omron parts)
-- technical_summary MUST describe the exact part_no values in items[] — never internal stock IDs or substitute part numbers
-- Match product category to part family (3VL/5SY = circuit breaker, MY2/E3Z = relay/sensor — do not describe a breaker as a relay)
+- Official documentation links — use SPECIFIC datasheet PDF or product detail pages only:
+  Datasheet: https://... (official manufacturer PDF, e.g. omron.com.tw/data_pdf/cat/*.pdf)
+  Product page: https://... (regional product detail page with model in URL path)
+- NEVER use generic family/category overview pages (WRONG examples):
+  omron.com/products/family/E5CC | omron.com/industrial-relays-catalog | siemens.com/global/en/products/overview
+- catalog_url MUST be from the SAME manufacturer as the part (Siemens 3VL → siemens.com only; never omron.com for non-Omron parts)
+- Prefer catalog_url = official datasheet PDF when available; otherwise the best product detail page
+- technical_summary MUST describe the exact part_no values in items[] — never internal stock IDs
+- Match product category to part family (3VL/5SY = breaker, MY2/E3Z = relay, E5CC = temperature controller)
 
 Per item, also fill when known:
-- technical_specs: array of "Label: value" strings (key electrical/mechanical specs)
-- catalog_url: full https:// manufacturer catalog or datasheet link
-- compatible_accessories: array of related part numbers (e.g. socket models)
+- technical_specs: array of "Label: value" strings
+- datasheet_url: direct link to official datasheet PDF (highest priority)
+- product_page_url: manufacturer regional product detail page (model in path)
+- catalog_url: same as datasheet_url if PDF known, else product_page_url
+- compatible_accessories: array of related part numbers
+
+OMRON link examples (E5CC-RX2ASM-800):
+  GOOD datasheet: https://www.omron.com.tw/data_pdf/cat/e5_c-800_h179-e1_5_7_csm1001629.pdf
+  GOOD product page: https://industrial.omron.eu/en/products/E5CC-RX2ASM-000
+  BAD (too generic): https://www.omron.com/products/family/E5CC
 
 Keep technical_summary under 400 words. Plain text only — no markdown, no ** bold, no code fences.
 If you do not know a spec or URL with confidence, omit it — never invent datasheet links.
@@ -395,6 +408,8 @@ Return ONLY this JSON object (no other text). Use YOUR OWN readings — do NOT c
       "reason": "",
       "technical_specs": ["Model: ", "Coil voltage: "],
       "catalog_url": "",
+      "datasheet_url": "",
+      "product_page_url": "",
       "compatible_accessories": []
     }
   ],
@@ -1671,6 +1686,10 @@ def _parse_copilot_items_from_dict(
         catalog_url = str(item.get("catalog_url") or "").strip()
         if catalog_url.startswith("http"):
             item_out["catalog_url"] = catalog_url
+        for url_field in ("datasheet_url", "product_page_url"):
+            url_val = str(item.get(url_field) or "").strip()
+            if url_val.startswith("http"):
+                item_out[url_field] = url_val
         accessories = item.get("compatible_accessories")
         if isinstance(accessories, list):
             cleaned_acc = [str(a).strip() for a in accessories if str(a).strip()]
@@ -2453,7 +2472,7 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
 
 PART_PREFIX_BRANDS = (
     (("3VL", "3VA", "5SY", "5SL", "5SP", "6ES", "6EP", "6SL", "3RT", "3RV"), "SIEMENS"),
-    (("E3Z", "E2E", "E39", "MY2", "MY4", "H3CR", "H3Y", "G2R", "G7T"), "OMRON"),
+    (("E3Z", "E2E", "E39", "MY2", "MY4", "H3CR", "H3Y", "G2R", "G7T", "E5CC", "E5CN", "E5CB"), "OMRON"),
     (("150-C", "1492-", "1734-", "1756-", "1769-"), "ALLEN BRADLEY"),
     (("LC1D", "LC1F", "GV2", "GV3"), "SCHNEIDER"),
     (("E3S", "E3X"), "OMRON"),
@@ -2461,7 +2480,7 @@ PART_PREFIX_BRANDS = (
 
 BRAND_CATALOG_DOMAINS = {
     "SIEMENS": ("siemens.com", "mall.industry.siemens.com"),
-    "OMRON": ("omron.com", "ia.omron.com", "industrial.omron.com"),
+    "OMRON": ("omron.com", "omron.com.tw", "ia.omron.com", "industrial.omron.com", "industrial.omron.eu"),
     "ALLEN BRADLEY": ("rockwellautomation.com", "ab.com"),
     "ROCKWELL": ("rockwellautomation.com", "ab.com"),
     "SCHNEIDER": ("se.com", "schneider-electric.com"),
@@ -2545,6 +2564,34 @@ def _brand_catalog_domains(brand: str) -> tuple:
     return ()
 
 
+def _clean_catalog_url(url: str) -> str:
+    """Strip tracking params and trailing punctuation from catalog URLs."""
+    cleaned = str(url or "").strip().rstrip(".,)")
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[?&]utm_[^&#\s]+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"[?&]$", "", cleaned)
+    return cleaned
+
+
+GENERIC_CATALOG_URL_PATTERNS = (
+    r"/products/family/",
+    r"/product-family/",
+    r"/products/category/",
+    r"/category/",
+    r"/catalogue/?$",
+    r"/catalog/?$",
+    r"industrial-relays-catalog",
+    r"/search\?",
+)
+
+
+def _is_generic_catalog_url(url: str) -> bool:
+    """True for family/category overview pages — not useful as product documentation."""
+    url_l = str(url or "").lower()
+    return any(re.search(pattern, url_l) for pattern in GENERIC_CATALOG_URL_PATTERNS)
+
+
 def _catalog_url_matches_brand(url: str, brand: str) -> bool:
     url_l = str(url or "").lower()
     if not url_l.startswith("http"):
@@ -2585,17 +2632,29 @@ def _sanitize_product_research_text(text: str, part_no: str, brand: str = "UNKNO
     for line in raw.splitlines():
         stripped = line.strip()
         lower = stripped.lower()
-        if lower.startswith("catalog:") or lower.startswith("datasheet:") or "http://" in lower or "https://" in lower:
+        if (
+            lower.startswith("catalog:")
+            or lower.startswith("datasheet:")
+            or lower.startswith("product page:")
+            or "http://" in lower
+            or "https://" in lower
+        ):
             url_match = re.search(r"https?://\S+", stripped)
             if url_match:
-                url = url_match.group(0).rstrip(".,)")
-                if brand_hint not in ("UNKNOWN", "") and not _catalog_url_matches_brand(url, brand_hint):
-                    print(
-                        f"[PRODUCT RESEARCH] Dropped off-brand catalog URL for {part_no} "
-                        f"({brand_hint}): {url[:80]}"
-                    )
+                url = _sanitize_item_catalog_url(
+                    url_match.group(0),
+                    part_no,
+                    brand_hint,
+                )
+                if not url:
                     continue
-                cleaned_lines.append(f"Catalog: {url}")
+                if lower.startswith("datasheet:"):
+                    cleaned_lines.append(f"Datasheet: {url}")
+                elif lower.startswith("product page:"):
+                    cleaned_lines.append(f"Product page: {url}")
+                else:
+                    label = "Datasheet" if url.lower().endswith(".pdf") else "Catalog"
+                    cleaned_lines.append(f"{label}: {url}")
                 continue
         cleaned_lines.append(line)
 
@@ -2631,8 +2690,12 @@ def _product_research_prompt(part_no: str, brand: str = "UNKNOWN") -> str:
         "- Pin / terminal configuration only if relevant to this product type\n"
         "- Compatible accessories commonly ordered with this exact part\n"
         "- Typical applications (short bullet list)\n"
-        "- Official manufacturer catalog URL on its own line: Catalog: https://...\n"
-        "  (must be the correct manufacturer domain for this brand — never cross-brand links)\n\n"
+        "- Official documentation links (SPECIFIC only — never generic family pages):\n"
+        "  Datasheet: https://... (official manufacturer PDF when available)\n"
+        "  Product page: https://... (regional product detail page with model in URL)\n"
+        "  NEVER use generic overview URLs like omron.com/products/family/E5CC\n"
+        "  OMRON E5CC example datasheet: https://www.omron.com.tw/data_pdf/cat/e5_c-800_h179-e1_5_7_csm1001629.pdf\n"
+        "  OMRON E5CC example product page: https://industrial.omron.eu/en/products/E5CC-RX2ASM-000\n"
         f"The summary MUST mention {part_no} by name.\n"
         "Keep under 280 words. Plain text only — no markdown, no ** bold.\n"
         "If unsure of a spec or URL, omit it — never invent links or substitute another part."
@@ -2760,16 +2823,48 @@ def build_ai_research_summary(formatted_rows, copilot_items=None):
 
 
 def _sanitize_item_catalog_url(url: str, part_no: str, brand: str) -> str:
-    url = str(url or "").strip()
+    url = _clean_catalog_url(str(url or "").strip())
     if not url.startswith("http"):
+        return ""
+    if _is_generic_catalog_url(url):
+        print(
+            f"[PRODUCT RESEARCH] Dropped generic family/catalog URL for {part_no}: {url[:90]}"
+        )
         return ""
     brand_hint = str(brand or "UNKNOWN").strip().upper()
     if brand_hint in ("UNKNOWN", ""):
         brand_hint = _infer_brand_from_part_no(part_no) or brand_hint
     if brand_hint not in ("UNKNOWN", "") and not _catalog_url_matches_brand(url, brand_hint):
-        print(f"[PRODUCT RESEARCH] Dropped off-brand item catalog_url for {part_no}: {url[:80]}")
+        print(f"[PRODUCT RESEARCH] Dropped off-brand catalog URL for {part_no}: {url[:80]}")
         return ""
     return url
+
+
+def _format_catalog_links_for_item(item: dict, part_no: str, brand: str) -> list:
+    """Build Datasheet / Product page lines for customer replies."""
+    lines = []
+    datasheet = _sanitize_item_catalog_url(
+        str(item.get("datasheet_url") or "").strip(),
+        part_no,
+        brand,
+    )
+    product_page = _sanitize_item_catalog_url(
+        str(item.get("product_page_url") or "").strip(),
+        part_no,
+        brand,
+    )
+    catalog = _sanitize_item_catalog_url(
+        str(item.get("catalog_url") or "").strip(),
+        part_no,
+        brand,
+    )
+    if datasheet:
+        lines.append(f"Datasheet: {datasheet}")
+    if product_page and product_page != datasheet:
+        lines.append(f"Product page: {product_page}")
+    if catalog and catalog not in (datasheet, product_page):
+        lines.append(f"Catalog: {catalog}")
+    return lines
 
 
 def build_product_details_for_reply(
@@ -2824,13 +2919,7 @@ def build_product_details_for_reply(
                 if acc_text:
                     item_lines.append(f"• {acc_text}")
 
-        catalog_url = _sanitize_item_catalog_url(
-            str(item.get("catalog_url") or "").strip(),
-            part_no,
-            brand,
-        )
-        if catalog_url:
-            item_lines.append(f"Catalog: {catalog_url}")
+        item_lines.extend(_format_catalog_links_for_item(item, part_no, brand))
 
         if item_lines:
             header = f"{part_no}"
