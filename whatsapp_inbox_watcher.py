@@ -38,11 +38,14 @@ from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
 from openclaw_main import (
+    VERSION as OPENCLAW_ENGINE_VERSION,
     analyze_incoming_inquiry_with_copilot,
     build_ai_research_summary,
+    build_extraction_failure_customer_reply,
     build_photo_confirmation_line,
     build_technical_support_reply,
     is_copilot_transport_failure,
+    is_extraction_parse_failure,
 )
 from whatsapp_message_classifier import (
     INTENT_TYPES,
@@ -68,14 +71,18 @@ from whatsapp_attachment_processor import (
     save_wa_image_manifest,
     save_validated_image_bytes,
     validate_image_file,
+    read_image_dimensions,
+    describe_image_file,
+    is_degraded_wa_capture,
     MIN_WA_IMAGE_DISPLAY_PX,
     MIN_WA_IMAGE_NATURAL_PX,
+    MIN_WA_IMAGE_FULL_WIDTH,
     BLOB_TO_BASE64_JS,
     _execute_async_js,
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.54-VOICE-BEFORE-AVATAR-BLOB"
+VERSION = "v3.56-FULL-DOWNLOAD-FIRST"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -1724,6 +1731,10 @@ def is_bot_noise_message(text):
             "Context: QUOTATION_REPLY",
             "Context: NO_ITEMS",
             "Context: IMAGE_NO_ITEMS",
+            "Context: PARSER_ERROR",
+            "Context: JSON_INVALID",
+            "Context: OCR_NO_TEXT",
+            "Context: NO_PRODUCT_FOUND",
         )
     )
 
@@ -3138,7 +3149,11 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             )
             if image_path_this_step:
                 image_path = image_path_this_step
-                print("   🖼️ Exact message-bubble screenshot captured — unified Copilot analyze at end of plan")
+                degraded, reason = is_degraded_wa_capture(image_path)
+                if degraded:
+                    print(f"   🖼️ Image captured (DEGRADED {reason}) — same file goes to Copilot + monitor")
+                else:
+                    print("   🖼️ Full-resolution image captured — unified Copilot analyze at end of plan")
             elif bubble_has_explicit_voice_ui(container) or (
                 bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
             ):
@@ -3649,6 +3664,7 @@ def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
     """Wait until viewer shows a real image (not 72x32 placeholder)."""
     end = time.time() + timeout
     best_info = None
+    best_natural = 0
     while time.time() < end:
         info = _viewer_image_info(driver)
         if info:
@@ -3656,10 +3672,14 @@ def wait_for_viewer_high_resolution(driver, timeout: float = 22.0):
             nh = int(info.get("naturalH") or 0)
             dw = int(info.get("displayW") or 0)
             dh = int(info.get("displayH") or 0)
-            best_info = info
+            natural_area = nw * nh
+            if natural_area > best_natural:
+                best_info = info
+                best_natural = natural_area
             if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
                 return info
-            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+            # Display size alone is not enough — WhatsApp upscales tiny placeholders in the viewer.
+            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150 and nw >= 120 and nh >= 120:
                 return info
         time.sleep(0.75)
     return best_info
@@ -3675,9 +3695,11 @@ def _save_downloaded_image(downloaded: str, dest_path: str) -> Optional[str]:
         return None
     saved = save_validated_image_bytes(data, dest_path)
     if saved:
+        dims = read_image_dimensions(saved)
+        dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
         print(
             f"🖼️ Saved full-resolution image → {saved} "
-            f"({os.path.getsize(saved)} bytes)"
+            f"({os.path.getsize(saved)} bytes, {dim_label})"
         )
     return saved
 
@@ -3724,6 +3746,73 @@ try {
   callback(null);
 }
 """
+
+IMAGE_DISPLAY_CANVAS_EXPORT_JS = """
+var img = arguments[0];
+var callback = arguments[arguments.length - 1];
+try {
+  var w = img.clientWidth || img.naturalWidth || img.width || 0;
+  var h = img.clientHeight || img.naturalHeight || img.height || 0;
+  if (w < 200 || h < 80) {
+    callback(null);
+    return;
+  }
+  var canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  var ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  var data = canvas.toDataURL('image/jpeg', 0.92);
+  callback(data && data.indexOf(',') >= 0 ? data.split(',')[1] : null);
+} catch (e) {
+  callback(null);
+}
+"""
+
+
+def _try_save_placeholder_viewer_image(driver, main_img, image_path: str, natural: dict) -> Optional[str]:
+    """
+  When naturalWidth stays tiny (72x32) but display is large, the CDN URL may still
+  serve full resolution — try blob fetch and display-size canvas before panel screenshot.
+    """
+    nw = int(natural.get("w") or 0)
+    nh = int(natural.get("h") or 0)
+    dw = int(natural.get("dw") or 0)
+    dh = int(natural.get("dh") or 0)
+    if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+        return None
+    if dw < MIN_WA_IMAGE_DISPLAY_PX or dh < 120:
+        return None
+
+    print(
+        f"🖼️ Placeholder natural {nw}x{nh} but display {dw}x{dh} — "
+        "trying blob fetch + display canvas before panel screenshot"
+    )
+    try:
+        b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
+        if b64:
+            saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+            if saved:
+                dims = read_image_dimensions(saved)
+                dim_label = f"{dims[0]}x{dims[1]}" if dims else "unknown"
+                if dims and dims[0] >= MIN_WA_IMAGE_NATURAL_PX and dims[1] >= 80:
+                    print(f"🖼️ Saved full-resolution image (blob fetch, placeholder natural) → {saved} ({dim_label})")
+                    return saved
+                print(f"🖼️ Blob fetch returned {dim_label} — keeping for Copilot")
+                return saved
+    except Exception as exc:
+        print(f"⚠️ Placeholder blob fetch failed: {exc}")
+
+    try:
+        b64 = _execute_async_js(driver, IMAGE_DISPLAY_CANVAS_EXPORT_JS, main_img, timeout=20)
+        if b64:
+            saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
+            if saved:
+                print(f"🖼️ Saved display-size canvas export → {saved}")
+                return saved
+    except Exception as exc:
+        print(f"⚠️ Display canvas export failed: {exc}")
+    return None
 
 
 def _save_viewer_panel_screenshot(driver, dest_path: str) -> Optional[str]:
@@ -3786,6 +3875,25 @@ def download_full_resolution_image(driver, bubble, image_path):
             "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0};",
             main_img,
         ) or {}
+        nw = int(natural.get("w") or 0)
+        nh = int(natural.get("h") or 0)
+        if nw < MIN_WA_IMAGE_NATURAL_PX or nh < 80:
+            print(
+                f"🖼️ Viewer still loading — natural {nw}x{nh}, waiting for full resolution..."
+            )
+            extra_end = time.time() + 20.0
+            while time.time() < extra_end:
+                time.sleep(1.0)
+                natural = driver.execute_script(
+                    "return {w: arguments[0].naturalWidth||0, h: arguments[0].naturalHeight||0,"
+                    "dw: arguments[0].clientWidth||0, dh: arguments[0].clientHeight||0};",
+                    main_img,
+                ) or {}
+                nw = int(natural.get("w") or 0)
+                nh = int(natural.get("h") or 0)
+                if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+                    break
+
         print(
             f"🖼️ Viewer image — display {natural.get('dw', 0)}x{natural.get('dh', 0)}, "
             f"natural {natural.get('w', 0)}x{natural.get('h', 0)}"
@@ -3804,32 +3912,42 @@ def download_full_resolution_image(driver, bubble, image_path):
                 for btn in driver.find_elements(By.CSS_SELECTOR, selector):
                     if btn.is_displayed():
                         btn.click()
-                        time.sleep(4)
+                        time.sleep(6)
                         downloaded = pick_newest_image_download(baseline_mtime)
                         saved = _save_downloaded_image(downloaded, image_path)
                         if saved:
-                            return saved
+                            degraded, reason = is_degraded_wa_capture(saved)
+                            if not degraded:
+                                return saved
+                            print(f"⚠️ Download saved but degraded ({reason}) — trying other methods")
             except Exception:
                 continue
 
-        if int(natural.get("dw") or 0) >= MIN_WA_IMAGE_DISPLAY_PX:
-            saved = _save_viewer_panel_screenshot(driver, image_path)
-            if saved:
-                return saved
-            saved = _save_element_screenshot(main_img, image_path)
-            if saved:
-                return saved
-
         nw = int(natural.get("w") or 0)
         nh = int(natural.get("h") or 0)
+        dw = int(natural.get("dw") or 0)
+        dh = int(natural.get("dh") or 0)
+        if nw < 120 or nh < 80:
+            if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+                placeholder_saved = _try_save_placeholder_viewer_image(
+                    driver, main_img, image_path, natural,
+                )
+                if placeholder_saved:
+                    degraded, reason = is_degraded_wa_capture(placeholder_saved)
+                    if not degraded:
+                        return placeholder_saved
+                    print(f"⚠️ Placeholder blob/canvas still degraded ({reason})")
+
         if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
             try:
                 b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
                 if b64:
                     saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
                     if saved:
-                        print(f"🖼️ Saved full-resolution image (blob fetch) → {saved}")
-                        return saved
+                        degraded, reason = is_degraded_wa_capture(saved)
+                        print(f"🖼️ Saved image (blob fetch) → {saved} ({reason})")
+                        if not degraded:
+                            return saved
             except Exception as exc:
                 print(f"⚠️ Blob fetch failed: {exc}")
 
@@ -3838,13 +3956,15 @@ def download_full_resolution_image(driver, bubble, image_path):
                 if b64:
                     saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
                     if saved:
-                        print(f"🖼️ Saved full-resolution image (canvas export) → {saved}")
-                        return saved
+                        degraded, reason = is_degraded_wa_capture(saved)
+                        print(f"🖼️ Saved image (canvas export) → {saved} ({reason})")
+                        if not degraded:
+                            return saved
             except Exception as exc:
                 print(f"⚠️ Canvas export failed: {exc}")
         else:
             print(
-                f"⚠️ Skipping blob/canvas — natural {nw}x{nh} looks like a loading placeholder."
+                f"⚠️ Skipping natural-size blob/canvas — natural {nw}x{nh} looks like a loading placeholder."
             )
 
         try:
@@ -3861,11 +3981,14 @@ def download_full_resolution_image(driver, bubble, image_path):
                     for item in items:
                         if item.is_displayed():
                             item.click()
-                            time.sleep(4)
+                            time.sleep(6)
                             downloaded = pick_newest_image_download(baseline_mtime)
                             saved = _save_downloaded_image(downloaded, image_path)
                             if saved:
-                                return saved
+                                degraded, reason = is_degraded_wa_capture(saved)
+                                if not degraded:
+                                    return saved
+                                print(f"⚠️ Save-as download degraded ({reason})")
                 except Exception:
                     continue
             ActionChains(driver).send_keys(Keys.ESCAPE).perform()
@@ -3875,7 +3998,20 @@ def download_full_resolution_image(driver, bubble, image_path):
 
         saved = _save_element_screenshot(main_img, image_path)
         if saved:
-            return saved
+            degraded, reason = is_degraded_wa_capture(saved)
+            if not degraded:
+                return saved
+            print(f"⚠️ Element screenshot degraded ({reason})")
+
+        if dw >= MIN_WA_IMAGE_DISPLAY_PX and dh >= 150:
+            print(
+                f"⚠️ Last resort — viewer panel screenshot (natural {nw}x{nh}, display {dw}x{dh})"
+            )
+            saved = _save_viewer_panel_screenshot(driver, image_path)
+            if saved:
+                degraded, reason = is_degraded_wa_capture(saved)
+                print(f"⚠️ Panel screenshot saved → {saved} ({reason})")
+                return saved
     except Exception as exc:
         print(f"⚠️ Full-resolution image download failed: {exc}")
     finally:
@@ -3927,7 +4063,27 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     full_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_full.png")
     full_result = download_full_resolution_image(driver, bubble, full_path)
     if full_result:
-        save_wa_image_manifest(full_result, message_data_id=message_data_id)
+        degraded, reason = is_degraded_wa_capture(full_result)
+        if degraded:
+            print(f"⚠️ First capture degraded ({reason}) — retrying full download once...")
+            retry_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_full_retry.png")
+            retry_result = download_full_resolution_image(driver, bubble, retry_path)
+            if retry_result:
+                retry_degraded, retry_reason = is_degraded_wa_capture(retry_result)
+                if not retry_degraded:
+                    full_result = retry_result
+                    degraded = False
+                else:
+                    print(f"⚠️ Retry still degraded ({retry_reason}) — using best available")
+                    size_a, _, _ = describe_image_file(full_result)
+                    size_b, _, _ = describe_image_file(retry_result)
+                    if size_b > size_a:
+                        full_result = retry_result
+        save_wa_image_manifest(
+            full_result,
+            message_data_id=message_data_id,
+            capture_method="download_full_resolution",
+        )
         return full_result
 
     viewer_path = os.path.join(WA_IMAGE_DIR, f"{base_name}_{stamp}_viewer.png")
@@ -4125,7 +4281,15 @@ def send_image_attachment_in_current_chat(driver, image_path: str, caption: str 
         return False
 
     abs_path = os.path.abspath(image_path)
-    print(f"📷 Attaching image to WhatsApp chat: {abs_path}")
+    size, dims, dim_label = describe_image_file(abs_path)
+    degraded, degrade_reason = is_degraded_wa_capture(abs_path)
+    print(f"📷 Attaching image to WhatsApp chat: {abs_path} ({dim_label}, {size} bytes)")
+    if degraded:
+        print(f"⚠️ Monitor will receive DEGRADED capture (same file as Copilot): {degrade_reason}")
+        if caption:
+            caption = f"{caption}\n[OpenClaw image: {dim_label}, {size} bytes — DEGRADED capture]"
+        else:
+            caption = f"[OpenClaw image: {dim_label}, {size} bytes — DEGRADED capture]"
 
     try:
         attach_selectors = [
@@ -4221,6 +4385,7 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
                         classification_summary=None, image_path=None, copilot_items=None):
     lines = [
         "[OpenClaw Monitor Mode]",
+        f"Engine: {OPENCLAW_ENGINE_VERSION}",
         f"Context: {context or 'Customer reply'}",
         f"Customer: {customer_name or '-'}",
     ]
@@ -4244,9 +4409,16 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
             )
 
     if image_path:
+        size, dims, dim_label = describe_image_file(image_path)
+        degraded, degrade_reason = is_degraded_wa_capture(image_path)
         lines.append("")
         lines.append(f"Analyzed image file: {image_path}")
-        lines.append("(Photo attached below for verification)")
+        lines.append(f"Image on disk: {dim_label}, {size} bytes")
+        if degraded:
+            lines.append(f"⚠️ DEGRADED capture (NOT true full-res): {degrade_reason}")
+            lines.append("Monitor receives this SAME file — may look like a low-res sticker.")
+        else:
+            lines.append("(Photo attached below for verification)")
 
     lines.extend([
         "",
@@ -4309,7 +4481,8 @@ def send_copilot_malfunction_alert(
 ):
     """Notify monitor WhatsApp when Copilot API fails (non-200 / connection error)."""
     status = copilot_analysis.get("http_status")
-    error = str(copilot_analysis.get("error") or "unknown Copilot error").strip()
+    error = str(copilot_analysis.get("error") or copilot_analysis.get("extraction_error") or "unknown Copilot error").strip()
+    parse_warning = str(copilot_analysis.get("parse_warning") or "").strip()
     raw = str(copilot_analysis.get("raw_excerpt") or "").strip()
     lines = [
         "[OpenClaw Copilot Malfunction]",
@@ -4329,6 +4502,8 @@ def send_copilot_malfunction_alert(
         lines.append(f"Image: {image_path}")
     if original_message:
         lines.append(f"Caption: {original_message[:300]}")
+    if parse_warning:
+        lines.append(f"Parse warning: {parse_warning[:400]}")
     if raw:
         lines.append(f"Copilot raw excerpt: {raw[:400]}")
     alert = "\n".join(lines)
@@ -4749,6 +4924,7 @@ def process_customer_inquiry(
                 "Please resend the product label photo together with the part numbers, or type:\n"
                 "ER6C 3.6V Qty:1"
             )
+            no_items_context = "NO_PRODUCT_FOUND"
         elif image_path and unified_analyze_ran:
             if is_copilot_transport_failure(copilot_analysis):
                 send_copilot_malfunction_alert(
@@ -4765,16 +4941,36 @@ def process_customer_inquiry(
                     image_path=image_path,
                     original_message=latest_message,
                 )
-            elif copilot_analysis.get("parse_warning"):
-                print(
-                    f"⚠️ Copilot parse warning (continuing RFQ): "
-                    f"{copilot_analysis.get('parse_warning')}"
+                reply = (
+                    "Hi, thank you for your inquiry.\n\n"
+                    "We received your message and our team is processing it now. "
+                    "We will send the quotation shortly."
                 )
-            reply = (
-                "Hi, I received your photo but could not read the product details clearly enough to quote.\n\n"
-                "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
-                "150-C25NBD Qty:3"
-            )
+                no_items_context = "COPILOT_TRANSPORT_FAILURE"
+            elif is_extraction_parse_failure(copilot_analysis):
+                send_copilot_malfunction_alert(
+                    driver,
+                    operation=str(copilot_analysis.get("extraction_error") or "PARSER_ERROR"),
+                    copilot_analysis=copilot_analysis,
+                    customer_name=contact_name,
+                    customer_contact=customer_contact,
+                    image_path=image_path,
+                    original_message=latest_message,
+                )
+                reply, no_items_context = build_extraction_failure_customer_reply(
+                    copilot_analysis,
+                    image_path=image_path,
+                )
+            else:
+                reply, no_items_context = build_extraction_failure_customer_reply(
+                    copilot_analysis,
+                    image_path=image_path,
+                )
+                print(
+                    f"⚠️ Extraction produced no warehouse items — "
+                    f"context={no_items_context} | "
+                    f"error={copilot_analysis.get('extraction_error')}"
+                )
         elif image_analysis:
             reply = (
                 "Hi, I analyzed your photo but could not match the parts in our system.\n\n"
@@ -4782,6 +4978,7 @@ def process_customer_inquiry(
                 "E3Z-T61 Qty:1\n"
                 "178902 Qty:2"
             )
+            no_items_context = "NO_PRODUCT_FOUND"
         elif voice_enrichment and (
             voice_enrichment.get("transcript")
             or voice_enrichment.get("voice_path")
@@ -4801,6 +4998,7 @@ def process_customer_inquiry(
                     "E3Z-T61 Qty:1\n"
                     "178902 Qty:2"
                 )
+            no_items_context = "OCR_NO_TEXT"
         else:
             reply = (
                 "Hi, I received your WhatsApp message, but I could not detect item details.\n\n"
@@ -4808,6 +5006,7 @@ def process_customer_inquiry(
                 "E3Z-T61 Qty:1\n"
                 "178902 Qty:2"
             )
+            no_items_context = "NO_PRODUCT_FOUND"
 
         sent = send_customer_reply(
             driver,
@@ -4815,7 +5014,7 @@ def process_customer_inquiry(
             customer_name=contact_name,
             customer_contact=customer_contact,
             original_message=latest_message,
-            context=f"{image_prefix}NO_ITEMS",
+            context=f"{image_prefix}{no_items_context}",
             customer_chat_is_open=True,
             classification_summary=classification_summary,
             image_path=image_path,
@@ -4826,7 +5025,7 @@ def process_customer_inquiry(
             log_message,
             [],
             [],
-            f"{image_prefix}NO_ITEMS_REPLIED" if sent else f"{image_prefix}NO_ITEMS_REPLY_FAILED"
+            f"{image_prefix}{no_items_context}_REPLIED" if sent else f"{image_prefix}{no_items_context}_REPLY_FAILED"
         )
         return
 
