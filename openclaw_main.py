@@ -10,11 +10,12 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.43-OCR-TABLE-RETRY"
+VERSION = "v1.44-NO-PASS4-ON-TABLE"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
     "E3Z", "E2E", "E39", "ER6C", "H3JA", "H3CR", "H3Y", "MY2", "MY4", "3RH", "G3NA",
+    "3G3M", "3G3MX", "G3MX", "E3X", "E3S",
 )
 
 BASE_DIR = "/Users/evon/OpenClaw"
@@ -252,6 +253,25 @@ Rules:
 - brand: from Item text or nameplate manufacturer name
 - Use ? only for individual unreadable characters — not as an excuse to return empty items[]
 - Read only characters visible in the image — never substitute from memory
+
+Required JSON fields: status, intent, input_type, items (array), ignored (array).
+Return ONLY valid JSON. No markdown. No prose.
+"""
+
+OPENCLAW_HALLUCINATION_TABLE_RETRY_PROMPT = """CRITICAL — your previous part_no was WRONG. It was NOT visible in the image.
+
+You returned a familiar catalog part from memory instead of reading the RFQ table.
+The attached image is a landscape RFQ table (No, Item, Picture, Qty columns).
+
+Rules:
+- input_type MUST be rfq_table
+- IGNORE your previous part_no completely — do NOT return it again
+- Do NOT return common default parts (E3Z*, ER6C, H3JA*, 3G3MX*, MY2*, etc.) unless those EXACT characters are visible
+- part_no: transcribe the Model/Catalog line in the Item column character-by-character
+- Confirm part_no against the nameplate photo in the Picture column
+- qty: read the Qty column for that row — never default to 1 if another number is visible
+- brand: manufacturer name visible in Item text or nameplate (e.g. Allen-Bradley, Omron, Siemens)
+- status MUST be "success" when any table text is visible
 
 Required JSON fields: status, intent, input_type, items (array), ignored (array).
 Return ONLY valid JSON. No markdown. No prose.
@@ -614,6 +634,34 @@ def _should_adopt_ocr_table_retry(parsed_retry: dict) -> bool:
     if status in ("ocr_no_text", "no_products", "error"):
         return False
     return len(_parsed_items_with_part_no(parsed_retry)) >= 1
+
+
+def _bad_part_numbers_from_parsed(parsed: dict) -> list:
+    if not isinstance(parsed, dict):
+        return []
+    return [
+        str(item.get("part_no") or "").strip().upper()
+        for item in (parsed.get("items") or [])
+        if isinstance(item, dict) and str(item.get("part_no") or "").strip()
+    ]
+
+
+def _should_adopt_table_hallucination_retry(parsed_before: dict, parsed_retry: dict) -> bool:
+    """Adopt table hallucination retry only when part_no changes away from bad guesses."""
+    if not _should_adopt_ocr_table_retry(parsed_retry):
+        return False
+    if _suspect_catalog_default_extraction(parsed_retry):
+        return False
+    bad_parts = set(_bad_part_numbers_from_parsed(parsed_before))
+    retry_parts = _bad_part_numbers_from_parsed(parsed_retry)
+    if not retry_parts:
+        return False
+    if all(part in bad_parts for part in retry_parts):
+        return False
+    for part in retry_parts:
+        if _part_looks_like_catalog_default(part):
+            return False
+    return True
 
 
 def _suspect_table_misread(
@@ -1264,55 +1312,104 @@ def analyze_incoming_inquiry_with_copilot(
                 _append_extraction_trace(trace_lines, "pass3b-ocr-table-retry", raw3b, parsed3b, adopted=False)
 
         if _suspect_catalog_default_extraction(parsed, message_text=message_text):
-            bad_parts = [
-                str(i.get("part_no") or "")
-                for i in (parsed.get("items") or [])
-                if isinstance(i, dict)
-            ]
+            bad_parts = _bad_part_numbers_from_parsed(parsed)
+            input_type = str(parsed.get("input_type") or "").strip().lower()
             print(
                 f"[COPILOT ANALYZE] Suspected catalog-default hallucination "
-                f"({', '.join(bad_parts)}) — literal transcription retry"
+                f"({', '.join(bad_parts)}) — retry"
             )
             trace_lines.append(
                 f"  WHY: part(s) {bad_parts} match common Copilot catalog defaults "
-                f"(E3Z/ER6C/H3JA prefixes) — likely NOT read from image"
+                f"(E3Z/ER6C/H3JA/3G3MX prefixes) — likely NOT read from image"
             )
-            literal_prompt = _build_extraction_user_prompt(
-                message_text=message_text,
-                document_text=document_text,
-                voice_transcript=voice_transcript,
-                base_prompt=OPENCLAW_LITERAL_RETRY_PROMPT,
-                image_path=image_path,
-                image_dims=image_dims,
-            )
-            raw4, parsed4, err4, det4 = _call_and_parse(literal_prompt, "pass4-literal-retry")
-            if parsed4 is not None and not _suspect_catalog_default_extraction(parsed4, message_text):
-                raw, parsed = raw4, parsed4
-                _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=True)
-            elif parsed4 is not None:
-                kept = [
-                    i for i in (parsed4.get("items") or [])
-                    if isinstance(i, dict)
-                    and not _part_looks_like_catalog_default(str(i.get("part_no") or ""))
-                ]
-                if kept:
-                    parsed4["items"] = kept
-                    raw, parsed = raw4, parsed4
+
+            if input_type == "rfq_table":
+                print("[COPILOT ANALYZE] rfq_table hallucination — table OCR retry (not pass4 literal)")
+                table_fix_prompt = (
+                    _build_extraction_user_prompt(
+                        message_text=message_text,
+                        document_text=document_text,
+                        voice_transcript=voice_transcript,
+                        base_prompt=OPENCLAW_HALLUCINATION_TABLE_RETRY_PROMPT,
+                        image_path=image_path,
+                        image_dims=image_dims,
+                    )
+                    + f"\n\nYour incorrect prior part_no values (NOT in image): {', '.join(bad_parts)}"
+                )
+                raw3c, parsed3c, err3c, det3c = _call_and_parse(
+                    table_fix_prompt, "pass3c-hallucination-table-retry",
+                )
+                if parsed3c is not None and _should_adopt_table_hallucination_retry(parsed, parsed3c):
+                    print(
+                        f"[COPILOT ANALYZE] Adopting pass3c-hallucination-table-retry: "
+                        f"{', '.join(_bad_part_numbers_from_parsed(parsed3c))}"
+                    )
+                    raw, parsed = raw3c, parsed3c
                     _append_extraction_trace(
-                        trace_lines, "pass4-literal-retry", raw4, parsed4,
-                        adopted=True, note="pruned catalog defaults",
+                        trace_lines, "pass3c-hallucination-table-retry", raw3c, parsed3c,
+                        adopted=True, note=f"replaced hallucination {bad_parts}",
+                    )
+                elif parsed3c is not None:
+                    print(
+                        "[COPILOT ANALYZE] pass3c-hallucination-table-retry not adopted — "
+                        f"parts={_bad_part_numbers_from_parsed(parsed3c)}"
+                    )
+                    _append_extraction_trace(
+                        trace_lines, "pass3c-hallucination-table-retry", raw3c, parsed3c,
+                        adopted=False,
+                    )
+                    parsed["items"] = []
+                    parsed["status"] = "no_products"
+                    trace_lines.append(
+                        "  Cleared items — table retry still returned suspect / repeated parts"
                     )
                 else:
                     parsed["items"] = []
                     parsed["status"] = "no_products"
-                    trace_lines.append(
-                        "  pass4-literal-retry still returned catalog defaults — cleared items"
-                    )
-                    _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=False)
+                    trace_lines.append("  pass3c-hallucination-table-retry failed — cleared items")
             else:
-                parsed["items"] = []
-                parsed["status"] = "no_products"
-                trace_lines.append("  pass4-literal-retry failed — cleared items")
+                literal_prompt = _build_extraction_user_prompt(
+                    message_text=message_text,
+                    document_text=document_text,
+                    voice_transcript=voice_transcript,
+                    base_prompt=OPENCLAW_LITERAL_RETRY_PROMPT,
+                    image_path=image_path,
+                    image_dims=image_dims,
+                )
+                raw4, parsed4, err4, det4 = _call_and_parse(literal_prompt, "pass4-literal-retry")
+                if parsed4 is not None and not _suspect_catalog_default_extraction(parsed4, message_text):
+                    if _should_adopt_table_hallucination_retry(parsed, parsed4):
+                        raw, parsed = raw4, parsed4
+                        _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=True)
+                    else:
+                        print("[COPILOT ANALYZE] pass4-literal-retry not adopted — same/suspect parts")
+                        parsed["items"] = []
+                        parsed["status"] = "no_products"
+                        _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=False)
+                elif parsed4 is not None:
+                    kept = [
+                        i for i in (parsed4.get("items") or [])
+                        if isinstance(i, dict)
+                        and not _part_looks_like_catalog_default(str(i.get("part_no") or ""))
+                    ]
+                    if kept and _should_adopt_table_hallucination_retry(parsed, {"items": kept}):
+                        parsed4["items"] = kept
+                        raw, parsed = raw4, parsed4
+                        _append_extraction_trace(
+                            trace_lines, "pass4-literal-retry", raw4, parsed4,
+                            adopted=True, note="pruned catalog defaults",
+                        )
+                    else:
+                        parsed["items"] = []
+                        parsed["status"] = "no_products"
+                        trace_lines.append(
+                            "  pass4-literal-retry still returned catalog defaults — cleared items"
+                        )
+                        _append_extraction_trace(trace_lines, "pass4-literal-retry", raw4, parsed4, adopted=False)
+                else:
+                    parsed["items"] = []
+                    parsed["status"] = "no_products"
+                    trace_lines.append("  pass4-literal-retry failed — cleared items")
 
         valid, missing = _validate_copilot_extraction_json(parsed)
         if not valid:
