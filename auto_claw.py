@@ -15,11 +15,22 @@ from O365 import Account
 from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
 from inquiry_extraction_helper import extract_clean_items_from_text
+from openclaw_inquiry_engine import MARKUP_DIVISOR
 from openclaw_main import extract_rfq_with_copilot
+from openclaw_busy import (
+    clear_busy,
+    flip_channel_turn,
+    get_channel_turn,
+    is_busy,
+    is_channel_turn,
+    set_busy,
+    throttled_log,
+    wait_until_idle,
+)
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
-VERSION = "v1.14-EMAIL-FIFO-ONE"
+VERSION = "v1.15-EMAIL-BUSY-FLAG-TURN"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -801,7 +812,7 @@ def process_supplier_replies(mailbox):
 
                     if cost_val:
                         try:
-                            sell_price = float(str(cost_val).replace(',', '')) / 0.8
+                            sell_price = float(str(cost_val).replace(',', '')) / MARKUP_DIVISOR
 
                             formatted_rows.append({
                                 'desc': desc,
@@ -1337,7 +1348,7 @@ def process_latest_inquiry():
                     if usable_store_qty > 0 and cost > 0:
                         quoted_qty = min(requested_qty, usable_store_qty)
                         balance_qty = max(requested_qty - quoted_qty, 0)
-                        sell_price = cost / 0.8
+                        sell_price = cost / MARKUP_DIVISOR
 
                         formatted_initial_rows.append({
                             'desc': full_desc,
@@ -1597,16 +1608,34 @@ if __name__ == "__main__":
     print(f"🧪 Testing Routing Email: {TEST_ROUTING_EMAIL}")
     log_line()
 
+    IDLE_POLL = float(os.getenv("OPENCLAW_IDLE_POLL_SECONDS", "2"))
+
     while True:
         try:
-            process_latest_inquiry()
+            if is_busy():
+                wait_until_idle(poll_seconds=IDLE_POLL, label="email-engine")
+                continue
+            if not is_channel_turn("email"):
+                throttled_log(
+                    "email-not-turn",
+                    f"⏸️ Not email turn (current={get_channel_turn()}) — waiting...",
+                )
+                time.sleep(IDLE_POLL)
+                continue
+
+            set_busy("email", "processing_inbox")
+            try:
+                process_latest_inquiry()
+            finally:
+                clear_busy()
+                flip_channel_turn()
 
         except requests.exceptions.ConnectionError:
-            print("🌐 Network issues detected. Retrying in 60 seconds...")
+            clear_busy()
+            print("🌐 Network issues detected. Retrying shortly...")
 
         except Exception as e:
+            clear_busy()
             print(f"⚠️ Unexpected error: {e}")
 
-        print("⏳ Sleeping 30 seconds before next check...")
-        log_line()
-        time.sleep(30)
+        time.sleep(IDLE_POLL)
