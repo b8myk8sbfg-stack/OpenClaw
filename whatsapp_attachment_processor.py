@@ -1730,7 +1730,7 @@ def download_document_from_bubble(
 MIN_WA_IMAGE_BYTES = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_BYTES", "8000"))
 MIN_WA_IMAGE_DISPLAY_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_DISPLAY_PX", "400"))
 MIN_WA_IMAGE_NATURAL_PX = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_NATURAL_PX", "250"))
-MIN_WA_IMAGE_FULL_WIDTH = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_FULL_WIDTH", "900"))
+MIN_WA_IMAGE_FULL_WIDTH = int(os.getenv("OPENCLAW_MIN_WA_IMAGE_FULL_WIDTH", "680"))
 
 
 def describe_image_file(path: str) -> Tuple[int, Optional[Tuple[int, int]], str]:

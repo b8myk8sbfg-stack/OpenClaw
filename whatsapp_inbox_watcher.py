@@ -45,6 +45,7 @@ from openclaw_main import (
     build_photo_confirmation_line,
     build_technical_support_reply,
     is_copilot_transport_failure,
+    is_openai_api_key_failure,
     is_extraction_parse_failure,
 )
 from whatsapp_message_classifier import (
@@ -4841,6 +4842,40 @@ def process_customer_inquiry(
     document_items = document_items or []
     copilot_analysis = copilot_analysis or {}
     image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
+
+    if is_openai_api_key_failure(copilot_analysis):
+        print(
+            "❌ OpenAI vision failed — fix OPENAI_API_KEY in /Users/evon/OpenClaw/.env "
+            "(must be sk-... not local-bypass). Replay works only if your shell sources .env."
+        )
+        send_copilot_malfunction_alert(
+            driver,
+            operation="openai_api_key_invalid",
+            copilot_analysis=copilot_analysis,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            image_path=image_path or "",
+            original_message=latest_message,
+        )
+        reply = (
+            "Hi, thank you for your inquiry.\n\n"
+            "We received your message and our team is reviewing it now. "
+            "We will send the quotation shortly."
+        )
+        send_customer_reply(
+            driver,
+            reply,
+            customer_name=contact_name,
+            customer_contact=customer_contact,
+            original_message=latest_message,
+            context="OPENAI_API_KEY_HOLD",
+            customer_chat_is_open=True,
+            classification_summary=classification_summary,
+            image_path=image_path,
+            copilot_items=[],
+        )
+        append_log(contact_name, latest_message, [], [], "OPENAI_API_KEY_HOLD")
+        return
 
     if is_copilot_transport_failure(copilot_analysis):
         send_copilot_malfunction_alert(

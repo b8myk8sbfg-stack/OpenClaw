@@ -8,9 +8,13 @@ import mimetypes
 import signal
 import re
 
+from dotenv import load_dotenv
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.51-OPENAI-IMAGE"
+BASE_DIR = "/Users/evon/OpenClaw"
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+VERSION = "v1.52-OPENAI-ENV-FIX"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -18,8 +22,6 @@ COMMON_CATALOG_DEFAULT_PREFIXES = (
     "3G3M", "3G3MX", "G3MX", "E3X", "E3S",
     "3RT", "3RV", "3RU", "3RP", "3RA", "6ES", "6EP", "6SL", "1FK", "LC1D", "LC1F",
 )
-
-BASE_DIR = "/Users/evon/OpenClaw"
 
 EMAIL_SCRIPT = os.path.join(BASE_DIR, "auto_claw.py")
 WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "whatsapp_inbox_watcher.py")
@@ -370,6 +372,9 @@ def is_copilot_transport_failure(analysis: dict) -> bool:
         return False
     if analysis.get("ok") is not False:
         return False
+    if analysis.get("analysis_backend") == "openai_vision":
+        # OpenAI vision misconfig (401 bad key) is not a Copilot proxy outage.
+        return False
     err = str(analysis.get("extraction_error") or "").upper()
     if err in BUSINESS_EXTRACTION_ERRORS:
         return False
@@ -388,6 +393,18 @@ def is_copilot_transport_failure(analysis: dict) -> bool:
         if "image data" in error or "invalid_request" in error:
             return False
     return code >= 400
+
+
+def is_openai_api_key_failure(analysis: dict) -> bool:
+    """True when OpenAI vision failed due to missing/invalid OPENAI_API_KEY."""
+    if not isinstance(analysis, dict):
+        return False
+    if analysis.get("analysis_backend") != "openai_vision":
+        return False
+    try:
+        return int(analysis.get("http_status") or 0) == 401
+    except (TypeError, ValueError):
+        return False
 
 
 def _minimal_copilot_analysis_result(
@@ -577,12 +594,26 @@ def _image_analysis_backend(override: str = None) -> str:
     return "copilot"
 
 
+def _resolve_openai_api_key() -> str:
+    """Return a real OpenAI API key from env, or empty if missing/placeholder."""
+    key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not key:
+        return ""
+    if key in ("local-bypass", "local-copilot-proxy", "unused", "sk-your-key-here"):
+        print(f"[OPENAI ANALYZE] OPENAI_API_KEY is placeholder ({key!r}) — set real sk-... key in .env")
+        return ""
+    if not key.startswith("sk-"):
+        print("[OPENAI ANALYZE] OPENAI_API_KEY does not look valid (must start with sk-)")
+        return ""
+    return key
+
+
 def _use_openai_for_image(image_path: str = None, backend: str = None) -> bool:
     if not image_path or not os.path.exists(image_path):
         return False
     if _image_analysis_backend(backend) != "openai":
         return False
-    if not os.getenv("OPENAI_API_KEY"):
+    if not _resolve_openai_api_key():
         print("[OPENAI ANALYZE] OPENAI_API_KEY not set — cannot use OpenAI image backend")
         return False
     return True
@@ -1298,7 +1329,19 @@ def analyze_incoming_inquiry_with_openai_vision(
             http_status=200,
         )
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=120.0, max_retries=1)
+    api_key = _resolve_openai_api_key()
+    if not api_key:
+        return {
+            "attempted": True,
+            "ok": False,
+            "error": "OPENAI_API_KEY missing or invalid in .env",
+            "http_status": 401,
+            "items": [],
+            "extraction_error": "OPENAI_API_KEY_INVALID",
+            "analysis_backend": "openai_vision",
+        }
+
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=1)
     user_text = _build_extraction_user_prompt(
         message_text=message_text,
         document_text=document_text,
@@ -1383,13 +1426,16 @@ def analyze_incoming_inquiry_with_openai_vision(
             "analysis_backend": "openai_vision",
         }
     except APIStatusError as exc:
-        print(f"[OPENAI ANALYZE] API error {exc.status_code}: {exc}")
+        status = getattr(exc, "status_code", None)
+        print(f"[OPENAI ANALYZE] API error {status}: {exc}")
+        err_code = "OPENAI_API_KEY_INVALID" if status == 401 else "OPENAI_API_ERROR"
         return {
             "attempted": True,
             "ok": False,
             "error": str(exc),
-            "http_status": getattr(exc, "status_code", None),
+            "http_status": status,
             "items": [],
+            "extraction_error": err_code,
             "analysis_backend": "openai_vision",
         }
     except Exception as exc:
