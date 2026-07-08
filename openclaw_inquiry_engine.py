@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.08-STORE-QTY-SPLIT-BALANCE"
+VERSION = "v1.09-CATALOG-BASE-LOOKUP"
 
 # Customer sell price = purchase cost / MARKUP_DIVISOR (0.72 → ~38.9% markup on cost, ~28% margin).
 MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
@@ -31,6 +31,17 @@ KNOWN_BRANDS = {
 
 def normalize_part(part):
     return re.sub(r"[^A-Z0-9]", "", str(part or "").upper())
+
+
+def catalog_part_base_key(value):
+    """Strip a trailing voltage suffix so E5CC-RX2ASM-800 AC100-240 → E5CC-RX2ASM-800."""
+    text = re.sub(r"\s+", " ", str(value or "").upper().strip())
+    if not text:
+        return ""
+    match = re.match(r"^(.+?)\s+(?:AC|DC)(?:\d|/|\s)", text)
+    if match:
+        return normalize_part(match.group(1))
+    return normalize_part(text)
 
 
 def clean_text(value):
@@ -99,9 +110,9 @@ def load_warehouse_map():
             rows.append(row_data)
 
             for val in [api_id, stock_name, model_no, alt_model]:
-                norm = normalize_part(val)
-                if norm and norm not in exact_lookup:
-                    exact_lookup[norm] = row_data
+                for norm in {normalize_part(val), catalog_part_base_key(val)}:
+                    if norm and len(norm) >= 5 and norm not in exact_lookup:
+                        exact_lookup[norm] = row_data
 
     WAREHOUSE_ROWS = rows
     EXACT_LOOKUP = exact_lookup
@@ -446,8 +457,6 @@ def _score_warehouse_candidate(row, part_no, qty, declared_brand, requested_volt
             return None
         if not set(requested_voltage[1]).intersection(stock_voltage[1]):
             return None
-    if stock_voltage:
-        candidate_voltages.add(stock_voltage)
 
     score = 0
     score += startswith_part_boundary(row.get("stock_name"), part_no)
@@ -468,6 +477,9 @@ def _score_warehouse_candidate(row, part_no, qty, declared_brand, requested_volt
 
     if score <= 0:
         return None
+
+    if stock_voltage:
+        candidate_voltages.add(stock_voltage)
 
     return {**row, "score": score, "match_type": "PARTIAL_STOCK_FAMILY"}
 
