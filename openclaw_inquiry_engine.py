@@ -1027,6 +1027,14 @@ def _display_product_name(row: dict, copilot_items: list = None) -> str:
     return desc or part_no
 
 
+def _format_technical_details_section(product_details: str = "") -> str:
+    """Format extracted or researched product details for the quotation body."""
+    details = str(product_details or "").strip()
+    if not details:
+        return ""
+    return f"Product details:\n{details}\n\n"
+
+
 def build_plain_quotation_reply(
     rows,
     ai_research=None,
@@ -1102,10 +1110,10 @@ def build_plain_quotation_reply(
             "and will update you shortly.\n\n"
         )
 
-    msg += f"Best regards,\n{company}"
+    technical_block = _format_technical_details_section(ai_research)
+    if technical_block:
+        msg += technical_block
 
-    if ai_research:
-        msg += "\n\n"
-        msg += str(ai_research).strip()
+    msg += f"Best regards,\n{company}"
 
     return msg

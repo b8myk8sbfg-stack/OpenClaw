@@ -15,7 +15,7 @@ from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 BASE_DIR = "/Users/evon/OpenClaw"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-VERSION = "v1.54-PREPROD-MONITOR"
+VERSION = "v1.55-TECH-DETAILS"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -196,6 +196,27 @@ rfq_inquiry | purchase_order | technical_support | replacement_request | repair 
 
 part_no must be literal transcription. Never normalize. Never improve.
 
+STEP 5 — Technical enrichment (when status=success and items[] is not empty):
+After part_no is transcribed from the image, add product expertise for customer quotation replies.
+This step uses industrial automation knowledge — it does NOT change part_no, qty, or brand transcription.
+
+Fill technical_summary (plain text, WhatsApp-friendly) covering the primary quoted item(s):
+- One-sentence product overview (what it is and typical use)
+- Specifications as "Label: value" lines (model, voltage, contact rating, mounting, enclosure, etc.)
+- Part-number suffix notes (e.g. what "N", "GS-R", or series letters mean when applicable)
+- Pin / terminal configuration if relevant (relay, sensor, connector products)
+- Compatible sockets, bases, or accessories commonly ordered with this part
+- Typical applications (short bullet list)
+- Official catalog or datasheet URL on its own line: Catalog: https://... (manufacturer site only)
+
+Per item, also fill when known:
+- technical_specs: array of "Label: value" strings (key electrical/mechanical specs)
+- catalog_url: full https:// manufacturer catalog or datasheet link
+- compatible_accessories: array of related part numbers (e.g. socket models)
+
+Keep technical_summary under 400 words. Plain text only — no markdown, no ** bold, no code fences.
+If you do not know a spec or URL with confidence, omit it — never invent datasheet links.
+
 Return ONLY this JSON object (no other text). Use YOUR OWN readings — do NOT copy example values:
 {
   "status": "success",
@@ -212,7 +233,10 @@ Return ONLY this JSON object (no other text). Use YOUR OWN readings — do NOT c
       "qty": 1,
       "source": "table row",
       "confidence": 0.0,
-      "reason": ""
+      "reason": "",
+      "technical_specs": ["Model: ", "Coil voltage: "],
+      "catalog_url": "",
+      "compatible_accessories": []
     }
   ],
   "ignored": [],
@@ -313,7 +337,7 @@ Schema:
   "input_type": "",
   "primary_subject": "",
   "confidence": 0.0,
-  "items": [{"brand":"","part_no":"","description":"","product_type":"","qty":1,"source":"","confidence":0.0,"reason":""}],
+  "items": [{"brand":"","part_no":"","description":"","product_type":"","qty":1,"source":"","confidence":0.0,"reason":"","technical_specs":[],"catalog_url":"","compatible_accessories":[]}],
   "ignored": [],
   "technical_summary": "",
   "reasoning": ""
@@ -1300,7 +1324,8 @@ def _copilot_extraction_result_from_parsed(
     if not isinstance(ignored, list):
         ignored = [str(ignored)]
     technical_summary = _sanitize_whatsapp_reply(
-        str(parsed.get("technical_summary") or "").strip()
+        str(parsed.get("technical_summary") or "").strip(),
+        preserve_urls=True,
     )
 
     items_out = _parse_copilot_items_from_dict(
@@ -1470,6 +1495,19 @@ def _parse_copilot_items_from_dict(
             item_out["reason"] = item_reason
         if item_confidence is not None:
             item_out["confidence"] = item_confidence
+        specs = item.get("technical_specs")
+        if isinstance(specs, list):
+            cleaned_specs = [str(s).strip() for s in specs if str(s).strip()]
+            if cleaned_specs:
+                item_out["technical_specs"] = cleaned_specs
+        catalog_url = str(item.get("catalog_url") or "").strip()
+        if catalog_url.startswith("http"):
+            item_out["catalog_url"] = catalog_url
+        accessories = item.get("compatible_accessories")
+        if isinstance(accessories, list):
+            cleaned_acc = [str(a).strip() for a in accessories if str(a).strip()]
+            if cleaned_acc:
+                item_out["compatible_accessories"] = cleaned_acc
         items_out.append(item_out)
     return items_out
 
@@ -2234,6 +2272,62 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
     return list(analysis.get("items") or [])
 
 
+def _product_research_prompt(part_no: str, brand: str = "UNKNOWN") -> str:
+    brand_line = f" by {brand}" if brand and brand != "UNKNOWN" else ""
+    return (
+        f"Research the industrial automation part {part_no}{brand_line}.\n"
+        "Write a technical summary for a sales quotation reply (plain text, WhatsApp-friendly).\n\n"
+        "Include when known:\n"
+        "- One-sentence product overview\n"
+        "- Specifications as 'Label: value' lines (model, voltage, contact rating, mounting, etc.)\n"
+        "- Part-number suffix meaning (e.g. what series letters indicate)\n"
+        "- Pin / terminal configuration if applicable\n"
+        "- Compatible sockets, bases, or accessories commonly ordered with this part\n"
+        "- Typical applications (short bullet list)\n"
+        "- Official manufacturer catalog or datasheet URL on its own line: Catalog: https://...\n\n"
+        "Keep under 280 words. Plain text only — no markdown, no ** bold.\n"
+        "Only include URLs you are confident are official manufacturer links."
+    )
+
+
+def research_part_with_openai(part_no: str, brand: str = "UNKNOWN") -> str:
+    """Look up a part with OpenAI and return a technical summary for customer replies."""
+    part_no = str(part_no or "").strip().upper()
+    brand = str(brand or "UNKNOWN").strip().upper()
+    if not part_no:
+        return ""
+
+    api_key = _resolve_openai_api_key()
+    if not api_key:
+        return ""
+
+    print(f"[OPENAI RESEARCH] Looking up {part_no} ({brand})...")
+    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_RESEARCH_MODEL", OPENAI_VISION_MODEL),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
+                        "Give accurate, practical product summaries for quotation replies. "
+                        "Plain text only — no markdown. Include official catalog URLs when known."
+                    ),
+                },
+                {"role": "user", "content": _product_research_prompt(part_no, brand)},
+            ],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        print(f"[OPENAI RESEARCH] {len(text)} chars for {part_no}")
+        return _sanitize_whatsapp_reply(text, preserve_urls=True)
+    except Exception as exc:
+        print(f"[WARN] OpenAI research failed for {part_no}: {exc}")
+        return ""
+
+
 def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
     """Look up a part with Copilot and return a short technical summary for customer replies."""
     part_no = str(part_no or "").strip().upper()
@@ -2251,16 +2345,7 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
         timeout=45.0,
         max_retries=1,
     )
-    prompt = (
-        f"Research the industrial automation part {part_no}"
-        f"{f' by {brand}' if brand and brand != 'UNKNOWN' else ''}.\n"
-        "Write a concise technical summary suitable for a sales quotation reply.\n"
-        "Include:\n"
-        "- One-sentence product description\n"
-        "- Main specifications as short bullet points\n"
-        "- Typical applications (one short bullet list)\n"
-        "Keep the answer under 180 words. Plain text only. No markdown, no headers, no hyperlinks."
-    )
+    prompt = _product_research_prompt(part_no, brand)
     try:
         response = _copilot_fresh_chat(
             client,
@@ -2268,9 +2353,9 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are an industrial automation product specialist. "
-                        "Give accurate, practical summaries for sales staff. "
-                        "Plain text only — no markdown, no links."
+                        "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
+                        "Give accurate, practical product summaries for quotation replies. "
+                        "Plain text only — no markdown. Include official catalog URLs when known."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -2281,14 +2366,26 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
             lines = text.splitlines()
             text = "\n".join(lines[1:-1]).strip()
         print(f"[COPILOT RESEARCH] {len(text)} chars for {part_no}")
-        return _sanitize_whatsapp_reply(text)
+        return _sanitize_whatsapp_reply(text, preserve_urls=True)
     except Exception as exc:
         print(f"[WARN] Copilot research failed for {part_no}: {exc}")
         return ""
 
 
+def research_part_for_quotation(part_no: str, brand: str = "UNKNOWN") -> str:
+    """Research a part using the configured product-research backend."""
+    backend = os.getenv("OPENCLAW_RESEARCH_BACKEND", "").strip().lower()
+    if not backend:
+        backend = "openai" if _resolve_openai_api_key() else "copilot"
+    if backend in ("openai", "gpt", "gpt-4o"):
+        text = research_part_with_openai(part_no, brand)
+        if text:
+            return text
+    return research_part_with_copilot(part_no, brand)
+
+
 def build_ai_research_summary(formatted_rows):
-    """Build Copilot research notes for the unique customer parts in a quote."""
+    """Build product research notes for the unique customer parts in a quote."""
     sections = []
     seen = set()
     for row in formatted_rows or []:
@@ -2297,10 +2394,66 @@ def build_ai_research_summary(formatted_rows):
             continue
         seen.add(part_no)
         brand = str(row.get("brand") or "UNKNOWN").strip().upper()
-        notes = research_part_with_copilot(part_no, brand)
+        notes = research_part_for_quotation(part_no, brand)
         if notes:
             sections.append(f"{part_no}\n{notes}")
     return "\n\n".join(sections)
+
+
+def build_product_details_for_reply(
+    formatted_rows=None,
+    copilot_items=None,
+    technical_summary: str = "",
+) -> str:
+    """Combine extraction technical_summary, per-item specs, and fallback research."""
+    sections = []
+    summary = str(technical_summary or "").strip()
+    if summary:
+        sections.append(summary)
+
+    seen_parts = set()
+    for item in copilot_items or []:
+        if not isinstance(item, dict):
+            continue
+        part_no = str(item.get("part_no") or "").strip().upper()
+        if not part_no or part_no in seen_parts:
+            continue
+        seen_parts.add(part_no)
+
+        item_lines = []
+        specs = item.get("technical_specs") or []
+        if isinstance(specs, list) and specs:
+            item_lines.append("Specifications:")
+            for spec in specs:
+                spec_text = str(spec).strip()
+                if spec_text:
+                    item_lines.append(f"• {spec_text}")
+
+        accessories = item.get("compatible_accessories") or []
+        if isinstance(accessories, list) and accessories:
+            item_lines.append("Compatible accessories:")
+            for acc in accessories:
+                acc_text = str(acc).strip()
+                if acc_text:
+                    item_lines.append(f"• {acc_text}")
+
+        catalog_url = str(item.get("catalog_url") or "").strip()
+        if catalog_url.startswith("http"):
+            item_lines.append(f"Catalog: {catalog_url}")
+
+        if item_lines:
+            header = f"{part_no}"
+            brand = str(item.get("brand") or "").strip()
+            if brand and brand.upper() not in ("UNKNOWN", ""):
+                header = f"{brand} {part_no}"
+            block = header + "\n" + "\n".join(item_lines)
+            if block not in summary:
+                sections.append(block)
+
+    if sections:
+        return "\n\n".join(sections).strip()
+
+    return build_ai_research_summary(formatted_rows)
 
 
 def _is_equivalent_support_request(message_text: str) -> bool:
@@ -2351,10 +2504,13 @@ def _part_refs_from_copilot_items(copilot_items) -> list:
 
 
 
-def _sanitize_whatsapp_reply(text: str) -> str:
+def _sanitize_whatsapp_reply(text: str, preserve_urls: bool = False) -> str:
     """Strip markdown links/formatting Copilot sometimes adds."""
     cleaned = str(text or "").strip()
-    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    if preserve_urls:
+        cleaned = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", cleaned)
+    else:
+        cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
     cleaned = cleaned.replace("*", "")
     return cleaned.strip()
 

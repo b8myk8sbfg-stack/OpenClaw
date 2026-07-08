@@ -40,7 +40,7 @@ from image_inquiry_analyzer import analyze_inquiry_image
 from openclaw_main import (
     VERSION as OPENCLAW_ENGINE_VERSION,
     analyze_incoming_inquiry_with_copilot,
-    build_ai_research_summary,
+    build_product_details_for_reply,
     build_extraction_failure_customer_reply,
     build_photo_confirmation_line,
     build_technical_support_reply,
@@ -5236,17 +5236,18 @@ def process_customer_inquiry(
     if image_path and copilot_items:
         photo_confirmation = build_photo_confirmation_line(copilot_items)
 
-    if unified_analyze_ran:
-        ai_research = (
+    product_details = build_product_details_for_reply(
+        formatted_rows=formatted_rows,
+        copilot_items=copilot_items,
+        technical_summary=(
             copilot_technical_summary
-            or str((copilot_analysis or {}).get("analysis_text") or "").strip()
-        )
-    else:
-        ai_research = copilot_technical_summary or build_ai_research_summary(formatted_rows)
+            or str((copilot_analysis or {}).get("technical_summary") or "").strip()
+        ),
+    )
 
     customer_reply = build_plain_quotation_reply(
         formatted_rows,
-        ai_research=ai_research,
+        ai_research=product_details,
         photo_confirmation=photo_confirmation,
         customer_message=latest_message,
         copilot_items=copilot_items,
