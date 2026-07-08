@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.49-VISION-DIAGNOSE"
+VERSION = "v1.50-DEGRADED-HONEST"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -285,7 +285,7 @@ OPENCLAW_LITERAL_RETRY_PROMPT = """CRITICAL — your part_no values look like ca
 Re-read the attached image from scratch. Transcribe ONLY characters printed in the table cells and nameplate photo.
 
 Rules:
-- Do NOT return common Omron/Siemens/Mitsubishi default part numbers unless literally visible
+- Do NOT return parts from model memory unless those exact characters are visible in the image
 - For RFQ tables: read Item column Model line and Qty column exactly
 - If the nameplate shows CAT/Catalog number, transcribe that exact string
 - part_no must match visible text — use ? for unreadable characters
@@ -586,6 +586,15 @@ def _build_extraction_user_prompt(
     if document_text:
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
     if image_path and not minimal:
+        from whatsapp_attachment_processor import is_degraded_wa_capture
+
+        degraded, _deg_reason = is_degraded_wa_capture(image_path)
+        if degraded:
+            prompt_parts.append(
+                "IMPORTANT — attached image is LOW RESOLUTION. "
+                "If part numbers are not clearly legible from the image pixels, "
+                "status MUST be ocr_no_text with items=[]. Never invent part numbers from memory."
+            )
         dim_label = (
             f"{image_dims[0]}x{image_dims[1]}"
             if image_dims and image_dims[0] and image_dims[1]
@@ -603,6 +612,43 @@ def _build_extraction_user_prompt(
             + (" (landscape — check for RFQ table with No/Item/Picture/Qty columns)" if landscape else "")
         )
     return "\n\n".join(prompt_parts)
+
+
+def _degraded_extraction_discard_reason(parsed: dict, image_path: str = None) -> str:
+    """
+    When WA_Image is degraded (e.g. 688x309), Copilot API often cannot read text.
+    Short vision probes return UNREADABLE; the long JSON prompt then hallucinates E3Z/3RT.
+    Discard those guesses — return ocr_no_text instead.
+    """
+    if not image_path or not isinstance(parsed, dict):
+        return ""
+    from whatsapp_attachment_processor import is_degraded_wa_capture
+
+    degraded, degrade_reason = is_degraded_wa_capture(image_path)
+    if not degraded or not _parsed_items_with_part_no(parsed):
+        return ""
+    conf = _max_table_confidence(parsed)
+    parts = _bad_part_numbers_from_parsed(parsed)
+    if conf < 0.55:
+        return (
+            f"degraded capture ({degrade_reason}) — API vision likely unreadable "
+            f"(confidence {conf:.0%}), discarding guessed parts {parts}"
+        )
+    if any(_part_looks_like_catalog_default(p) for p in parts):
+        return f"catalog guess on degraded capture ({degrade_reason}): {parts}"
+    return ""
+
+
+def _apply_degraded_extraction_guard(parsed: dict, image_path: str = None) -> dict:
+    """Clear hallucinated items when degraded image + low confidence / catalog guess."""
+    reason = _degraded_extraction_discard_reason(parsed, image_path=image_path)
+    if not reason:
+        return parsed
+    print(f"[COPILOT ANALYZE] {reason}")
+    out = dict(parsed)
+    out["items"] = []
+    out["status"] = "ocr_no_text"
+    return out
 
 
 def _is_landscape_rfq_image(image_dims: tuple = None, message_text: str = "") -> bool:
@@ -1397,6 +1443,8 @@ def analyze_incoming_inquiry_with_copilot(
                 note=f"JSON_INVALID: {missing}",
             )
             return fail
+
+        parsed = _apply_degraded_extraction_guard(parsed, image_path=image_path)
 
         if single_pass:
             catalog_parts = _bad_part_numbers_from_parsed(parsed)
