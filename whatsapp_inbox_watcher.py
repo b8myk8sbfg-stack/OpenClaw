@@ -3151,9 +3151,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 image_path = image_path_this_step
                 degraded, reason = is_degraded_wa_capture(image_path)
                 if degraded:
-                    print(f"   🖼️ Image captured (DEGRADED {reason}) — same file goes to Copilot + monitor")
+                    print(f"   🖼️ Image captured (DEGRADED {reason}) — same file goes to OpenAI/Copilot + monitor")
                 else:
-                    print("   🖼️ Full-resolution image captured — unified Copilot analyze at end of plan")
+                    print("   🖼️ Full-resolution image captured — unified analyze at end of plan")
             elif bubble_has_explicit_voice_ui(container) or (
                 bubble_looks_like_voice_note(container) and not bubble_has_photo_attachment(container)
             ):
@@ -3233,7 +3233,11 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 continue
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
-            print("   📝 Text step: caption saved — unified Copilot analyze at end of plan")
+            print("   📝 Text step: caption saved — unified analyze at end of plan")
+
+        elif kind == "image":
+            # Caption already stored; capture may have failed — unified analyze still runs below.
+            pass
 
         else:
             print(f"   ⚠️ Skipping empty/unknown message unit at step {step}.")
@@ -3274,9 +3278,10 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
         voice_transcript=enrichment.get("transcript") or "",
     )
     if copilot_analysis.get("attempted"):
+        backend = copilot_analysis.get("analysis_backend") or "copilot"
         if copilot_analysis.get("items"):
             copilot_items = copilot_analysis["items"]
-            print(f"   🧠 Unified Copilot analyze: {len(copilot_items)} item(s)")
+            print(f"   🧠 Unified analyze ({backend}): {len(copilot_items)} item(s)")
         elif copilot_analysis.get("ok"):
             print("   ⚠️ Unified Copilot analyze OK but returned zero items")
         else:
@@ -3704,6 +3709,35 @@ def _save_downloaded_image(downloaded: str, dest_path: str) -> Optional[str]:
     return saved
 
 
+def _better_image_path(path_a: str, path_b: str) -> Optional[str]:
+    """Pick the larger/higher-resolution saved capture."""
+    if not path_a:
+        return path_b
+    if not path_b:
+        return path_a
+    size_a, dims_a, _ = describe_image_file(path_a)
+    size_b, dims_b, _ = describe_image_file(path_b)
+    px_a = (dims_a[0] * dims_a[1]) if dims_a else 0
+    px_b = (dims_b[0] * dims_b[1]) if dims_b else 0
+    if px_a != px_b:
+        return path_a if px_a > px_b else path_b
+    return path_a if size_a >= size_b else path_b
+
+
+def _save_viewer_element_screenshot(driver, dest_path: str, src_hint: str = "") -> Optional[str]:
+    """Screenshot viewer image element; re-find once on stale element."""
+    for attempt in range(2):
+        img = _find_main_viewer_image(driver, src_hint)
+        if img is None:
+            return None
+        saved = _save_element_screenshot(img, dest_path)
+        if saved:
+            return saved
+        if attempt == 0:
+            time.sleep(0.6)
+    return None
+
+
 def _save_element_screenshot(element, dest_path: str) -> Optional[str]:
     try:
         tmp_path = dest_path if dest_path.endswith(".png") else f"{dest_path}.png"
@@ -3865,10 +3899,19 @@ def download_full_resolution_image(driver, bubble, image_path):
         time.sleep(3.0)
 
         info = wait_for_viewer_high_resolution(driver, timeout=22.0)
-        main_img = _find_main_viewer_image(driver, (info or {}).get("src", ""))
+        src_hint = (info or {}).get("src", "")
+        main_img = _find_main_viewer_image(driver, src_hint)
         if main_img is None:
             print("⚠️ Media viewer opened but main image element not found.")
             return None
+
+        best_saved = None
+
+        def _note_saved(saved: Optional[str]) -> Optional[str]:
+            nonlocal best_saved
+            if saved:
+                best_saved = _better_image_path(best_saved, saved)
+            return saved
 
         natural = driver.execute_script(
             "return {w: arguments[0].naturalWidth||0, h: arguments[0].naturalHeight||0,"
@@ -3917,6 +3960,7 @@ def download_full_resolution_image(driver, bubble, image_path):
                         saved = _save_downloaded_image(downloaded, image_path)
                         if saved:
                             degraded, reason = is_degraded_wa_capture(saved)
+                            _note_saved(saved)
                             if not degraded:
                                 return saved
                             print(f"⚠️ Download saved but degraded ({reason}) — trying other methods")
@@ -3934,17 +3978,20 @@ def download_full_resolution_image(driver, bubble, image_path):
                 )
                 if placeholder_saved:
                     degraded, reason = is_degraded_wa_capture(placeholder_saved)
+                    _note_saved(placeholder_saved)
                     if not degraded:
                         return placeholder_saved
                     print(f"⚠️ Placeholder blob/canvas still degraded ({reason})")
 
         if nw >= MIN_WA_IMAGE_NATURAL_PX and nh >= 80:
+            main_img = _find_main_viewer_image(driver, src_hint)
             try:
                 b64 = _execute_async_js(driver, BLOB_TO_BASE64_JS, main_img, timeout=30)
                 if b64:
                     saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
                     if saved:
                         degraded, reason = is_degraded_wa_capture(saved)
+                        _note_saved(saved)
                         print(f"🖼️ Saved image (blob fetch) → {saved} ({reason})")
                         if not degraded:
                             return saved
@@ -3952,11 +3999,13 @@ def download_full_resolution_image(driver, bubble, image_path):
                 print(f"⚠️ Blob fetch failed: {exc}")
 
             try:
+                main_img = _find_main_viewer_image(driver, src_hint)
                 b64 = _execute_async_js(driver, IMAGE_CANVAS_EXPORT_JS, main_img, timeout=20)
                 if b64:
                     saved = save_validated_image_bytes(base64.b64decode(b64), image_path)
                     if saved:
                         degraded, reason = is_degraded_wa_capture(saved)
+                        _note_saved(saved)
                         print(f"🖼️ Saved image (canvas export) → {saved} ({reason})")
                         if not degraded:
                             return saved
@@ -3968,6 +4017,7 @@ def download_full_resolution_image(driver, bubble, image_path):
             )
 
         try:
+            main_img = _find_main_viewer_image(driver, src_hint)
             ActionChains(driver).context_click(main_img).perform()
             time.sleep(0.8)
             for label in ("Save image as", "Save Image As", "Save image", "Save picture as"):
@@ -3986,6 +4036,7 @@ def download_full_resolution_image(driver, bubble, image_path):
                             saved = _save_downloaded_image(downloaded, image_path)
                             if saved:
                                 degraded, reason = is_degraded_wa_capture(saved)
+                                _note_saved(saved)
                                 if not degraded:
                                     return saved
                                 print(f"⚠️ Save-as download degraded ({reason})")
@@ -3996,9 +4047,10 @@ def download_full_resolution_image(driver, bubble, image_path):
         except Exception as exc:
             print(f"⚠️ Save Image As menu failed: {exc}")
 
-        saved = _save_element_screenshot(main_img, image_path)
+        saved = _save_viewer_element_screenshot(driver, image_path, src_hint)
         if saved:
             degraded, reason = is_degraded_wa_capture(saved)
+            _note_saved(saved)
             if not degraded:
                 return saved
             print(f"⚠️ Element screenshot degraded ({reason})")
@@ -4010,8 +4062,17 @@ def download_full_resolution_image(driver, bubble, image_path):
             saved = _save_viewer_panel_screenshot(driver, image_path)
             if saved:
                 degraded, reason = is_degraded_wa_capture(saved)
+                _note_saved(saved)
                 print(f"⚠️ Panel screenshot saved → {saved} ({reason})")
                 return saved
+
+        if best_saved:
+            degraded, reason = is_degraded_wa_capture(best_saved)
+            print(
+                f"🖼️ Using best available capture"
+                f"{' (DEGRADED ' + reason + ')' if degraded else ''} → {best_saved}"
+            )
+            return best_saved
     except Exception as exc:
         print(f"⚠️ Full-resolution image download failed: {exc}")
     finally:
@@ -4921,8 +4982,8 @@ def process_customer_inquiry(
             print("⚠️ RFQ caption with no parts and no zoomed screenshot — cannot extract.")
             reply = (
                 "Hi, I received your quote request but could not access the product photo.\n\n"
-                "Please resend the product label photo together with the part numbers, or type:\n"
-                "ER6C 3.6V Qty:1"
+                "Please resend the photo, or type the part number and quantity, for example:\n"
+                "150-C25NBD Qty:3"
             )
             no_items_context = "NO_PRODUCT_FOUND"
         elif image_path and unified_analyze_ran:
