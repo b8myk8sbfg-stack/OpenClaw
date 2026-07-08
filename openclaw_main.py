@@ -10,7 +10,7 @@ import re
 
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
-VERSION = "v1.47-DEGRADED-CAPTURE-WARN"
+VERSION = "v1.48-MANUAL-PARITY-TEST"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -550,6 +550,22 @@ def _classify_empty_extraction(parsed: dict, image_path: str = None) -> str:
     return "NO_PRODUCT_FOUND"
 
 
+def _copilot_single_pass_enabled(override: bool = None) -> bool:
+    if override is not None:
+        return bool(override)
+    return os.getenv("OPENCLAW_COPILOT_SINGLE_PASS", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _copilot_manual_parity_prompt_enabled(override: bool = None) -> bool:
+    if override is not None:
+        return bool(override)
+    return os.getenv("OPENCLAW_COPILOT_MANUAL_PARITY", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _build_extraction_user_prompt(
     message_text: str = "",
     document_text: str = "",
@@ -557,6 +573,7 @@ def _build_extraction_user_prompt(
     base_prompt: str = None,
     image_path: str = None,
     image_dims: tuple = None,
+    minimal: bool = False,
 ) -> str:
     prompt_parts = [base_prompt or OPENCLAW_UNIFIED_PROMPT]
     if voice_transcript:
@@ -568,7 +585,7 @@ def _build_extraction_user_prompt(
         prompt_parts.append(f"Attached customer message/caption:\n{message_text}")
     if document_text:
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
-    if image_path:
+    if image_path and not minimal:
         dim_label = (
             f"{image_dims[0]}x{image_dims[1]}"
             if image_dims and image_dims[0] and image_dims[1]
@@ -1188,10 +1205,15 @@ def analyze_incoming_inquiry_with_copilot(
     image_path: str = None,
     document_text: str = None,
     voice_transcript: str = None,
+    single_pass: bool = None,
+    minimal_prompt: bool = None,
 ) -> dict:
     """Copilot-first unified analysis: classify intent + extract parts from text/image/voice/doc together."""
     if os.getenv("OPENCLAW_COPILOT_FIRST", "1").strip().lower() in ("0", "false", "no", "off"):
         return {"attempted": False, "ok": False, "items": []}
+
+    single_pass = _copilot_single_pass_enabled(single_pass)
+    minimal_prompt = _copilot_manual_parity_prompt_enabled(minimal_prompt)
 
     message_text = str(message_text or "").strip()
     document_text = str(document_text or "").strip()
@@ -1201,6 +1223,10 @@ def analyze_incoming_inquiry_with_copilot(
         return {"attempted": False, "ok": False, "items": []}
 
     print("[COPILOT ANALYZE] Unified incoming message analysis (text + attachment together)...")
+    if single_pass:
+        print("[COPILOT ANALYZE] Mode: SINGLE_PASS (pass1 only — no verify/retries)")
+    if minimal_prompt:
+        print("[COPILOT ANALYZE] Mode: MANUAL_PARITY prompt (unified prompt + caption only, no file path/dims)")
     print(f"[COPILOT LOG] Consolidated log: {COPILOT_EXTRACTION_LOG}")
     image_dims = None
     if image_path:
@@ -1256,6 +1282,7 @@ def analyze_incoming_inquiry_with_copilot(
         voice_transcript=voice_transcript,
         image_path=image_path,
         image_dims=image_dims,
+        minimal=minimal_prompt,
     )
     if image_path and os.path.exists(image_path):
         print(f"[COPILOT ANALYZE] Fresh chat — attached image: {image_path}")
@@ -1291,6 +1318,26 @@ def analyze_incoming_inquiry_with_copilot(
 
         if parsed is None:
             print(f"[COPILOT ANALYZE] JSON parse failed ({parse_error}): {parse_detail}")
+            if single_pass:
+                fail = _minimal_copilot_analysis_result(
+                    message_text=message_text,
+                    analysis_text=raw,
+                    raw=raw,
+                    parse_warning=f"JSON parse failed: {parse_detail}",
+                    http_status=200,
+                    extraction_error="PARSER_ERROR",
+                )
+                _append_copilot_extraction_log(
+                    pass_label="final",
+                    message_text=message_text,
+                    image_path=image_path,
+                    image_dims=image_dims,
+                    raw=raw,
+                    parsed=None,
+                    result=fail,
+                    note="PARSER_ERROR single_pass",
+                )
+                return fail
             retry_prompt = (
                 _build_extraction_user_prompt(
                     message_text=message_text,
@@ -1351,6 +1398,27 @@ def analyze_incoming_inquiry_with_copilot(
                 note=f"JSON_INVALID: {missing}",
             )
             return fail
+
+        if single_pass:
+            result = _copilot_extraction_result_from_parsed(
+                parsed,
+                raw,
+                message_text=message_text,
+                voice_transcript=voice_transcript,
+                image_path=image_path,
+            )
+            _append_copilot_extraction_log(
+                pass_label="final",
+                message_text=message_text,
+                image_path=image_path,
+                image_dims=image_dims,
+                raw=raw,
+                parsed=parsed,
+                result=result,
+                trace_lines=trace_lines,
+                note="single_pass manual parity",
+            )
+            return result
 
         if _suspect_table_misread(parsed, image_dims=image_dims, message_text=message_text):
             prev_type = parsed.get("input_type")

@@ -1,7 +1,11 @@
 #!/bin/bash
 # Replay a saved image through Copilot extraction using OpenClaw's uv environment.
 #
-# Usage:
+# Manual Copilot UI parity (recommended for Mac testing):
+#   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --manual \\
+#     --expect-part 150-C25NBD --expect-qty 3
+#
+# Full OpenClaw pipeline:
 #   bash scripts/replay_copilot_image.sh /path/to/image_full.jpg --caption "PLS QUOTE"
 
 set -euo pipefail
@@ -33,5 +37,4 @@ fi
 
 echo "ERROR: OpenClaw Python environment not found." >&2
 echo "Install uv, then from $BASE_DIR run: uv sync" >&2
-echo "Or run: uv run python scripts/replay_copilot_image.py <image> [--caption ...]" >&2
 exit 1
