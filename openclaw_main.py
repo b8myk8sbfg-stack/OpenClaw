@@ -585,16 +585,6 @@ def _build_extraction_user_prompt(
         prompt_parts.append(f"Attached customer message/caption:\n{message_text}")
     if document_text:
         prompt_parts.append(f"Attached document text:\n{document_text[:4000]}")
-    if image_path:
-        from whatsapp_attachment_processor import is_degraded_wa_capture
-
-        degraded, _deg_reason = is_degraded_wa_capture(image_path)
-        if degraded:
-            prompt_parts.append(
-                "IMPORTANT — attached image is LOW RESOLUTION. "
-                "If part numbers are not clearly legible from the image pixels, "
-                "status MUST be ocr_no_text with items=[]. Never invent part numbers from memory."
-            )
     if image_path and not minimal:
         dim_label = (
             f"{image_dims[0]}x{image_dims[1]}"

@@ -1752,8 +1752,12 @@ def is_degraded_wa_capture(path: str) -> Tuple[bool, str]:
     if not dims:
         return True, f"unknown dimensions ({size} bytes)"
     width, height = dims
-    if width < MIN_WA_IMAGE_FULL_WIDTH:
-        return True, f"{dim_label}, {size} bytes (need width >= {MIN_WA_IMAGE_FULL_WIDTH}px)"
+    longest = max(width, height)
+    if longest < MIN_WA_IMAGE_FULL_WIDTH:
+        return True, (
+            f"{dim_label}, {size} bytes "
+            f"(need longest side >= {MIN_WA_IMAGE_FULL_WIDTH}px)"
+        )
     if size < 50000 and width * height < 500_000:
         return True, f"{dim_label}, {size} bytes (small file for Copilot vision)"
     return False, f"{dim_label}, {size} bytes"
