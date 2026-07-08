@@ -5186,6 +5186,7 @@ def process_customer_inquiry(
                     "E3Z-T61 Qty:1\n"
                     "178902 Qty:2"
                 )
+                no_items_context = "NO_PRODUCT_FOUND"
             else:
                 reply = (
                     "Hi, we received your voice message but could not transcribe it.\n\n"
@@ -5193,7 +5194,7 @@ def process_customer_inquiry(
                     "E3Z-T61 Qty:1\n"
                     "178902 Qty:2"
                 )
-            no_items_context = "OCR_NO_TEXT"
+                no_items_context = "OCR_NO_TEXT"
         else:
             reply = (
                 "Hi, I received your WhatsApp message, but I could not detect item details.\n\n"

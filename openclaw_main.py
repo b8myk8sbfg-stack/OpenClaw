@@ -15,7 +15,7 @@ from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 BASE_DIR = "/Users/evon/OpenClaw"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-VERSION = "v1.56-MARKUP-072"
+VERSION = "v1.57-VOICE-RFQ-FIX"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -144,6 +144,162 @@ BUSINESS_EXTRACTION_ERRORS = frozenset({
 })
 
 REQUIRED_EXTRACTION_FIELDS = ("status", "intent", "input_type", "items")
+
+ITEM_EXTRACTION_FIELDS = (
+    "brand", "part_no", "description", "product_type", "qty", "source",
+    "confidence", "reason", "technical_specs", "catalog_url", "compatible_accessories",
+)
+
+
+def _score_extraction_json_candidate(parsed: dict) -> int:
+    """Prefer full extraction envelopes over nested item fragments."""
+    if not isinstance(parsed, dict):
+        return -1
+    score = 0
+    for field in REQUIRED_EXTRACTION_FIELDS:
+        if field in parsed:
+            score += 20
+    items = parsed.get("items")
+    if isinstance(items, list):
+        score += 15
+        score += sum(
+            10 for item in items
+            if isinstance(item, dict) and str(item.get("part_no") or "").strip()
+        )
+    if str(parsed.get("part_no") or "").strip() and not (
+        isinstance(items, list) and items
+    ):
+        score += 8
+    return score
+
+
+def _extract_item_dict_from_root(parsed: dict) -> dict:
+    part_no = str(parsed.get("part_no") or "").strip()
+    if not part_no:
+        return {}
+    item = {}
+    for key in ITEM_EXTRACTION_FIELDS:
+        if key in parsed:
+            item[key] = parsed[key]
+    return item
+
+
+def _coalesce_root_item_into_items(parsed: dict) -> dict:
+    """Recover when the JSON parser returned an item object instead of the full envelope."""
+    if not isinstance(parsed, dict):
+        return parsed
+    items = parsed.get("items")
+    if isinstance(items, list) and any(
+        isinstance(item, dict) and str(item.get("part_no") or "").strip()
+        for item in items
+    ):
+        return parsed
+    root_item = _extract_item_dict_from_root(parsed)
+    if not root_item:
+        return parsed
+    out = dict(parsed)
+    out["items"] = [root_item]
+    if not str(out.get("status") or "").strip() or out.get("status") == "no_products":
+        out["status"] = "success"
+    if not str(out.get("intent") or "").strip():
+        out["intent"] = "rfq_inquiry"
+    if not str(out.get("input_type") or "").strip():
+        out["input_type"] = "text_message"
+    print(
+        f"[COPILOT ANALYZE] Recovered item from JSON root fragment: "
+        f"{root_item.get('part_no')} x{root_item.get('qty', 1)}"
+    )
+    return out
+
+
+def _fallback_copilot_items_from_text(message_text: str = "", voice_transcript: str = "") -> list:
+    """Parse part numbers directly from voice/text when Copilot JSON has zero items."""
+    from inquiry_extraction_helper import extract_clean_items_from_text, extract_brand_from_text
+
+    blob = str(voice_transcript or message_text or "").strip()
+    if not blob:
+        return []
+    items_out = []
+    seen = set()
+    for item in extract_clean_items_from_text(blob):
+        part_no = str(item.get("part_no") or "").strip().upper()
+        if not part_no:
+            continue
+        try:
+            qty = max(1, int(item.get("qty") or 1))
+        except (TypeError, ValueError):
+            qty = 1
+        key = (part_no, qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        items_out.append({
+            "part_no": part_no,
+            "qty": qty,
+            "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
+            "source": "TRANSCRIPT_FALLBACK",
+        })
+
+    if items_out:
+        return items_out
+
+    voice_part_qty = re.compile(
+        r"\b([A-Z0-9][A-Z0-9\-]{4,40})\??\s+(\d{1,4})\s*"
+        r"(?:PCS|PC|PIECES|PIECE|UNIT|UNITS|EA)\b",
+        re.I,
+    )
+    for part_no, qty in voice_part_qty.findall(blob.upper()):
+        part_no = part_no.strip("-").upper()
+        qty = max(1, int(qty))
+        key = (part_no, qty)
+        if key in seen:
+            continue
+        seen.add(key)
+        items_out.append({
+            "part_no": part_no,
+            "qty": qty,
+            "brand": extract_brand_from_text(blob),
+            "source": "TRANSCRIPT_FALLBACK",
+        })
+    return items_out
+
+
+def _maybe_apply_transcript_fallback(
+    parsed: dict,
+    message_text: str = "",
+    voice_transcript: str = "",
+) -> dict:
+    """Fill items[] from transcript when Copilot JSON parsed to zero items."""
+    if not isinstance(parsed, dict):
+        return parsed
+    if _parsed_items_with_part_no(parsed):
+        return parsed
+    fallback_items = _fallback_copilot_items_from_text(message_text, voice_transcript)
+    if not fallback_items:
+        return parsed
+    print(
+        f"[COPILOT ANALYZE] Transcript fallback extracted "
+        f"{len(fallback_items)} item(s) from voice/text"
+    )
+    out = dict(parsed)
+    out["items"] = [
+        {
+            "brand": item.get("brand") or "UNKNOWN",
+            "part_no": item["part_no"],
+            "description": "",
+            "product_type": "",
+            "qty": item["qty"],
+            "source": "voice transcript",
+            "confidence": 0.9,
+            "reason": "Parsed from voice/text transcript after JSON extraction gap",
+        }
+        for item in fallback_items
+    ]
+    out["status"] = "success"
+    out["intent"] = str(out.get("intent") or "rfq_inquiry")
+    out["input_type"] = str(out.get("input_type") or "text_message")
+    return out
+
 
 OPENCLAW_UNIFIED_PROMPT = """CRITICAL RULES (override every other instruction):
 1. Never guess. Never autocomplete. Never correct spelling.
@@ -531,10 +687,18 @@ def parse_copilot_json_response(raw: str):
         if fragment and fragment not in candidates:
             candidates.append(fragment)
 
+    best_parsed = None
+    best_score = -1
     for candidate in candidates:
         parsed = _try_parse_json_candidate(candidate)
-        if parsed is not None:
-            return parsed, None, ""
+        if parsed is None:
+            continue
+        score = _score_extraction_json_candidate(parsed)
+        if score > best_score:
+            best_score = score
+            best_parsed = parsed
+    if best_parsed is not None:
+        return best_parsed, None, ""
 
     return None, "JSON_INVALID", "no parseable JSON object found"
 
@@ -564,7 +728,7 @@ def _normalize_copilot_extraction_json(parsed: dict) -> dict:
         out["technical_summary"] = ""
     if "reasoning" not in out:
         out["reasoning"] = ""
-    return out
+    return _coalesce_root_item_into_items(out)
 
 
 def _validate_copilot_extraction_json(parsed: dict):
@@ -1407,13 +1571,14 @@ def _infer_intent_from_prose(prose: str, message_text: str = "") -> str:
     return "unknown"
 
 
-def _copilot_fresh_chat(client, messages, timeout: float = 60.0):
+def _copilot_fresh_chat(client, messages, timeout: float = 60.0, max_tokens: int = 4096):
     """Every Copilot call starts a new upstream conversation — no thread history."""
     return client.chat.completions.create(
         model=COPILOT_MODEL,
         messages=messages,
         extra_body={"conversation_id": None},
         timeout=timeout,
+        max_tokens=max_tokens,
     )
 
 
@@ -1920,6 +2085,11 @@ def analyze_incoming_inquiry_with_copilot(
             return fail
 
         parsed = _apply_degraded_extraction_guard(parsed, image_path=image_path)
+        parsed = _maybe_apply_transcript_fallback(
+            parsed,
+            message_text=message_text,
+            voice_transcript=voice_transcript,
+        )
 
         if single_pass:
             catalog_parts = _bad_part_numbers_from_parsed(parsed)
@@ -2186,6 +2356,12 @@ def analyze_incoming_inquiry_with_copilot(
                 parsed["items"] = []
                 parsed["status"] = "no_products"
                 trace_lines.append("  pass4-literal-retry failed — cleared items")
+
+        parsed = _maybe_apply_transcript_fallback(
+            parsed,
+            message_text=message_text,
+            voice_transcript=voice_transcript,
+        )
 
         valid, missing = _validate_copilot_extraction_json(parsed)
         if not valid:
