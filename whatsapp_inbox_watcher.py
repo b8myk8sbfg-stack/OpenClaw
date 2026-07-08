@@ -3291,6 +3291,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 f"(HTTP {copilot_analysis.get('http_status')}): "
                 f"{copilot_analysis.get('error')}"
             )
+        comparison = copilot_analysis.get("backend_comparison") or {}
+        if comparison.get("enabled"):
+            print(f"   🔀 Backend compare: {comparison.get('summary')}")
         if image_path and copilot_items:
             image_analysis = {
                 "items": copilot_items,
@@ -4443,8 +4446,28 @@ def send_monitor_notification(
     return ok
 
 
+def format_backend_comparison_lines(backend_comparison: dict) -> list:
+    """Format OpenAI vs Copilot shadow extraction for monitor messages."""
+    if not backend_comparison or not backend_comparison.get("enabled"):
+        return []
+    verdict = str(backend_comparison.get("verdict") or "unknown").upper()
+    openai_info = backend_comparison.get("openai") or {}
+    copilot_info = backend_comparison.get("copilot") or {}
+    lines = [
+        "",
+        "Backend comparison (OpenAI primary vs Copilot shadow):",
+        f"  OpenAI:  {openai_info.get('label') or 'none'} (production)",
+        f"  Copilot: {copilot_info.get('label') or 'none'} (shadow)",
+        f"  Verdict: {verdict}",
+    ]
+    if verdict == "MISMATCH":
+        lines.append("  Note: Customer reply uses OpenAI extraction only.")
+    return lines
+
+
 def build_monitor_reply(context, customer_name, customer_contact, original_message, reply_message,
-                        classification_summary=None, image_path=None, copilot_items=None):
+                        classification_summary=None, image_path=None, copilot_items=None,
+                        backend_comparison=None):
     lines = [
         "[OpenClaw Monitor Mode]",
         f"Engine: {OPENCLAW_ENGINE_VERSION}",
@@ -4469,6 +4492,8 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
                 f"  - {item.get('part_no')} | Qty: {item.get('qty')} | "
                 f"Brand: {item.get('brand')} | Source: {item.get('source')}"
             )
+
+    lines.extend(format_backend_comparison_lines(backend_comparison))
 
     if image_path:
         size, dims, dim_label = describe_image_file(image_path)
@@ -4497,7 +4522,7 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
 def send_customer_reply(driver, reply_message, customer_name=None, customer_contact=None,
                         original_message=None, context="CUSTOMER_REPLY",
                         customer_chat_is_open=True, classification_summary=None,
-                        image_path=None, copilot_items=None):
+                        image_path=None, copilot_items=None, backend_comparison=None):
     if customer_replies_go_to_monitor():
         print(
             "🧪 Monitor mode active. Redirecting alert to your monitor number "
@@ -4517,6 +4542,7 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
             classification_summary=classification_summary,
             image_path=image_path,
             copilot_items=copilot_items,
+            backend_comparison=backend_comparison,
         )
         return send_monitor_notification(
             driver,
@@ -4842,6 +4868,7 @@ def process_customer_inquiry(
     document_items = document_items or []
     copilot_analysis = copilot_analysis or {}
     image_path = image_path or (image_analysis.get("image_path") if image_analysis else None)
+    backend_comparison = copilot_analysis.get("backend_comparison")
 
     if is_openai_api_key_failure(copilot_analysis):
         print(
@@ -4873,6 +4900,7 @@ def process_customer_inquiry(
             classification_summary=classification_summary,
             image_path=image_path,
             copilot_items=[],
+            backend_comparison=backend_comparison,
         )
         append_log(contact_name, latest_message, [], [], "OPENAI_API_KEY_HOLD")
         return
@@ -4903,6 +4931,7 @@ def process_customer_inquiry(
             classification_summary=classification_summary,
             image_path=image_path,
             copilot_items=copilot_analysis.get("items") or [],
+            backend_comparison=backend_comparison,
         )
         append_log(contact_name, latest_message, [], [], "COPILOT_MALFUNCTION_HOLD")
         return
@@ -5115,6 +5144,7 @@ def process_customer_inquiry(
             classification_summary=classification_summary,
             image_path=image_path,
             copilot_items=copilot_items,
+            backend_comparison=backend_comparison,
         )
         append_log(
             contact_name,
@@ -5160,6 +5190,7 @@ def process_customer_inquiry(
         classification_summary=classification_summary,
         image_path=image_path,
         copilot_items=copilot_items,
+        backend_comparison=backend_comparison,
     )
 
     if tbc_by_brand:

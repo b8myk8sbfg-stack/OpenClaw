@@ -7,6 +7,7 @@ import base64
 import mimetypes
 import signal
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
@@ -14,7 +15,7 @@ from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
 BASE_DIR = "/Users/evon/OpenClaw"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-VERSION = "v1.52-OPENAI-ENV-FIX"
+VERSION = "v1.53-IMAGE-COMPARE"
 
 # Part prefixes Copilot often hallucinates without reading the image (post-parse guard only).
 COMMON_CATALOG_DEFAULT_PREFIXES = (
@@ -617,6 +618,214 @@ def _use_openai_for_image(image_path: str = None, backend: str = None) -> bool:
         print("[OPENAI ANALYZE] OPENAI_API_KEY not set — cannot use OpenAI image backend")
         return False
     return True
+
+
+def _image_compare_copilot_enabled(override: bool = None) -> bool:
+    """When OpenAI is primary for images, also run Copilot in parallel for diagnostics."""
+    if override is not None:
+        return bool(override)
+    return os.getenv("OPENCLAW_IMAGE_COMPARE_COPILOT", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _normalize_part_for_comparison(part_no: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(part_no or "").strip().upper())
+
+
+def _extraction_item_tuples(items: list) -> list:
+    """Stable (part, qty) pairs for backend comparison."""
+    tuples = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        part = _normalize_part_for_comparison(item.get("part_no"))
+        if not part:
+            continue
+        try:
+            qty = int(item.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        tuples.append((part, max(qty, 1)))
+    tuples.sort()
+    return tuples
+
+
+def _format_items_for_comparison(items: list, source: str = "") -> str:
+    tuples = _extraction_item_tuples(items)
+    if not tuples:
+        return "none"
+    label = ", ".join(f"{part} x{qty}" for part, qty in tuples)
+    if source:
+        return f"{label} ({source})"
+    return label
+
+
+def _compare_image_extractions(primary: dict, secondary: dict) -> dict:
+    """Compare OpenAI (primary) vs Copilot (secondary) extraction results."""
+    primary_items = primary.get("items") or []
+    secondary_items = secondary.get("items") or []
+    primary_tuples = _extraction_item_tuples(primary_items)
+    secondary_tuples = _extraction_item_tuples(secondary_items)
+
+    if primary_tuples and secondary_tuples:
+        verdict = "match" if primary_tuples == secondary_tuples else "mismatch"
+    elif primary_tuples and not secondary_tuples:
+        verdict = "openai_only"
+    elif secondary_tuples and not primary_tuples:
+        verdict = "copilot_only"
+    else:
+        verdict = "both_empty"
+
+    openai_label = _format_items_for_comparison(primary_items, "OPENAI_VISION")
+    copilot_label = _format_items_for_comparison(secondary_items, "COPILOT_API")
+    summary = f"OpenAI: {openai_label} | Copilot: {copilot_label} — {verdict.upper()}"
+
+    return {
+        "enabled": True,
+        "verdict": verdict,
+        "summary": summary,
+        "openai": {
+            "ok": bool(primary.get("ok")),
+            "items": primary_items,
+            "label": openai_label,
+            "backend": primary.get("analysis_backend") or "openai_vision",
+            "error": primary.get("extraction_error") or primary.get("error"),
+        },
+        "copilot": {
+            "ok": bool(secondary.get("ok")),
+            "items": secondary_items,
+            "label": copilot_label,
+            "backend": secondary.get("analysis_backend") or "copilot",
+            "error": secondary.get("extraction_error") or secondary.get("error"),
+        },
+    }
+
+
+def _append_backend_comparison_log(
+    comparison: dict,
+    message_text: str = "",
+    image_path: str = None,
+    image_dims: tuple = None,
+) -> None:
+    if not comparison or not comparison.get("enabled"):
+        return
+    note = comparison.get("summary") or ""
+    _append_copilot_extraction_log(
+        pass_label="backend-compare",
+        message_text=message_text,
+        image_path=image_path,
+        image_dims=image_dims,
+        raw=note,
+        parsed={
+            "verdict": comparison.get("verdict"),
+            "openai": comparison.get("openai", {}).get("label"),
+            "copilot": comparison.get("copilot", {}).get("label"),
+        },
+        note=note,
+    )
+
+
+def _run_openai_and_copilot_image_compare(
+    message_text: str = "",
+    image_path: str = None,
+    document_text: str = None,
+    voice_transcript: str = None,
+    minimal_prompt: bool = False,
+) -> dict:
+    """Run OpenAI vision (primary) and Copilot API (shadow) in parallel; return OpenAI result."""
+    from whatsapp_attachment_processor import read_image_dimensions
+
+    image_dims = read_image_dimensions(image_path) if image_path else None
+    print(
+        "[IMAGE COMPARE] Running OpenAI vision + Copilot API in parallel "
+        f"(OPENCLAW_IMAGE_COMPARE_COPILOT=1, engine={VERSION})"
+    )
+
+    openai_result = None
+    copilot_result = None
+
+    def _openai_job():
+        return analyze_incoming_inquiry_with_openai_vision(
+            message_text=message_text,
+            image_path=image_path,
+            document_text=document_text,
+            voice_transcript=voice_transcript,
+            minimal_prompt=minimal_prompt,
+        )
+
+    def _copilot_job():
+        return analyze_incoming_inquiry_with_copilot(
+            message_text=message_text,
+            image_path=image_path,
+            document_text=document_text,
+            voice_transcript=voice_transcript,
+            single_pass=True,
+            minimal_prompt=minimal_prompt,
+            image_backend="copilot",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {
+            pool.submit(_openai_job): "openai",
+            pool.submit(_copilot_job): "copilot",
+        }
+        for future in as_completed(futures):
+            label = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"[IMAGE COMPARE] {label} failed: {exc}")
+                result = {
+                    "attempted": True,
+                    "ok": False,
+                    "items": [],
+                    "error": str(exc),
+                    "analysis_backend": label,
+                }
+            if label == "openai":
+                openai_result = result
+            else:
+                copilot_result = result
+
+    openai_result = openai_result or {
+        "attempted": True,
+        "ok": False,
+        "items": [],
+        "analysis_backend": "openai_vision",
+        "error": "OpenAI compare job did not return",
+    }
+    copilot_result = copilot_result or {
+        "attempted": True,
+        "ok": False,
+        "items": [],
+        "analysis_backend": "copilot",
+        "error": "Copilot compare job did not return",
+    }
+
+    comparison = _compare_image_extractions(openai_result, copilot_result)
+    openai_result["backend_comparison"] = comparison
+    openai_result["copilot_shadow"] = copilot_result
+
+    verdict = comparison.get("verdict", "unknown")
+    print(f"[IMAGE COMPARE] {comparison.get('summary')}")
+    if verdict == "match":
+        print("[IMAGE COMPARE] ✅ Backends agree — OpenAI result used for production")
+    elif verdict == "mismatch":
+        print(
+            "[IMAGE COMPARE] ⚠️ Backends disagree — OpenAI result used for production; "
+            "see copilot_extraction.log backend-compare"
+        )
+    else:
+        print(f"[IMAGE COMPARE] Verdict={verdict} — OpenAI result used for production")
+
+    _append_backend_comparison_log(
+        comparison,
+        message_text=message_text,
+        image_path=image_path,
+        image_dims=image_dims,
+    )
+    return openai_result
 
 
 def _build_extraction_user_prompt(
@@ -1472,12 +1681,21 @@ def analyze_incoming_inquiry_with_copilot(
 
     # Images → OpenAI vision when OPENCLAW_IMAGE_BACKEND=openai (saves Copilot tokens; better vision).
     if _use_openai_for_image(image_path, backend=image_backend):
+        minimal = _copilot_manual_parity_prompt_enabled(minimal_prompt)
+        if _image_compare_copilot_enabled():
+            return _run_openai_and_copilot_image_compare(
+                message_text=message_text,
+                image_path=image_path,
+                document_text=document_text,
+                voice_transcript=voice_transcript,
+                minimal_prompt=minimal,
+            )
         return analyze_incoming_inquiry_with_openai_vision(
             message_text=message_text,
             image_path=image_path,
             document_text=document_text,
             voice_transcript=voice_transcript,
-            minimal_prompt=_copilot_manual_parity_prompt_enabled(minimal_prompt),
+            minimal_prompt=minimal,
         )
 
     single_pass = _copilot_single_pass_enabled(single_pass)
