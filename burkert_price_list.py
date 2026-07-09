@@ -14,9 +14,11 @@ import pandas as pd
 COL_ID = 0
 COL_TYPE = 1
 COL_DESC = 2
+COL_MOQ = 6
 COL_NET_PRICE = 10
 COL_LEAD_TIME = 11
 DATA_START_ROW = 19
+CACHE_VERSION = 2
 
 DEFAULT_PRICE_LIST_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -266,6 +268,25 @@ def _parse_net_price(value: Any) -> float | None:
     return price if price > 0 else None
 
 
+def _parse_moq(value: Any) -> int:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0
+    try:
+        moq = int(float(str(value).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, moq)
+
+
+def apply_moq_to_qty(requested_qty: int, moq: int) -> tuple[int, bool]:
+    """Return (quoted_qty, moq_applied). Bump qty up to MOQ when customer qty is lower."""
+    requested = max(1, int(requested_qty or 1))
+    minimum = max(0, int(moq or 0))
+    if minimum > 1 and requested < minimum:
+        return minimum, True
+    return requested, False
+
+
 def _register_entry(
     lookup: dict[str, dict[str, Any]],
     family_index: dict[str, list],
@@ -313,6 +334,8 @@ def _load_from_cache(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, li
         lookup = payload.get("lookup") or {}
         family_index = payload.get("family_index") or {}
         id_index = payload.get("id_index") or {}
+        if payload.get("version") != CACHE_VERSION:
+            return None
         if lookup and id_index:
             return lookup, family_index, id_index
     except Exception as exc:
@@ -330,7 +353,12 @@ def _save_cache(
     try:
         with open(cache_file, "wb") as handle:
             pickle.dump(
-                {"lookup": lookup, "family_index": family_index, "id_index": id_index},
+                {
+                    "version": CACHE_VERSION,
+                    "lookup": lookup,
+                    "family_index": family_index,
+                    "id_index": id_index,
+                },
                 handle,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
@@ -372,7 +400,7 @@ def load_burkert_price_list(force: bool = False) -> bool:
             path,
             sheet_name=0,
             header=None,
-            usecols=[COL_ID, COL_TYPE, COL_DESC, COL_NET_PRICE, COL_LEAD_TIME],
+            usecols=[COL_ID, COL_TYPE, COL_DESC, COL_MOQ, COL_NET_PRICE, COL_LEAD_TIME],
             skiprows=DATA_START_ROW,
             engine="openpyxl",
         )
@@ -397,15 +425,17 @@ def load_burkert_price_list(force: bool = False) -> bool:
         if not any([burkert_id, part_type, description]):
             continue
 
-        net_price = _parse_net_price(row.iloc[3] if len(row) > 3 else None)
-        factory_lt = row.iloc[4] if len(row) > 4 else None
+        net_price = _parse_net_price(row.iloc[4] if len(row) > 4 else None)
+        factory_lt = row.iloc[5] if len(row) > 5 else None
         customer_lt = customer_lead_time_from_field(factory_lt)
+        moq = _parse_moq(row.iloc[3] if len(row) > 3 else None)
 
         entry = {
             "burkert_id": burkert_id,
             "type": part_type,
             "description": description,
             "net_price": net_price,
+            "moq": moq,
             "factory_lead_time": factory_lt,
             "customer_lead_time": customer_lt,
         }
@@ -539,7 +569,7 @@ def lookup_burkert_quote(
     """
     Return a quote dict for a Burkert part from the offline price list.
 
-    Keys: desc, net_price, sell_price, price (formatted), lt, burkert_id, type, source.
+    Keys: desc, net_price, sell_price, price (formatted), lt, moq, burkert_id, type, source.
     """
     entry = _lookup_entry(
         part_no,
@@ -552,6 +582,9 @@ def lookup_burkert_quote(
 
     net_price = entry.get("net_price")
     customer_lt = entry.get("customer_lead_time") or "[TBC]"
+    moq = _parse_moq(entry.get("moq"))
+    requested_qty = max(1, int(qty))
+    quoted_qty, moq_applied = apply_moq_to_qty(requested_qty, moq)
 
     sell_price = None
     price_display = "[TBC]"
@@ -567,7 +600,10 @@ def lookup_burkert_quote(
 
     return {
         "desc": desc,
-        "qty": int(qty),
+        "qty": quoted_qty,
+        "requested_qty": requested_qty,
+        "moq": moq,
+        "moq_applied": moq_applied,
         "net_price": net_price,
         "sell_price": sell_price,
         "price": price_display,

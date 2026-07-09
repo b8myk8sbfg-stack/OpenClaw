@@ -890,13 +890,21 @@ def _try_burkert_price_list_row(
         return None
 
     label = resolved_id or part_no
+    moq_note = ""
+    if quote.get("moq_applied"):
+        moq_note = f" | MOQ applied ({quote.get('requested_qty')} → {quote.get('qty')})"
+    elif int(quote.get("moq") or 0) > 1:
+        moq_note = f" | MOQ {quote.get('moq')}"
     print(
         f"   ✅ [BURKERT] Price list match for {label}: "
-        f"RM {quote.get('price')} | LT {quote.get('lt')}"
+        f"RM {quote.get('price')} | LT {quote.get('lt')}{moq_note}"
     )
     return {
         "desc": quote.get("desc") or desc or part_no,
-        "qty": int(qty),
+        "qty": int(quote.get("qty") or qty),
+        "requested_qty": int(quote.get("requested_qty") or qty),
+        "moq": int(quote.get("moq") or 0),
+        "moq_applied": bool(quote.get("moq_applied")),
         "price": quote.get("price", "[TBC]"),
         "lt": quote.get("lt", "[TBC]"),
         "pid": quote.get("burkert_id") or part_no,
@@ -936,6 +944,13 @@ def _merge_burkert_quote_into_row(row, part_no):
         merged["desc"] = quote_row["desc"]
     if quote_row.get("pid"):
         merged["pid"] = quote_row["pid"]
+    if quote_row.get("qty"):
+        merged["qty"] = quote_row["qty"]
+    if quote_row.get("requested_qty") is not None:
+        merged["requested_qty"] = quote_row["requested_qty"]
+    if quote_row.get("moq") is not None:
+        merged["moq"] = quote_row["moq"]
+    merged["moq_applied"] = quote_row.get("moq_applied", merged.get("moq_applied"))
     merged["source"] = quote_row.get("source", merged.get("source"))
     merged["needs_supplier"] = quote_row.get("needs_supplier", merged.get("needs_supplier"))
     return merged
@@ -1381,7 +1396,17 @@ def build_plain_quotation_reply(
             has_tbc_balance = True
 
         msg += f"• {desc}\n"
-        msg += f"  Quantity: {qty} {'pc' if qty == 1 else 'pcs'}\n"
+        requested_qty = int(row.get("requested_qty") or qty)
+        moq = int(row.get("moq") or 0)
+        if row.get("moq_applied") and requested_qty != qty:
+            msg += (
+                f"  Quantity: {qty} {'pc' if qty == 1 else 'pcs'} "
+                f"(MOQ — you requested {requested_qty} {'pc' if requested_qty == 1 else 'pcs'})\n"
+            )
+        else:
+            msg += f"  Quantity: {qty} {'pc' if qty == 1 else 'pcs'}\n"
+        if moq > 1:
+            msg += f"  MOQ: {moq} pcs\n"
         if price == "[TBC]":
             msg += "  Unit price: Pending verification\n"
         else:

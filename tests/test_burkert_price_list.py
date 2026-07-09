@@ -1,6 +1,7 @@
 import unittest
 
 from burkert_price_list import (
+    apply_moq_to_qty,
     burkert_lookup_keys,
     burkert_type_family_key,
     burkert_id_lookup_keys,
@@ -65,6 +66,17 @@ class BurkertLeadTimeMappingTests(unittest.TestCase):
         self.assertEqual(normalize_burkert_id("00132465"), "132465")
         self.assertEqual(normalize_burkert_id("132465"), "132465")
         self.assertIn("132465", burkert_id_lookup_keys("00132465"))
+
+    def test_moq_bumps_requested_qty(self):
+        quoted, applied = apply_moq_to_qty(1, 5)
+        self.assertEqual(quoted, 5)
+        self.assertTrue(applied)
+        quoted, applied = apply_moq_to_qty(6, 5)
+        self.assertEqual(quoted, 6)
+        self.assertFalse(applied)
+        quoted, applied = apply_moq_to_qty(2, 0)
+        self.assertEqual(quoted, 2)
+        self.assertFalse(applied)
 
 
 if __name__ == "__main__":
