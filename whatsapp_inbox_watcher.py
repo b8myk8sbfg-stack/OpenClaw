@@ -86,7 +86,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.57-KEEP-WHATSAPP-DOWNLOAD"
+VERSION = "v3.59-FASTER-WHATSAPP-STARTUP"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -157,11 +157,28 @@ def ensure_whatsapp_session(driver, force_reload: bool = False) -> bool:
     if force_reload:
         WHATSAPP_SESSION_READY = False
 
-    if WHATSAPP_SESSION_READY and whatsapp_session_is_ready(driver) and not force_reload:
-        return True
+    if not force_reload:
+        if WHATSAPP_SESSION_READY and whatsapp_session_is_ready(driver):
+            return True
+        if whatsapp_session_is_ready(driver):
+            WHATSAPP_SESSION_READY = True
+            print("✅ WhatsApp Web session already active (no reload).")
+            return True
 
-    print("🌐 Loading WhatsApp Web session...")
-    driver.get("https://web.whatsapp.com")
+    needs_navigation = force_reload
+    if not needs_navigation:
+        try:
+            current_url = str(driver.current_url or "")
+            needs_navigation = "web.whatsapp.com" not in current_url
+        except Exception:
+            needs_navigation = True
+
+    if needs_navigation:
+        print("🌐 Loading WhatsApp Web session...")
+        driver.get("https://web.whatsapp.com")
+    else:
+        print("🌐 WhatsApp Web tab already open — waiting for UI...")
+
     if not wait_for_whatsapp_ready(driver):
         WHATSAPP_SESSION_READY = False
         return False
@@ -259,9 +276,23 @@ def init_driver():
     options.add_argument("--disable-extensions")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
+    options.page_load_strategy = "eager"
 
     driver = webdriver.Chrome(options=options)
     _install_whatsapp_voice_hooks(driver)
+
+    try:
+        current_url = str(driver.current_url or "")
+    except Exception:
+        current_url = ""
+
+    if "web.whatsapp.com" not in current_url:
+        print("🌐 Opening WhatsApp Web in Chrome...")
+        try:
+            driver.get("https://web.whatsapp.com")
+        except Exception as exc:
+            print(f"⚠️ Initial WhatsApp navigation failed: {exc}")
+
     return driver
 
 
@@ -350,26 +381,36 @@ def wait_for_whatsapp_ready(driver, timeout=90):
     print("🟢 Waiting for WhatsApp Web session...")
 
     end = time.time() + timeout
+    attempt = 0
 
     while time.time() < end:
-        selectors = [
-            '//div[@id="side"]',
-            '//div[@aria-label="Chat list"]',
-            '//div[@role="grid"]',
-            '//header',
-        ]
+        attempt += 1
 
-        for selector in selectors:
-            try:
-                found = driver.find_elements(By.XPATH, selector)
-                if found:
-                    print("✅ WhatsApp Web ready.")
-                    return True
-            except Exception:
-                pass
+        if whatsapp_session_is_ready(driver):
+            print(f"✅ WhatsApp Web ready (search box detected, attempt {attempt}).")
+            return True
 
-        print("   ⏳ Waiting for WhatsApp login/session...")
-        time.sleep(3)
+        try:
+            ready = driver.execute_script(
+                """
+                const side = document.querySelector('#side, #pane-side');
+                if (side && side.querySelector('[contenteditable="true"], [role="textbox"]')) {
+                    return true;
+                }
+                return !!document.querySelector(
+                    '[data-testid="chat-list"], [data-testid="conversation-panel-messages"]'
+                );
+                """
+            )
+            if ready:
+                print(f"✅ WhatsApp Web ready (JS UI check, attempt {attempt}).")
+                return True
+        except Exception:
+            pass
+
+        if attempt <= 3 or attempt % 5 == 0:
+            print("   ⏳ Waiting for WhatsApp login/session...")
+        time.sleep(1.0 if attempt <= 25 else 2.0)
 
     print("❌ WhatsApp Web not ready.")
     return False
@@ -6412,9 +6453,19 @@ def run_persistent_watcher():
     clear_stale_busy()
 
     driver = None
+    startup_t0 = time.time()
 
     try:
         driver = init_driver()
+        print(f"⏱️ Chrome driver ready in {time.time() - startup_t0:.1f}s")
+
+        if not ensure_whatsapp_session(driver):
+            print(
+                "⚠️ WhatsApp Web not ready yet after startup "
+                "(scan QR if needed — will keep retrying each cycle)."
+            )
+        else:
+            print(f"⏱️ WhatsApp Web ready in {time.time() - startup_t0:.1f}s total")
 
         while True:
             try:

@@ -133,7 +133,11 @@ start_openclaw() {
     pkill -f "chromedriver" 2>/dev/null || true
     pkill -9 -f "chromedriver" 2>/dev/null || true
 
-    sleep 5
+    log "Clearing coordination flags from previous run..."
+    rm -f "$BASE_DIR/openclaw_busy.flag" 2>/dev/null || true
+    printf '%s\n' "whatsapp" > "$BASE_DIR/openclaw_channel_turn.flag"
+
+    sleep 2
 
     if ! start_openclaw; then
         exit 1
