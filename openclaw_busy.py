@@ -16,6 +16,7 @@ from typing import Optional
 BASE_DIR = "/Users/evon/OpenClaw"
 BUSY_FLAG_FILE = os.path.join(BASE_DIR, "openclaw_busy.flag")
 CHANNEL_TURN_FILE = os.path.join(BASE_DIR, "openclaw_channel_turn.flag")
+STALE_BUSY_SECONDS = int(os.getenv("OPENCLAW_BUSY_STALE_SECONDS", "300"))
 
 
 def _now_iso() -> str:
@@ -92,7 +93,35 @@ def clear_busy() -> None:
     print("🚦 [BUSY] OFF")
 
 
+def clear_stale_busy() -> bool:
+    """Drop a leftover busy flag from a crashed or hung worker."""
+    data = _read_json(BUSY_FLAG_FILE)
+    if not data or int(data.get("busy") or 0) != 1:
+        return False
+
+    since = str(data.get("since") or "").strip()
+    age_seconds = STALE_BUSY_SECONDS + 1
+    if since:
+        try:
+            started = datetime.datetime.fromisoformat(since)
+            age_seconds = (datetime.datetime.now() - started).total_seconds()
+        except Exception:
+            age_seconds = STALE_BUSY_SECONDS + 1
+
+    if age_seconds < STALE_BUSY_SECONDS:
+        return False
+
+    print(
+        "⚠️ [BUSY] Clearing stale busy flag "
+        f"({age_seconds:.0f}s old | channel={data.get('channel') or '-'} "
+        f"| task={data.get('task') or '-'})"
+    )
+    clear_busy()
+    return True
+
+
 def is_busy() -> bool:
+    clear_stale_busy()
     data = _read_json(BUSY_FLAG_FILE)
     if not data:
         return False
@@ -109,16 +138,17 @@ def busy_info() -> dict:
 def wait_until_idle(poll_seconds: float = 2.0, label: str = "") -> None:
     import time
 
-    last_log = 0.0
     while is_busy():
         info = busy_info()
         task = info.get("task") or "-"
         channel = info.get("channel") or "-"
+        since = info.get("since") or "-"
         suffix = f" ({label})" if label else ""
-        now = time.time()
-        if now - last_log >= 30.0:
-            print(f"⏸️ [BUSY] Waiting{suffix} — {channel} busy: {task}")
-            last_log = now
+        throttled_log(
+            f"busy-wait:{label or 'default'}",
+            f"⏸️ [BUSY] Waiting{suffix} — {channel} busy: {task} (since {since})",
+            interval=60.0,
+        )
         time.sleep(max(0.5, float(poll_seconds)))
 
 

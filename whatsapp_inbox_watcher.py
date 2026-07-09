@@ -21,6 +21,7 @@ from selenium.webdriver.chrome.options import Options
 
 from openclaw_busy import (
     clear_busy,
+    clear_stale_busy,
     flip_channel_turn,
     get_channel_turn,
     is_busy,
@@ -6262,6 +6263,7 @@ def run_persistent_watcher():
     print(f"🚀 WhatsApp Watcher Persistent Mode ({VERSION})")
     print(f"⏱️ Check interval: {CHECK_INTERVAL_SECONDS} seconds")
     print(f"📁 Chrome Profile: {OPENCLAW_CHROME_PROFILE}")
+    clear_stale_busy()
 
     driver = None
 
