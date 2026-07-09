@@ -2903,7 +2903,7 @@ def build_product_details_for_reply(
         if not part_no or part_no in seen_parts:
             continue
         seen_parts.add(part_no)
-        brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+        brand = str(item.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
         if brand in ("UNKNOWN", ""):
             brand = _infer_brand_from_part_no(part_no) or brand
 
@@ -2927,9 +2927,36 @@ def build_product_details_for_reply(
         item_lines.extend(_format_catalog_links_for_item(item, part_no, brand))
 
         if item_lines:
-            header = f"{part_no}"
-            if brand and brand.upper() not in ("UNKNOWN", ""):
+            from openclaw_inquiry_engine import _format_burkert_order_label_from_item, _row_burkert_id
+
+            matching_row = {}
+            for row in formatted_rows or []:
+                if not isinstance(row, dict):
+                    continue
+                customer_part = str(row.get("customer_part") or "").strip().upper()
+                if customer_part == part_no:
+                    matching_row = row
+                    break
+
+            order_label = _format_burkert_order_label_from_item(item)
+            burkert_id = _row_burkert_id(matching_row, copilot_items=[item]) or str(
+                item.get("burkert_id") or ""
+            ).strip()
+            if burkert_id:
+                from burkert_price_list import format_burkert_id_display
+
+                burkert_id = format_burkert_id_display(burkert_id)
+
+            if order_label and brand == "BURKERT":
+                header = order_label
+            elif brand and brand.upper() not in ("UNKNOWN", ""):
                 header = f"{brand} {part_no}"
+            else:
+                header = f"{part_no}"
+
+            if burkert_id and brand == "BURKERT":
+                header = f"{header}\nID: {burkert_id}"
+
             block = header + "\n" + "\n".join(item_lines)
             if block not in "\n\n".join(sections):
                 sections.append(block)

@@ -67,6 +67,12 @@ class BurkertLeadTimeMappingTests(unittest.TestCase):
         self.assertEqual(normalize_burkert_id("132465"), "132465")
         self.assertIn("132465", burkert_id_lookup_keys("00132465"))
 
+    def test_burkert_id_display(self):
+        from burkert_price_list import format_burkert_id_display
+
+        self.assertEqual(format_burkert_id_display("132465"), "00132465")
+        self.assertEqual(format_burkert_id_display("00132465"), "00132465")
+
     def test_moq_bumps_requested_qty(self):
         quoted, applied = apply_moq_to_qty(1, 5)
         self.assertEqual(quoted, 5)

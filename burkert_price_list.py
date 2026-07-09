@@ -95,6 +95,16 @@ def extract_burkert_id_from_text(text: str) -> str:
     return ""
 
 
+def format_burkert_id_display(value: str) -> str:
+    """Format Burkert article ID for customer-facing quotes (e.g. 132465 → 00132465)."""
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if not digits:
+        return ""
+    if len(digits) <= 8:
+        return digits.zfill(8)
+    return digits
+
+
 def resolve_burkert_id(
     burkert_id: str = "",
     technical_specs: list | None = None,
@@ -609,6 +619,7 @@ def lookup_burkert_quote(
         "price": price_display,
         "lt": customer_lt,
         "burkert_id": entry.get("burkert_id"),
+        "burkert_id_display": format_burkert_id_display(str(entry.get("burkert_id") or "")),
         "type": part_type,
         "factory_lead_time": entry.get("factory_lead_time"),
         "source": "BURKERT_PRICE_LIST",

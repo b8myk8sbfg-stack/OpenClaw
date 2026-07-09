@@ -7,7 +7,7 @@ from requests.auth import HTTPBasicAuth
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 
-from burkert_price_list import lookup_burkert_quote, resolve_burkert_id
+from burkert_price_list import lookup_burkert_quote, resolve_burkert_id, format_burkert_id_display
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -908,6 +908,7 @@ def _try_burkert_price_list_row(
         "price": quote.get("price", "[TBC]"),
         "lt": quote.get("lt", "[TBC]"),
         "pid": quote.get("burkert_id") or part_no,
+        "burkert_id": quote.get("burkert_id_display") or format_burkert_id_display(resolved_id),
         "brand": "BURKERT",
         "source": quote.get("source", "BURKERT_PRICE_LIST"),
         "customer_part": part_no,
@@ -944,6 +945,8 @@ def _merge_burkert_quote_into_row(row, part_no):
         merged["desc"] = quote_row["desc"]
     if quote_row.get("pid"):
         merged["pid"] = quote_row["pid"]
+    if quote_row.get("burkert_id"):
+        merged["burkert_id"] = quote_row["burkert_id"]
     if quote_row.get("qty"):
         merged["qty"] = quote_row["qty"]
     if quote_row.get("requested_qty") is not None:
@@ -1328,6 +1331,74 @@ def _copilot_item_for_part(copilot_items: list, part_no: str) -> dict:
     return {}
 
 
+def _row_burkert_id(row: dict, copilot_items: list = None) -> str:
+    """Customer-facing Burkert ID for a quote row."""
+    brand = str(row.get("brand") or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand != "BURKERT":
+        return ""
+
+    display_id = str(row.get("burkert_id") or "").strip()
+    if display_id:
+        return format_burkert_id_display(display_id)
+
+    raw_id = str(row.get("pid") or "").strip()
+    if raw_id.isdigit():
+        return format_burkert_id_display(raw_id)
+
+    customer_part = str(row.get("customer_part") or "").strip()
+    copilot_item = _copilot_item_for_part(copilot_items, customer_part or row.get("desc", ""))
+    copilot_id = str(copilot_item.get("burkert_id") or "").strip()
+    if copilot_id:
+        return format_burkert_id_display(copilot_id)
+    return ""
+
+
+def _format_burkert_order_label(row: dict, copilot_items: list = None) -> str:
+    """One-line Burkert order label: brand, model, and nameplate specs."""
+    brand = str(row.get("brand") or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand != "BURKERT":
+        return ""
+
+    customer_part = str(row.get("customer_part") or "").strip()
+    copilot_item = _copilot_item_for_part(copilot_items, customer_part or row.get("desc", ""))
+    part_no = str(copilot_item.get("part_no") or customer_part or row.get("desc") or "").strip()
+    if not part_no:
+        return ""
+
+    tokens = [f"{brand} {part_no}"]
+    specs = copilot_item.get("technical_specs") or row.get("technical_specs") or []
+    if isinstance(specs, str):
+        specs = [specs]
+    for spec in specs:
+        text = str(spec).strip()
+        if not text:
+            continue
+        if ":" in text:
+            label, value = text.split(":", 1)
+            if label.strip().upper() in {"MODEL", "TYPE"}:
+                continue
+            value = value.strip()
+            if value:
+                tokens.append(value.replace(" - ", "-").replace(" ", " ").upper())
+        else:
+            tokens.append(text)
+
+    return " ".join(tokens)
+
+
+def _format_burkert_order_label_from_item(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    brand = str(item.get("brand") or "BURKERT").strip().upper().replace("BÜRKERT", "BURKERT")
+    part_no = str(item.get("part_no") or "").strip()
+    if not part_no:
+        return ""
+    return _format_burkert_order_label(
+        {"brand": brand, "customer_part": part_no, "technical_specs": item.get("technical_specs") or []},
+        copilot_items=[item],
+    )
+
+
 def _display_product_name(row: dict, copilot_items: list = None) -> str:
     """Prefer a readable product label from extraction, then warehouse row."""
     customer_part = str(row.get("customer_part") or "").strip()
@@ -1369,13 +1440,21 @@ def build_plain_quotation_reply(
         msg += f"{str(photo_confirmation).strip()}\n\n"
 
     if len(rows) == 1:
-        product_name = _display_product_name(rows[0], copilot_items=copilot_items)
-        qty = int(rows[0].get("qty", 1))
+        row = rows[0]
+        product_name = _display_product_name(row, copilot_items=copilot_items)
+        qty = int(row.get("qty", 1))
         unit = "pc" if qty == 1 else "pcs"
         msg += (
             f"Please find below our preliminary quotation for "
-            f"{product_name} — quantity {qty} {unit}:\n\n"
+            f"{product_name} — quantity {qty} {unit}:\n"
         )
+        order_label = _format_burkert_order_label(row, copilot_items=copilot_items)
+        burkert_id = _row_burkert_id(row, copilot_items=copilot_items)
+        if order_label:
+            msg += f"{order_label}\n"
+        if burkert_id:
+            msg += f"ID: {burkert_id}\n"
+        msg += "\n"
     else:
         msg += "Please find below our preliminary quotation:\n\n"
 
@@ -1396,6 +1475,12 @@ def build_plain_quotation_reply(
             has_tbc_balance = True
 
         msg += f"• {desc}\n"
+        burkert_id = _row_burkert_id(row, copilot_items=copilot_items)
+        if burkert_id and len(rows) != 1:
+            order_label = _format_burkert_order_label(row, copilot_items=copilot_items)
+            if order_label:
+                msg += f"  {order_label}\n"
+            msg += f"  ID: {burkert_id}\n"
         requested_qty = int(row.get("requested_qty") or qty)
         moq = int(row.get("moq") or 0)
         if row.get("moq_applied") and requested_qty != qty:
