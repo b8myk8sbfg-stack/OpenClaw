@@ -15,6 +15,14 @@ RESTART_LOG="$LOG_DIR/daily_restart.log"
 
 mkdir -p "$LOG_DIR"
 
+ENV_FILE="$BASE_DIR/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
@@ -104,7 +112,7 @@ start_openclaw() {
     fi
 
     log "Stopping OpenClaw processes..."
-    stop_openclaw_processes
+    bash "$SCRIPT_DIR/kill_all_openclaw.sh" || stop_openclaw_processes
     sleep 2
 
     if ! wait_for_processes_to_exit "openclaw_main.py" 10; then
@@ -123,6 +131,7 @@ start_openclaw() {
     log "Stopping WhatsApp Chrome / chromedriver..."
     pkill -f "chrome_whatsapp_profile" 2>/dev/null || true
     pkill -f "chromedriver" 2>/dev/null || true
+    pkill -9 -f "chromedriver" 2>/dev/null || true
 
     sleep 5
 
