@@ -7,10 +7,12 @@ from requests.auth import HTTPBasicAuth
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 
+from burkert_price_list import lookup_burkert_quote
+
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.10-VOLTAGE-AWARE-MATCH"
+VERSION = "v1.11-BURKERT-PRICELIST"
 
 # Customer sell price = purchase cost / MARKUP_DIVISOR (0.72 → ~38.9% markup on cost, ~28% margin).
 MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
@@ -856,6 +858,64 @@ def get_purchase_price(api_id):
         return {}
 
 
+def _try_burkert_price_list_row(part_no, qty, desc=None, brand=""):
+    """Fill price and lead time from the Burkert offline price list when available."""
+    brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand_u != "BURKERT":
+        return None
+
+    quote = lookup_burkert_quote(part_no, qty=qty, markup_divisor=MARKUP_DIVISOR)
+    if not quote:
+        return None
+
+    print(
+        f"   ✅ [BURKERT] Price list match for {part_no}: "
+        f"RM {quote.get('price')} | LT {quote.get('lt')}"
+    )
+    return {
+        "desc": quote.get("desc") or desc or part_no,
+        "qty": int(qty),
+        "price": quote.get("price", "[TBC]"),
+        "lt": quote.get("lt", "[TBC]"),
+        "pid": quote.get("burkert_id") or part_no,
+        "brand": "BURKERT",
+        "source": quote.get("source", "BURKERT_PRICE_LIST"),
+        "customer_part": part_no,
+        "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+    }
+
+
+def _merge_burkert_quote_into_row(row, part_no):
+    """Update an existing quote row from the Burkert price list when price/LT are still TBC."""
+    if str(row.get("brand") or "").upper().replace("BÜRKERT", "BURKERT") != "BURKERT":
+        return row
+
+    if row.get("price") != "[TBC]" and row.get("lt") != "[TBC]":
+        return row
+
+    quote_row = _try_burkert_price_list_row(
+        part_no,
+        row.get("qty", 1),
+        desc=row.get("desc"),
+        brand="BURKERT",
+    )
+    if not quote_row:
+        return row
+
+    merged = dict(row)
+    if merged.get("price") == "[TBC]" and quote_row.get("price") != "[TBC]":
+        merged["price"] = quote_row["price"]
+    if merged.get("lt") == "[TBC]" and quote_row.get("lt") != "[TBC]":
+        merged["lt"] = quote_row["lt"]
+    if quote_row.get("desc"):
+        merged["desc"] = quote_row["desc"]
+    if quote_row.get("pid"):
+        merged["pid"] = quote_row["pid"]
+    merged["source"] = quote_row.get("source", merged.get("source"))
+    merged["needs_supplier"] = quote_row.get("needs_supplier", merged.get("needs_supplier"))
+    return merged
+
+
 def get_store_qty_from_product(obm):
     """
     Only STORE location is considered usable stock.
@@ -957,7 +1017,7 @@ def build_rows_from_api(api_id, qty, customer_part=None):
             )
 
         if balance_qty > 0:
-            rows.append({
+            balance_row = {
                 "desc": full_desc,
                 "qty": balance_qty,
                 "price": "[TBC]",
@@ -967,25 +1027,34 @@ def build_rows_from_api(api_id, qty, customer_part=None):
                 "source": "BALANCE_SUPPLIER_REQUIRED",
                 "customer_part": customer_part or api_id,
                 "needs_supplier": True,
-            })
-
-            supplier_item = {
-                "desc": full_desc,
-                "qty": balance_qty,
-                "pid": api_id,
-                "brand": brand,
             }
+            balance_row = _merge_burkert_quote_into_row(balance_row, customer_part or api_id)
+            rows.append(balance_row)
 
-            print(
-                f"   ⚠️ Requested qty {requested_qty} exceeds STORE stock {usable_store_qty}. "
-                f"Balance qty {balance_qty} quoted as [TBC]."
-            )
+            if balance_row.get("needs_supplier", True):
+                supplier_item = {
+                    "desc": full_desc,
+                    "qty": balance_qty,
+                    "pid": api_id,
+                    "brand": brand,
+                }
+                print(
+                    f"   ⚠️ Requested qty {requested_qty} exceeds STORE stock {usable_store_qty}. "
+                    f"Balance qty {balance_qty} quoted as [TBC]."
+                )
+            else:
+                supplier_item = None
+                print(
+                    f"   ✅ Balance qty {balance_qty} quoted from Burkert price list "
+                    f"at RM {balance_row.get('price')} | LT {balance_row.get('lt')}"
+                )
 
+        rows[0] = _merge_burkert_quote_into_row(rows[0], customer_part or api_id)
         return rows, supplier_item
 
     print("   ⚠️ No usable STORE stock. Full quantity added to supplier RFQ queue.")
 
-    rows.append({
+    no_stock_row = {
         "desc": full_desc if full_desc else api_id,
         "qty": requested_qty,
         "price": "[TBC]",
@@ -995,14 +1064,23 @@ def build_rows_from_api(api_id, qty, customer_part=None):
         "source": "NO_STORE_STOCK_OR_COST",
         "customer_part": customer_part or api_id,
         "needs_supplier": True,
-    })
-
-    supplier_item = {
-        "desc": full_desc if full_desc else api_id,
-        "qty": requested_qty,
-        "pid": api_id,
-        "brand": brand,
     }
+    no_stock_row = _merge_burkert_quote_into_row(no_stock_row, customer_part or api_id)
+    rows.append(no_stock_row)
+
+    supplier_item = None
+    if no_stock_row.get("needs_supplier", True):
+        supplier_item = {
+            "desc": full_desc if full_desc else api_id,
+            "qty": requested_qty,
+            "pid": api_id,
+            "brand": brand,
+        }
+    else:
+        print(
+            f"   ✅ Quoted from Burkert price list at RM {no_stock_row.get('price')} "
+            f"| LT {no_stock_row.get('lt')}"
+        )
 
     return rows, supplier_item
 
@@ -1055,6 +1133,23 @@ def process_structured_items(structured_items):
         else:
             inferred_brand = declared_brand if declared_brand != "UNKNOWN" else infer_brand_from_part(part_no)
             desc = item.get("desc") or (f"{inferred_brand} {part_no}" if inferred_brand != "UNKNOWN" else part_no)
+
+            burkert_row = _try_burkert_price_list_row(
+                part_no,
+                qty,
+                desc=desc,
+                brand=inferred_brand,
+            )
+            if burkert_row:
+                formatted_rows.append(burkert_row)
+                if burkert_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
+                    tbc_by_brand.setdefault(inferred_brand, []).append({
+                        "desc": burkert_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": inferred_brand,
+                    })
+                continue
 
             formatted_rows.append({
                 "desc": desc,
