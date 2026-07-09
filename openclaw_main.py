@@ -2493,6 +2493,8 @@ BRAND_CATALOG_DOMAINS = {
     "SMC": ("smcworld.com", "smc.eu"),
     "FESTO": ("festo.com",),
     "MITSUBISHI": ("mitsubishielectric.com",),
+    "BURKERT": ("burkert.com", "bürkert.com"),
+    "BÜRKERT": ("burkert.com", "bürkert.com"),
 }
 
 
@@ -2676,7 +2678,7 @@ def _sanitize_product_research_text(text: str, part_no: str, brand: str = "UNKNO
     return cleaned
 
 
-def _product_research_prompt(part_no: str, brand: str = "UNKNOWN") -> str:
+def _product_research_prompt(part_no: str, brand: str = "UNKNOWN", article_number: str = "") -> str:
     brand_line = f" by {brand}" if brand and brand != "UNKNOWN" else ""
     inferred = _infer_brand_from_part_no(part_no)
     brand_note = ""
@@ -2684,33 +2686,47 @@ def _product_research_prompt(part_no: str, brand: str = "UNKNOWN") -> str:
         brand_note = f"\nManufacturer family: {inferred} (from part number prefix)."
     elif inferred:
         brand_note = f"\nManufacturer: {inferred}."
+    article_line = ""
+    if article_number:
+        article_line = (
+            f"\nArticle Number / Order Code (search this FIRST on the manufacturer site): {article_number}\n"
+        )
     return (
-        f"Research the EXACT industrial automation catalog part number: {part_no}{brand_line}.\n"
-        f"Do NOT substitute a different part number, stock ID, or generic relay/sensor example.{brand_note}\n"
+        f"Research the EXACT industrial automation catalog part.{article_line}"
+        f"Type / part number: {part_no}{brand_line}.{brand_note}\n"
+        "You are an industrial spare parts verification assistant.\n"
+        "Rules:\n"
+        "1. Search the manufacturer's OFFICIAL website only.\n"
+        "2. Search by Article Number / Order Code before using the type/part number.\n"
+        "3. Never infer or substitute another configuration.\n"
+        "4. Verify manufacturer, article number, product type, coil voltage, power, port size, "
+        "orifice, and pressure range when known.\n"
+        "5. Return links ONLY when they match this exact item.\n"
+        "6. Provide official product webpage and official PDF datasheet when available.\n"
+        "7. State PDF status: Direct PDF | PDF available from product page | No PDF available.\n"
+        "8. Never use third-party websites unless the manufacturer has no official documentation.\n\n"
         "Write a technical summary for a sales quotation reply (plain text, WhatsApp-friendly).\n\n"
-        "Include ONLY when accurate for THIS exact part number:\n"
-        "- One-sentence product overview (correct product category — breaker vs relay vs sensor)\n"
+        "Include ONLY when accurate for THIS exact item:\n"
+        "- One-sentence product overview (correct product category)\n"
         "- Specifications as 'Label: value' lines\n"
-        "- Part-number suffix notes when applicable\n"
-        "- Pin / terminal configuration only if relevant to this product type\n"
         "- Compatible accessories commonly ordered with this exact part\n"
         "- Typical applications (short bullet list)\n"
         "- Official documentation links (SPECIFIC only — never generic family pages):\n"
+        "  Product page: https://... (manufacturer site, article-specific when possible)\n"
         "  Datasheet: https://... (official manufacturer PDF when available)\n"
-        "  Product page: https://... (regional product detail page with model in URL)\n"
-        "  NEVER use generic overview URLs like omron.com/products/family/E5CC\n"
-        "  OMRON E5CC example datasheet: https://www.omron.com.tw/data_pdf/cat/e5_c-800_h179-e1_5_7_csm1001629.pdf\n"
-        "  OMRON E5CC example product page: https://industrial.omron.eu/en/products/E5CC-RX2ASM-000\n"
-        f"The summary MUST mention {part_no} by name.\n"
-        "Keep under 280 words. Plain text only — no markdown, no ** bold.\n"
+        "  PDF status: Direct PDF / PDF available from product page / No PDF available\n"
+        "  Catalog match: Exact Match / Partial Match / No Match\n"
+        f"The summary MUST reference {article_number or part_no}.\n"
+        "Keep under 280 words. Plain text only — no markdown.\n"
         "If unsure of a spec or URL, omit it — never invent links or substitute another part."
     )
 
 
-def research_part_with_openai(part_no: str, brand: str = "UNKNOWN") -> str:
+def research_part_with_openai(part_no: str, brand: str = "UNKNOWN", article_number: str = "") -> str:
     """Look up a part with OpenAI and return a technical summary for customer replies."""
     part_no = str(part_no or "").strip().upper()
     brand = str(brand or "UNKNOWN").strip().upper()
+    article_number = str(article_number or "").strip()
     if not part_no:
         return ""
 
@@ -2727,12 +2743,12 @@ def research_part_with_openai(part_no: str, brand: str = "UNKNOWN") -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
-                        "Give accurate, practical product summaries for quotation replies. "
-                        "Plain text only — no markdown. Include official catalog URLs when known."
+                        "You are an industrial spare parts verification assistant and technical sales engineer "
+                        "at Robomatics (Malaysia). Search manufacturer official sites only. "
+                        "Use Article Number before type/part number. Plain text only — no markdown."
                     ),
                 },
-                {"role": "user", "content": _product_research_prompt(part_no, brand)},
+                {"role": "user", "content": _product_research_prompt(part_no, brand, article_number=article_number)},
             ],
             temperature=0.2,
             max_tokens=900,
@@ -2749,10 +2765,11 @@ def research_part_with_openai(part_no: str, brand: str = "UNKNOWN") -> str:
         return ""
 
 
-def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
+def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN", article_number: str = "") -> str:
     """Look up a part with Copilot and return a short technical summary for customer replies."""
     part_no = str(part_no or "").strip().upper()
     brand = str(brand or "UNKNOWN").strip().upper()
+    article_number = str(article_number or "").strip()
     if not part_no:
         return ""
 
@@ -2766,7 +2783,7 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
         timeout=45.0,
         max_retries=1,
     )
-    prompt = _product_research_prompt(part_no, brand)
+    prompt = _product_research_prompt(part_no, brand, article_number=article_number)
     try:
         response = _copilot_fresh_chat(
             client,
@@ -2774,9 +2791,9 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are a senior industrial automation technical sales engineer at Robomatics (Malaysia). "
-                        "Give accurate, practical product summaries for quotation replies. "
-                        "Plain text only — no markdown. Include official catalog URLs when known."
+                        "You are an industrial spare parts verification assistant and technical sales engineer "
+                        "at Robomatics (Malaysia). Search manufacturer official sites only. "
+                        "Use Article Number before type/part number. Plain text only — no markdown."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -2797,16 +2814,47 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
         return ""
 
 
-def research_part_for_quotation(part_no: str, brand: str = "UNKNOWN") -> str:
+def research_part_for_quotation(part_no: str, brand: str = "UNKNOWN", article_number: str = "") -> str:
     """Research a part using the configured product-research backend."""
     backend = os.getenv("OPENCLAW_RESEARCH_BACKEND", "").strip().lower()
     if not backend:
         backend = "openai" if _resolve_openai_api_key() else "copilot"
     if backend in ("openai", "gpt", "gpt-4o"):
-        text = research_part_with_openai(part_no, brand)
+        text = research_part_with_openai(part_no, brand, article_number=article_number)
         if text:
             return text
-    return research_part_with_copilot(part_no, brand)
+    return research_part_with_copilot(part_no, brand, article_number=article_number)
+
+
+def _article_number_from_row(row: dict, copilot_items=None) -> str:
+    row = row or {}
+    from burkert_price_list import resolve_burkert_id, format_burkert_id_display
+
+    brand = str(row.get("brand") or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand != "BURKERT":
+        return ""
+
+    for item in copilot_items or []:
+        if not isinstance(item, dict):
+            continue
+        if _normalize_part_key(item.get("part_no")) == _normalize_part_key(row.get("customer_part")):
+            article = resolve_burkert_id(
+                burkert_id=str(item.get("burkert_id") or ""),
+                technical_specs=item.get("technical_specs") or [],
+            )
+            if article:
+                return format_burkert_id_display(article)
+
+    article = resolve_burkert_id(
+        burkert_id=str(row.get("burkert_id") or ""),
+        technical_specs=row.get("technical_specs") or [],
+    )
+    if article:
+        return format_burkert_id_display(article)
+    pid = str(row.get("pid") or "").strip()
+    if pid.isdigit():
+        return format_burkert_id_display(pid)
+    return ""
 
 
 def build_ai_research_summary(formatted_rows, copilot_items=None):
@@ -2821,7 +2869,8 @@ def build_ai_research_summary(formatted_rows, copilot_items=None):
             print(f"[PRODUCT RESEARCH] Skipping OBM stock ID {part_no} — no catalog part resolved")
             continue
         seen.add(part_no)
-        notes = research_part_for_quotation(part_no, brand)
+        article_number = _article_number_from_row(row, copilot_items=copilot_items)
+        notes = research_part_for_quotation(part_no, brand, article_number=article_number)
         if notes:
             sections.append(notes)
     return "\n\n".join(sections)
@@ -2924,19 +2973,38 @@ def build_product_details_for_reply(
                 if acc_text:
                     item_lines.append(f"• {acc_text}")
 
-        item_lines.extend(_format_catalog_links_for_item(item, part_no, brand))
+        matching_row = {}
+        for row in formatted_rows or []:
+            if not isinstance(row, dict):
+                continue
+            customer_part = str(row.get("customer_part") or "").strip().upper()
+            if customer_part == part_no:
+                matching_row = row
+                break
+
+        from product_verification import (
+            enrich_item_catalog_links,
+            format_verification_links_for_reply,
+            verify_product_with_openai,
+        )
+
+        enrich_item_catalog_links(item, matching_row)
+        llm_verify = verify_product_with_openai(item, matching_row)
+        for field in ("product_page_url", "datasheet_url", "pdf_status", "match_confidence"):
+            value = str((llm_verify or {}).get(field) or "").strip()
+            if value and not str(item.get(field if field != "match_confidence" else "verification_confidence") or "").strip():
+                if field == "match_confidence":
+                    item["verification_confidence"] = value
+                else:
+                    item[field] = value
+
+        catalog_lines = format_verification_links_for_reply(item)
+        if not catalog_lines:
+            catalog_lines = _format_catalog_links_for_item(item, part_no, brand)
+        item_lines.extend(catalog_lines)
 
         if item_lines:
             from openclaw_inquiry_engine import _format_burkert_order_label_from_item, _row_burkert_id
-
-            matching_row = {}
-            for row in formatted_rows or []:
-                if not isinstance(row, dict):
-                    continue
-                customer_part = str(row.get("customer_part") or "").strip().upper()
-                if customer_part == part_no:
-                    matching_row = row
-                    break
 
             order_label = _format_burkert_order_label_from_item(item)
             burkert_id = _row_burkert_id(matching_row, copilot_items=[item]) or str(
