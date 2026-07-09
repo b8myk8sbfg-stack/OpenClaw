@@ -1544,6 +1544,130 @@ def is_outgoing_pre_plain(pre_plain_text):
     return bool(re.search(r"\]\s*You:\s*$", ppt, re.I))
 
 
+def is_outgoing_data_id(data_id: str) -> bool:
+    """WhatsApp Web outgoing bubbles often use data-id prefixes like 3EB…"""
+    return bool(re.match(r"^3EB", str(data_id or "").strip(), re.I))
+
+
+def is_outgoing_message_container(container) -> bool:
+    """
+    True when a DOM bubble was sent FROM this WhatsApp account (manual phone reply or bot).
+    Customer messages use message-in; our replies use message-out.
+    """
+    if container is None:
+        return False
+    try:
+        node = container
+        for _ in range(8):
+            classes = str(node.get_attribute("class") or "")
+            if "message-out" in classes:
+                return True
+            if "message-in" in classes:
+                return False
+            node = node.find_element(By.XPATH, "..")
+    except Exception:
+        pass
+    try:
+        for div in container.find_elements(By.CSS_SELECTOR, "[data-pre-plain-text]"):
+            if is_outgoing_pre_plain(div.get_attribute("data-pre-plain-text")):
+                return True
+    except Exception:
+        pass
+    data_id = _data_id_from_container(container)
+    return is_outgoing_data_id(data_id)
+
+
+LATEST_BUBBLE_DIRECTION_JS = """
+const panel = document.querySelector('#main [data-testid="conversation-panel-messages"]')
+    || document.querySelector('#main [role="application"]')
+    || document.querySelector('#main');
+if (!panel) return { found: false, outgoing: false };
+
+function resolveDataId(container) {
+    let node = container;
+    for (let depth = 0; depth < 8 && node; depth++) {
+        const id = node.getAttribute && node.getAttribute('data-id');
+        if (id) return id;
+        node = node.parentElement;
+    }
+    const child = container.querySelector('[data-id]');
+    return child ? (child.getAttribute('data-id') || '') : '';
+}
+
+function isOutgoing(container) {
+    let node = container;
+    for (let depth = 0; depth < 8 && node; depth++) {
+        if (node.classList && node.classList.contains('message-out')) return true;
+        if (node.classList && node.classList.contains('message-in')) return false;
+        node = node.parentElement;
+    }
+    const copyables = container.querySelectorAll('[data-pre-plain-text]');
+    for (const c of copyables) {
+        const pre = c.getAttribute('data-pre-plain-text') || '';
+        if (/\\]\\s*You:\\s*$/i.test(pre)) return true;
+    }
+    const dataId = resolveDataId(container);
+    if (dataId && /^3EB/i.test(dataId)) return true;
+    return false;
+}
+
+const bubbles = panel.querySelectorAll('[data-testid="msg-container"]');
+if (!bubbles.length) return { found: false, outgoing: false };
+const latest = bubbles[bubbles.length - 1];
+return { found: true, outgoing: isOutgoing(latest) };
+"""
+
+
+def latest_chat_bubble_is_outgoing(driver) -> bool:
+    """Return True when the newest chat bubble was sent from this WhatsApp account."""
+    try:
+        result = driver.execute_script(LATEST_BUBBLE_DIRECTION_JS)
+        if isinstance(result, dict) and result.get("found"):
+            return bool(result.get("outgoing"))
+    except Exception as exc:
+        print(f"⚠️ Could not read latest bubble direction: {exc}")
+    try:
+        bubbles = driver.find_elements(By.CSS_SELECTOR, '#main [data-testid="msg-container"]')
+        if bubbles:
+            return is_outgoing_message_container(bubbles[-1])
+    except Exception:
+        pass
+    return False
+
+
+def mark_incoming_units_human_handled(contact_name: str, units, contact_hint: str = ""):
+    """Record pending customer bubbles as handled when staff replied manually last."""
+    data_ids = [
+        str(u.get("data_id") or "").strip()
+        for u in (units or [])
+        if str(u.get("data_id") or "").strip()
+    ]
+    if not data_ids:
+        return
+    store_key = contact_store_key(contact_name, contact_hint)
+    fingerprint = build_plan_fingerprint(units, contact_name, contact_hint) or f"human_handled:{now_iso()}"
+    mark_watch_contact_processed(store_key, fingerprint, data_ids)
+    print(
+        f"✅ Marked {len(data_ids)} incoming message(s) as human-handled for {store_key!r} "
+        "(manual reply detected — bot will not respond)."
+    )
+
+
+def should_skip_chat_human_replied_last(driver, contact_name: str, units, contact_hint: str = "") -> bool:
+    """
+    When the latest bubble is outgoing, staff (or the bot) already replied.
+    Do not process older incoming messages in the lookback window.
+    """
+    if not latest_chat_bubble_is_outgoing(driver):
+        return False
+    print(
+        "ℹ️ Latest chat bubble is outgoing (manual reply from your phone or bot message). "
+        "OpenClaw ignores it and will NOT send another reply."
+    )
+    mark_incoming_units_human_handled(contact_name, units, contact_hint=contact_hint)
+    return True
+
+
 def is_playback_speed_label(text):
     """WhatsApp voice-note UI shows 1× / 1.5× / 2× — not message content."""
     return bool(re.fullmatch(r"\d+(?:\.\d+)?\s*[×xX]", str(text or "").strip()))
@@ -1807,11 +1931,19 @@ def filter_processable_units(units, contact_name: str = "", contact_hint: str = 
         kind = unit.get("kind") or "empty"
         if kind == "empty":
             continue
+        container = unit.get("container")
+        if container is not None and is_outgoing_message_container(container):
+            preview = str(unit.get("text") or "")[:70]
+            print(f"   ⏭️ Skip outgoing bubble (not customer): {preview!r}...")
+            continue
         if is_monitor_noise_unit(unit):
             preview = str(unit.get("text") or "")[:70]
             print(f"   ⏭️ Skip bot/monitor echo ({kind}): {preview!r}...")
             continue
         data_id = str(unit.get("data_id") or "").strip()
+        if data_id and is_outgoing_data_id(data_id):
+            print(f"   ⏭️ Skip outgoing WhatsApp message id {data_id[:28]!r}")
+            continue
         if data_id and data_id in processed_ids:
             print(f"   ⏭️ Skip already-processed WhatsApp message {data_id[:28]!r}")
             continue
@@ -1987,7 +2119,7 @@ const seen = new Set();
 const incoming = [];
 
 const candidates = panel.querySelectorAll(
-    '[data-testid="msg-container"], div.message-in[data-id], div.message-in'
+    'div.message-in[data-testid="msg-container"], div.message-in[data-id], div.message-in'
 );
 
 for (const node of candidates) {
@@ -2395,6 +2527,11 @@ def scrape_incoming_units_js(driver, lookback=6):
 
         if container is None and incoming_index is not None:
             container = relocate_incoming_by_index(driver, incoming_index)
+
+        if container is not None and is_outgoing_message_container(container):
+            preview = normalize_unit_text(item.get("text"))[:70]
+            print(f"   ⏭️ JS unit skipped — outgoing bubble: {preview!r}")
+            continue
 
         text = normalize_unit_text(item.get("text"))
         if is_bot_noise_message(text):
@@ -3030,6 +3167,8 @@ def collect_incoming_units(driver, lookback=INCOMING_LOOKBACK):
     recent = containers[-lookback:] if len(containers) > lookback else list(containers)
     units = []
     for container in recent:
+        if is_outgoing_message_container(container):
+            continue
         kind, text = classify_incoming_unit(container)
         units.append({
             "container": container,
@@ -5503,6 +5642,8 @@ def _process_open_chat_body(driver, raw_contact_name):
             return
         wait_for_chat_messages(driver, timeout=15)
         units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
+        if should_skip_chat_human_replied_last(driver, raw_contact_name, units):
+            return
         if not units:
             print(
                 "ℹ️ No incoming customer messages in this chat lookback window. "
@@ -6117,6 +6258,9 @@ def process_watched_contacts(driver, max_contacts: int = 1):
         raw_contact_name = get_contact_name_from_open_chat(driver)
         units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
         contact_name = raw_contact_name or contact_hint
+        if should_skip_chat_human_replied_last(driver, contact_name, units, contact_hint=contact_hint):
+            print(f"   ℹ️ {contact_name}: manual/bot reply is latest — skipping")
+            continue
         store_key = contact_store_key(contact_name, contact_hint)
         plan = plan_sequential_units(units, contact_name, contact_hint)
         if not plan:
