@@ -7,7 +7,7 @@ from requests.auth import HTTPBasicAuth
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 
-from burkert_price_list import lookup_burkert_quote
+from burkert_price_list import lookup_burkert_quote, resolve_burkert_id
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -858,23 +858,40 @@ def get_purchase_price(api_id):
         return {}
 
 
-def _try_burkert_price_list_row(part_no, qty, desc=None, brand="", search_context=""):
+def _try_burkert_price_list_row(
+    part_no,
+    qty,
+    desc=None,
+    brand="",
+    search_context="",
+    burkert_id="",
+    technical_specs=None,
+):
     """Fill price and lead time from the Burkert offline price list when available."""
     brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
     if brand_u != "BURKERT":
         return None
+
+    resolved_id = resolve_burkert_id(
+        burkert_id=burkert_id,
+        technical_specs=technical_specs,
+        search_context=search_context,
+    )
 
     quote = lookup_burkert_quote(
         part_no,
         qty=qty,
         markup_divisor=MARKUP_DIVISOR,
         search_context=search_context,
+        burkert_id=resolved_id,
+        technical_specs=technical_specs,
     )
     if not quote:
         return None
 
+    label = resolved_id or part_no
     print(
-        f"   ✅ [BURKERT] Price list match for {part_no}: "
+        f"   ✅ [BURKERT] Price list match for {label}: "
         f"RM {quote.get('price')} | LT {quote.get('lt')}"
     )
     return {
@@ -904,6 +921,8 @@ def _merge_burkert_quote_into_row(row, part_no):
         desc=row.get("desc"),
         brand="BURKERT",
         search_context=row.get("search_context") or "",
+        burkert_id=row.get("burkert_id") or "",
+        technical_specs=row.get("technical_specs") or [],
     )
     if not quote_row:
         return row
@@ -1146,6 +1165,8 @@ def process_structured_items(structured_items):
                 desc=desc,
                 brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
                 search_context=search_context,
+                burkert_id=item.get("burkert_id") or "",
+                technical_specs=item.get("technical_specs") or [],
             )
             if burkert_row:
                 formatted_rows.append(burkert_row)

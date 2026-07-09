@@ -3,8 +3,10 @@ import unittest
 from burkert_price_list import (
     burkert_lookup_keys,
     burkert_type_family_key,
+    burkert_id_lookup_keys,
     customer_lead_time_from_field,
     factory_days_to_customer_lead_time,
+    normalize_burkert_id,
     parse_factory_days,
 )
 
@@ -58,6 +60,11 @@ class BurkertLeadTimeMappingTests(unittest.TestCase):
             burkert_type_family_key("6519-H08,0-GM82-B5-024/DC-02"),
             "6519H08",
         )
+
+    def test_burkert_id_normalization(self):
+        self.assertEqual(normalize_burkert_id("00132465"), "132465")
+        self.assertEqual(normalize_burkert_id("132465"), "132465")
+        self.assertIn("132465", burkert_id_lookup_keys("00132465"))
 
 
 if __name__ == "__main__":

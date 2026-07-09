@@ -146,7 +146,7 @@ BUSINESS_EXTRACTION_ERRORS = frozenset({
 REQUIRED_EXTRACTION_FIELDS = ("status", "intent", "input_type", "items")
 
 ITEM_EXTRACTION_FIELDS = (
-    "brand", "part_no", "description", "product_type", "qty", "source",
+    "brand", "part_no", "burkert_id", "description", "product_type", "qty", "source",
     "confidence", "reason", "technical_specs", "catalog_url", "datasheet_url",
     "product_page_url", "compatible_accessories",
 )
@@ -376,6 +376,7 @@ Fill technical_summary (plain text, WhatsApp-friendly) covering the primary quot
 
 Per item, also fill when known:
 - technical_specs: array of "Label: value" strings
+- burkert_id: for Bürkert/Burkert nameplates only — transcribe the numeric ID printed on the label (often shown vertically, e.g. 00132465). Copy digits exactly as printed, including leading zeros. Leave empty for non-Burkert brands.
 - datasheet_url: direct link to official datasheet PDF (highest priority)
 - product_page_url: manufacturer regional product detail page (model in path)
 - catalog_url: same as datasheet_url if PDF known, else product_page_url
@@ -400,6 +401,7 @@ Return ONLY this JSON object (no other text). Use YOUR OWN readings — do NOT c
     {
       "brand": "",
       "part_no": "",
+      "burkert_id": "",
       "description": "",
       "product_type": "",
       "qty": 1,
@@ -511,7 +513,7 @@ Schema:
   "input_type": "",
   "primary_subject": "",
   "confidence": 0.0,
-  "items": [{"brand":"","part_no":"","description":"","product_type":"","qty":1,"source":"","confidence":0.0,"reason":"","technical_specs":[],"catalog_url":"","compatible_accessories":[]}],
+  "items": [{"brand":"","part_no":"","burkert_id":"","description":"","product_type":"","qty":1,"source":"","confidence":0.0,"reason":"","technical_specs":[],"catalog_url":"","compatible_accessories":[]}],
   "ignored": [],
   "technical_summary": "",
   "reasoning": ""
@@ -1695,6 +1697,9 @@ def _parse_copilot_items_from_dict(
             cleaned_acc = [str(a).strip() for a in accessories if str(a).strip()]
             if cleaned_acc:
                 item_out["compatible_accessories"] = cleaned_acc
+        burkert_id = str(item.get("burkert_id") or "").strip()
+        if burkert_id:
+            item_out["burkert_id"] = burkert_id
         items_out.append(item_out)
     return items_out
 

@@ -35,10 +35,83 @@ FACTORY_DAY_BUCKETS: list[tuple[int, int, str]] = [
 _PRICE_LIST_LOADED = False
 _LOOKUP_BY_KEY: dict[str, dict[str, Any]] = {}
 _FAMILY_INDEX: dict[str, list[dict[str, Any]]] = {}
+_ID_INDEX: dict[str, dict[str, Any]] = {}
 
 
 def normalize_part(part: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(part or "").upper())
+
+
+def normalize_burkert_id(value: str) -> str:
+    """Strip non-digits and leading zeros: 00132465 → 132465."""
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if not digits:
+        return ""
+    return digits.lstrip("0") or "0"
+
+
+def burkert_id_lookup_keys(value: str) -> list[str]:
+    """All ID forms to try: with/without leading zeros."""
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if not digits:
+        return []
+
+    stripped = digits.lstrip("0") or "0"
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    add(stripped)
+    add(digits)
+    if len(digits) < 8:
+        add(digits.zfill(6))
+        add(digits.zfill(8))
+    if stripped != digits:
+        add(stripped.zfill(6))
+        add(stripped.zfill(8))
+    return keys
+
+
+def extract_burkert_id_from_text(text: str) -> str:
+    """Pull a Burkert article ID from label text or Copilot specs."""
+    blob = str(text or "").strip()
+    if not blob:
+        return ""
+
+    patterns = (
+        r"\b(?:ID|ARTICLE|ART\.?|ARTICLE\s+NO\.?)\s*[:#]?\s*(0*\d{5,9})\b",
+        r"\b(0\d{5,8})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, blob, flags=re.I)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def resolve_burkert_id(
+    burkert_id: str = "",
+    technical_specs: list | None = None,
+    search_context: str = "",
+) -> str:
+    """Prefer explicit burkert_id, else scan specs/context for label ID."""
+    explicit = str(burkert_id or "").strip()
+    if explicit:
+        return explicit
+
+    specs = technical_specs or []
+    if isinstance(specs, str):
+        specs = [specs]
+    for spec in specs:
+        found = extract_burkert_id_from_text(spec)
+        if found:
+            return found
+
+    return extract_burkert_id_from_text(search_context)
 
 
 def burkert_type_family_key(part_type: str) -> str:
@@ -193,13 +266,31 @@ def _parse_net_price(value: Any) -> float | None:
     return price if price > 0 else None
 
 
-def _register_entry(lookup: dict[str, dict[str, Any]], family_index: dict[str, list], entry: dict[str, Any]) -> None:
+def _register_entry(
+    lookup: dict[str, dict[str, Any]],
+    family_index: dict[str, list],
+    id_index: dict[str, dict[str, Any]],
+    entry: dict[str, Any],
+) -> None:
     part_type = str(entry.get("type") or "").strip()
     family = burkert_type_family_key(part_type)
     if family:
         family_index.setdefault(family, []).append(entry)
 
-    for key in {entry.get("burkert_id"), part_type, entry.get("description")}:
+    burkert_id = str(entry.get("burkert_id") or "").strip()
+    for id_key in burkert_id_lookup_keys(burkert_id):
+        existing = id_index.get(id_key)
+        if existing is None:
+            id_index[id_key] = entry
+        elif existing.get("net_price") is None and entry.get("net_price") is not None:
+            id_index[id_key] = entry
+        existing_lookup = lookup.get(id_key)
+        if existing_lookup is None:
+            lookup[id_key] = entry
+        elif existing_lookup.get("net_price") is None and entry.get("net_price") is not None:
+            lookup[id_key] = entry
+
+    for key in {burkert_id, part_type, entry.get("description")}:
         norm = normalize_part(str(key or ""))
         if len(norm) < 3:
             continue
@@ -210,7 +301,7 @@ def _register_entry(lookup: dict[str, dict[str, Any]], family_index: dict[str, l
             lookup[norm] = entry
 
 
-def _load_from_cache(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, list]] | None:
+def _load_from_cache(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, list], dict[str, dict[str, Any]]] | None:
     cache_file = _cache_path(path)
     if not os.path.exists(cache_file):
         return None
@@ -221,18 +312,28 @@ def _load_from_cache(path: str) -> tuple[dict[str, dict[str, Any]], dict[str, li
             payload = pickle.load(handle)
         lookup = payload.get("lookup") or {}
         family_index = payload.get("family_index") or {}
-        if lookup:
-            return lookup, family_index
+        id_index = payload.get("id_index") or {}
+        if lookup and id_index:
+            return lookup, family_index, id_index
     except Exception as exc:
         print(f"⚠️ [BURKERT] Cache read failed: {exc}")
     return None
 
 
-def _save_cache(path: str, lookup: dict[str, dict[str, Any]], family_index: dict[str, list]) -> None:
+def _save_cache(
+    path: str,
+    lookup: dict[str, dict[str, Any]],
+    family_index: dict[str, list],
+    id_index: dict[str, dict[str, Any]],
+) -> None:
     cache_file = _cache_path(path)
     try:
         with open(cache_file, "wb") as handle:
-            pickle.dump({"lookup": lookup, "family_index": family_index}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(
+                {"lookup": lookup, "family_index": family_index, "id_index": id_index},
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
         print(f"💾 [BURKERT] Saved lookup cache: {cache_file}")
     except Exception as exc:
         print(f"⚠️ [BURKERT] Cache write failed: {exc}")
@@ -240,7 +341,7 @@ def _save_cache(path: str, lookup: dict[str, dict[str, Any]], family_index: dict
 
 def load_burkert_price_list(force: bool = False) -> bool:
     """Load the Burkert XLSM into memory. Returns True when the index is ready."""
-    global _PRICE_LIST_LOADED, _LOOKUP_BY_KEY, _FAMILY_INDEX
+    global _PRICE_LIST_LOADED, _LOOKUP_BY_KEY, _FAMILY_INDEX, _ID_INDEX
 
     if _PRICE_LIST_LOADED and not force:
         return bool(_LOOKUP_BY_KEY)
@@ -251,15 +352,16 @@ def load_burkert_price_list(force: bool = False) -> bool:
         _PRICE_LIST_LOADED = True
         _LOOKUP_BY_KEY = {}
         _FAMILY_INDEX = {}
+        _ID_INDEX = {}
         return False
 
     cached = None if force else _load_from_cache(path)
     if cached:
-        _LOOKUP_BY_KEY, _FAMILY_INDEX = cached
+        _LOOKUP_BY_KEY, _FAMILY_INDEX, _ID_INDEX = cached
         _PRICE_LIST_LOADED = True
         print(
             f"✅ [BURKERT] Loaded cached index: {len(_LOOKUP_BY_KEY)} keys, "
-            f"{len(_FAMILY_INDEX)} families."
+            f"{len(_FAMILY_INDEX)} families, {len(_ID_INDEX)} IDs."
         )
         return True
 
@@ -279,10 +381,12 @@ def load_burkert_price_list(force: bool = False) -> bool:
         _PRICE_LIST_LOADED = True
         _LOOKUP_BY_KEY = {}
         _FAMILY_INDEX = {}
+        _ID_INDEX = {}
         return False
 
     lookup: dict[str, dict[str, Any]] = {}
     family_index: dict[str, list[dict[str, Any]]] = {}
+    id_index: dict[str, dict[str, Any]] = {}
     loaded_rows = 0
 
     for _, row in df.iterrows():
@@ -305,18 +409,19 @@ def load_burkert_price_list(force: bool = False) -> bool:
             "factory_lead_time": factory_lt,
             "customer_lead_time": customer_lt,
         }
-        _register_entry(lookup, family_index, entry)
+        _register_entry(lookup, family_index, id_index, entry)
         loaded_rows += 1
 
     _LOOKUP_BY_KEY = lookup
     _FAMILY_INDEX = family_index
+    _ID_INDEX = id_index
     _PRICE_LIST_LOADED = True
     elapsed = time.time() - started
     print(
         f"✅ [BURKERT] Loaded {loaded_rows} rows, {len(lookup)} lookup keys, "
-        f"{len(family_index)} families in {elapsed:.1f}s."
+        f"{len(family_index)} families, {len(id_index)} IDs in {elapsed:.1f}s."
     )
-    _save_cache(path, lookup, family_index)
+    _save_cache(path, lookup, family_index, id_index)
     return bool(lookup)
 
 
@@ -379,17 +484,47 @@ def _pick_best_entry(candidates: list[dict[str, Any]], search_context: str = "")
     return priced[0] if priced else scored[0]
 
 
-def _lookup_entry(part_no: str, search_context: str = "") -> dict[str, Any] | None:
+def _lookup_entry_by_id(burkert_id: str) -> dict[str, Any] | None:
+    if not burkert_id:
+        return None
+    for key in burkert_id_lookup_keys(burkert_id):
+        entry = _ID_INDEX.get(key) or _LOOKUP_BY_KEY.get(key)
+        if entry:
+            return entry
+    return None
+
+
+def _lookup_entry(
+    part_no: str,
+    search_context: str = "",
+    burkert_id: str = "",
+    technical_specs: list | None = None,
+) -> dict[str, Any] | None:
     if not _PRICE_LIST_LOADED:
         load_burkert_price_list()
+
+    resolved_id = resolve_burkert_id(
+        burkert_id=burkert_id,
+        technical_specs=technical_specs,
+        search_context=search_context,
+    )
+    if resolved_id:
+        entry = _lookup_entry_by_id(resolved_id)
+        if entry:
+            print(f"   ✅ [BURKERT] Matched by ID {resolved_id} → type {entry.get('type')}")
+            return entry
 
     candidates = _collect_candidate_entries(part_no)
     entry = _pick_best_entry(candidates, search_context=search_context)
     if entry:
         return entry
 
-    tried = ", ".join(burkert_lookup_keys(part_no)[:6])
-    print(f"   ⚠️ [BURKERT] No price list match for {part_no!r} (tried: {tried})")
+    tried_id = normalize_burkert_id(resolved_id) if resolved_id else ""
+    tried_keys = ", ".join(burkert_lookup_keys(part_no)[:4])
+    print(
+        f"   ⚠️ [BURKERT] No price list match for {part_no!r}"
+        f"{f' / ID {tried_id}' if tried_id else ''} (tried: {tried_keys})"
+    )
     return None
 
 
@@ -398,13 +533,20 @@ def lookup_burkert_quote(
     qty: int = 1,
     markup_divisor: float = 0.72,
     search_context: str = "",
+    burkert_id: str = "",
+    technical_specs: list | None = None,
 ) -> dict[str, Any] | None:
     """
     Return a quote dict for a Burkert part from the offline price list.
 
     Keys: desc, net_price, sell_price, price (formatted), lt, burkert_id, type, source.
     """
-    entry = _lookup_entry(part_no, search_context=search_context)
+    entry = _lookup_entry(
+        part_no,
+        search_context=search_context,
+        burkert_id=burkert_id,
+        technical_specs=technical_specs,
+    )
     if not entry:
         return None
 

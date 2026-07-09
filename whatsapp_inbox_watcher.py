@@ -5079,6 +5079,7 @@ def process_customer_inquiry(
             structured_items.append({
                 "brand": str(item.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT"),
                 "part_no": part_no,
+                "burkert_id": str(item.get("burkert_id") or "").strip(),
                 "desc": part_no,
                 "qty": qty,
                 "norm": part_norm,
@@ -5092,7 +5093,8 @@ def process_customer_inquiry(
                 ),
             })
             existing_norms.add(part_norm)
-            print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {qty}")
+            id_note = f" | ID: {item.get('burkert_id')}" if item.get("burkert_id") else ""
+            print(f"   👁️ Copilot identified | Part: {part_no}{id_note} | Qty: {qty}")
 
         formatted_rows, tbc_by_brand, skipped, voltage_selections = process_structured_items(structured_items)
         result = {

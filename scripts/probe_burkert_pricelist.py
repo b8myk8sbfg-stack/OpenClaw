@@ -69,8 +69,14 @@ def main() -> int:
         quote = lookup_burkert_quote(
             "6519 H 8.0",
             search_context="Coil voltage: 24V DC",
+            burkert_id="00132465",
         )
-        print(f"Quote: {quote}")
+        print(f"Quote by ID: {quote}")
+        quote2 = lookup_burkert_quote(
+            "6519 H 8.0",
+            search_context="Coil voltage: 24V DC",
+        )
+        print(f"Quote by type: {quote2}")
     except Exception as exc:
         print(f"(lookup test skipped: {exc})")
 
