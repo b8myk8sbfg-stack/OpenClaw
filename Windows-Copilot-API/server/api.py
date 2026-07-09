@@ -114,6 +114,8 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
+    # OpenClaw treats every inquiry as brand-new — never continue upstream threads.
+    conversation_id = None
     try:
         prompt, image = messages_to_prompt_and_image(req.messages)
     except ValueError as exc:
@@ -121,6 +123,14 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=400,
             content={"error": {"message": str(exc), "type": "invalid_request_error"}},
         )
+    if image is not None:
+        print(
+            f"[copilot] chat/completions image: {len(image)} bytes, prompt_chars={len(prompt)}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(f"[copilot] chat/completions text-only, prompt_chars={len(prompt)}", file=sys.stderr, flush=True)
     if not prompt.strip():
         return JSONResponse(
             status_code=400,
@@ -136,13 +146,13 @@ def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream(prompt, model, req.conversation_id, image=image),
+            _stream(prompt, model, conversation_id, image=image),
             media_type="text/event-stream",
         )
 
     try:
         with _upstream_lock:  # serialize: one upstream chat at a time
-            reply = client.chat(prompt, conversation_id=req.conversation_id, image=image)
+            reply = client.chat(prompt, conversation_id=conversation_id, image=image)
     except ClearanceRequired:
         return JSONResponse(
             status_code=503,
