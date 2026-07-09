@@ -858,13 +858,18 @@ def get_purchase_price(api_id):
         return {}
 
 
-def _try_burkert_price_list_row(part_no, qty, desc=None, brand=""):
+def _try_burkert_price_list_row(part_no, qty, desc=None, brand="", search_context=""):
     """Fill price and lead time from the Burkert offline price list when available."""
     brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
     if brand_u != "BURKERT":
         return None
 
-    quote = lookup_burkert_quote(part_no, qty=qty, markup_divisor=MARKUP_DIVISOR)
+    quote = lookup_burkert_quote(
+        part_no,
+        qty=qty,
+        markup_divisor=MARKUP_DIVISOR,
+        search_context=search_context,
+    )
     if not quote:
         return None
 
@@ -898,6 +903,7 @@ def _merge_burkert_quote_into_row(row, part_no):
         row.get("qty", 1),
         desc=row.get("desc"),
         brand="BURKERT",
+        search_context=row.get("search_context") or "",
     )
     if not quote_row:
         return row
@@ -1138,7 +1144,8 @@ def process_structured_items(structured_items):
                 part_no,
                 qty,
                 desc=desc,
-                brand=inferred_brand,
+                brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
+                search_context=search_context,
             )
             if burkert_row:
                 formatted_rows.append(burkert_row)

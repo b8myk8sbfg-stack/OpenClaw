@@ -1,6 +1,8 @@
 import unittest
 
 from burkert_price_list import (
+    burkert_lookup_keys,
+    burkert_type_family_key,
     customer_lead_time_from_field,
     factory_days_to_customer_lead_time,
     parse_factory_days,
@@ -45,6 +47,17 @@ class BurkertLeadTimeMappingTests(unittest.TestCase):
         self.assertEqual(customer_lead_time_from_field("11 to 20 days"), "6-8 weeks")
         self.assertEqual(customer_lead_time_from_field("21 to 50 days"), "8-10 weeks")
         self.assertEqual(customer_lead_time_from_field("51 to 100 days"), "10-14 weeks")
+
+    def test_nameplate_maps_to_catalog_family(self):
+        keys = burkert_lookup_keys("6519 H 8.0")
+        self.assertIn("6519H80", keys)
+        self.assertIn("6519H08", keys)
+
+    def test_type_family_key(self):
+        self.assertEqual(
+            burkert_type_family_key("6519-H08,0-GM82-B5-024/DC-02"),
+            "6519H08",
+        )
 
 
 if __name__ == "__main__":

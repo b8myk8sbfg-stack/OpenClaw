@@ -59,6 +59,21 @@ def main() -> int:
             print(f"Row {i}: {row.tolist()[:10]}")
             break
 
+    print()
+    print("=== Sample lookup keys for nameplate '6519 H 8.0' ===")
+    try:
+        from burkert_price_list import burkert_lookup_keys, lookup_burkert_quote
+
+        keys = burkert_lookup_keys("6519 H 8.0")
+        print(f"Keys: {keys}")
+        quote = lookup_burkert_quote(
+            "6519 H 8.0",
+            search_context="Coil voltage: 24V DC",
+        )
+        print(f"Quote: {quote}")
+    except Exception as exc:
+        print(f"(lookup test skipped: {exc})")
+
     return 0
 
 

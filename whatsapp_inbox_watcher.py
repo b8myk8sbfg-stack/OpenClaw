@@ -5077,7 +5077,7 @@ def process_customer_inquiry(
                     "COPILOT_VISUAL" if image_path else "COPILOT_TEXT"
                 )
             structured_items.append({
-                "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
+                "brand": str(item.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT"),
                 "part_no": part_no,
                 "desc": part_no,
                 "qty": qty,
@@ -5113,7 +5113,7 @@ def process_customer_inquiry(
             if not part_norm or part_norm in existing_norms:
                 continue
             structured_items.append({
-                "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
+                "brand": str(item.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT"),
                 "part_no": part_no,
                 "desc": part_no,
                 "qty": int(item.get("qty") or 1),
