@@ -60,6 +60,7 @@ BURKERT_DOMAINS = ("burkert.com", "bürkert.com")
 BURKERT_DATASHEET_TEMPLATE = "https://www.burkert.com/en/Media/plm/DTS/DS/ds{type}-standard-eu-en.pdf"
 BURKERT_ITEM_PAGE_TEMPLATE = "https://www.burkert.com/en/item/{article_id}"
 BURKERT_TYPE_PAGE_TEMPLATE = "https://www.burkert.com/en/type/{type_no}"
+SMC_PRODUCT_SEARCH_TEMPLATE = "https://www.smcworld.com/webcatalog/en-my/search/?q={part_no}"
 
 
 def _spec_value(technical_specs: list | None, labels: tuple[str, ...]) -> str:
@@ -131,6 +132,19 @@ def resolve_burkert_official_links(
     return result
 
 
+def resolve_smc_official_links(part_no: str) -> dict[str, Any]:
+    """Deterministic SMC catalogue search URL (Malaysia region)."""
+    part = str(part_no or "").strip()
+    if not part:
+        return {}
+    encoded = part.replace(" ", "+")
+    return {
+        "product_page_url": SMC_PRODUCT_SEARCH_TEMPLATE.format(part_no=encoded),
+        "match_confidence": "Partial Match",
+        "pdf_status": "PDF available from product page",
+    }
+
+
 def _is_official_brand_url(url: str, brand: str) -> bool:
     return False  # reserved for future URL policy checks
 
@@ -177,6 +191,14 @@ def enrich_item_catalog_links(item: dict, row: dict | None = None) -> dict[str, 
         item["pdf_status"] = verification.get("pdf_status") or ""
         if verification.get("type_page_url"):
             item["type_page_url"] = verification["type_page_url"]
+    elif brand == "SMC" and part_no:
+        verification = resolve_smc_official_links(part_no)
+        product_page = str(verification.get("product_page_url") or "").strip()
+        if product_page:
+            item["product_page_url"] = product_page
+            item["catalog_url"] = product_page
+        item["verification_confidence"] = verification.get("match_confidence") or ""
+        item["pdf_status"] = verification.get("pdf_status") or ""
 
     return verification
 

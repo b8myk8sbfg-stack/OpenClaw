@@ -8,11 +8,12 @@ from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 
 from burkert_price_list import lookup_burkert_quote, resolve_burkert_id, format_burkert_id_display
+from smc_portal_lookup import lookup_smc_quote
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.11-BURKERT-PRICELIST"
+VERSION = "v1.12-SMC-PORTAL"
 
 # Customer sell price = purchase cost / MARKUP_DIVISOR (0.72 → ~38.9% markup on cost, ~28% margin).
 MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
@@ -916,6 +917,85 @@ def _try_burkert_price_list_row(
     }
 
 
+def _try_smc_portal_row(
+    part_no,
+    qty,
+    desc=None,
+    brand="",
+    search_context="",
+):
+    """Fill price and lead time from the SMC distributor web portal when available."""
+    brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand_u != "SMC":
+        return None
+
+    quote = lookup_smc_quote(
+        part_no,
+        qty=qty,
+        markup_divisor=MARKUP_DIVISOR,
+        search_context=search_context,
+    )
+    if not quote:
+        return None
+
+    return {
+        "desc": quote.get("desc") or desc or part_no,
+        "qty": int(quote.get("qty") or qty),
+        "requested_qty": int(quote.get("requested_qty") or qty),
+        "moq": int(quote.get("moq") or 0),
+        "moq_applied": bool(quote.get("moq_applied")),
+        "price": quote.get("price", "[TBC]"),
+        "lt": quote.get("lt", "[TBC]"),
+        "pid": quote.get("smc_part") or part_no,
+        "smc_part": quote.get("smc_part") or part_no,
+        "brand": "SMC",
+        "source": quote.get("source", "SMC_PORTAL"),
+        "customer_part": part_no,
+        "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+    }
+
+
+def _merge_smc_quote_into_row(row, part_no):
+    """Update an existing quote row from the SMC portal when price/LT are still TBC."""
+    if str(row.get("brand") or "").upper() != "SMC":
+        return row
+
+    if row.get("price") != "[TBC]" and row.get("lt") != "[TBC]":
+        return row
+
+    quote_row = _try_smc_portal_row(
+        part_no,
+        row.get("qty", 1),
+        desc=row.get("desc"),
+        brand="SMC",
+        search_context=row.get("search_context") or "",
+    )
+    if not quote_row:
+        return row
+
+    merged = dict(row)
+    if merged.get("price") == "[TBC]" and quote_row.get("price") != "[TBC]":
+        merged["price"] = quote_row["price"]
+    if merged.get("lt") == "[TBC]" and quote_row.get("lt") != "[TBC]":
+        merged["lt"] = quote_row["lt"]
+    if quote_row.get("desc"):
+        merged["desc"] = quote_row["desc"]
+    if quote_row.get("pid"):
+        merged["pid"] = quote_row["pid"]
+    if quote_row.get("smc_part"):
+        merged["smc_part"] = quote_row["smc_part"]
+    if quote_row.get("qty"):
+        merged["qty"] = quote_row["qty"]
+    if quote_row.get("requested_qty") is not None:
+        merged["requested_qty"] = quote_row["requested_qty"]
+    if quote_row.get("moq") is not None:
+        merged["moq"] = quote_row["moq"]
+    merged["moq_applied"] = quote_row.get("moq_applied", merged.get("moq_applied"))
+    merged["source"] = quote_row.get("source", merged.get("source"))
+    merged["needs_supplier"] = quote_row.get("needs_supplier", merged.get("needs_supplier"))
+    return merged
+
+
 def _merge_burkert_quote_into_row(row, part_no):
     """Update an existing quote row from the Burkert price list when price/LT are still TBC."""
     if str(row.get("brand") or "").upper().replace("BÜRKERT", "BURKERT") != "BURKERT":
@@ -1072,6 +1152,7 @@ def build_rows_from_api(api_id, qty, customer_part=None):
                 "needs_supplier": True,
             }
             balance_row = _merge_burkert_quote_into_row(balance_row, customer_part or api_id)
+            balance_row = _merge_smc_quote_into_row(balance_row, customer_part or api_id)
             rows.append(balance_row)
 
             if balance_row.get("needs_supplier", True):
@@ -1093,6 +1174,7 @@ def build_rows_from_api(api_id, qty, customer_part=None):
                 )
 
         rows[0] = _merge_burkert_quote_into_row(rows[0], customer_part or api_id)
+        rows[0] = _merge_smc_quote_into_row(rows[0], customer_part or api_id)
         return rows, supplier_item
 
     print("   ⚠️ No usable STORE stock. Full quantity added to supplier RFQ queue.")
@@ -1109,6 +1191,7 @@ def build_rows_from_api(api_id, qty, customer_part=None):
         "needs_supplier": True,
     }
     no_stock_row = _merge_burkert_quote_into_row(no_stock_row, customer_part or api_id)
+    no_stock_row = _merge_smc_quote_into_row(no_stock_row, customer_part or api_id)
     rows.append(no_stock_row)
 
     supplier_item = None
@@ -1176,6 +1259,24 @@ def process_structured_items(structured_items):
         else:
             inferred_brand = declared_brand if declared_brand != "UNKNOWN" else infer_brand_from_part(part_no)
             desc = item.get("desc") or (f"{inferred_brand} {part_no}" if inferred_brand != "UNKNOWN" else part_no)
+
+            smc_row = _try_smc_portal_row(
+                part_no,
+                qty,
+                desc=desc,
+                brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
+                search_context=search_context,
+            )
+            if smc_row:
+                formatted_rows.append(smc_row)
+                if smc_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
+                    tbc_by_brand.setdefault(inferred_brand, []).append({
+                        "desc": smc_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": inferred_brand,
+                    })
+                continue
 
             burkert_row = _try_burkert_price_list_row(
                 part_no,

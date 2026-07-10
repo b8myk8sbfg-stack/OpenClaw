@@ -1,0 +1,22 @@
+{
+  "search_input": [
+    "input[name*='model' i]",
+    "input[placeholder*='model' i]",
+    "#txtSearch"
+  ],
+  "search_button": [
+    "button[type='submit']",
+    ".btn-search"
+  ],
+  "search_url_templates": [
+    "{base}/Home/Search?model={part}",
+    "{base}/Product/Search?model={part}"
+  ],
+  "result_table": [
+    "table",
+    ".table"
+  ],
+  "login_email": ["#Email", "input[name='Email']"],
+  "login_password": ["#Password", "input[name='Password']"],
+  "login_submit": ["button[type='submit']"]
+}
