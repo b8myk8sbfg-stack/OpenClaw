@@ -1,54 +1,79 @@
-"""Unit tests for SMC part normalization (no Selenium required)."""
+"""Unit tests for SMC portal lead-time and row-selection logic (no Selenium)."""
 
 import re
 import unittest
+from typing import Any
+
+PENINSULA_WAREHOUSES = frozenset({"JH", "PG", "SJ"})
+LT_EX_STOCK = "1 week"
+LT_INDENT = "4-6 weeks"
 
 
-def normalize_smc_part(part: str) -> str:
-    raw = str(part or "").strip().upper()
-    if not raw:
-        return ""
-    compact = re.sub(r"\s+", "", raw)
-    if re.match(r"^\d{1,2}[A-Z]", compact) and "-" not in compact:
-        m = re.match(r"^(\d{1,2})([A-Z].+)$", compact)
-        if m:
-            body = m.group(2)
-            if len(body) > 6 and "-" not in body:
-                return f"{m.group(1)}-{body[:6]}-{body[6:]}"
-            return f"{m.group(1)}-{body}"
-    return raw
+def compact_part(part: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(part or "").upper())
 
 
-def smc_lookup_keys(part_no: str) -> list[str]:
-    raw = str(part_no or "").strip()
-    keys: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: str) -> None:
-        value = str(value or "").strip()
-        if value and value not in seen:
-            seen.add(value)
-            keys.append(value)
-
-    add(raw)
-    add(raw.upper())
-    add(normalize_smc_part(raw))
-    compact = re.sub(r"[^A-Z0-9]", "", raw.upper())
-    add(compact)
-    return keys
+def parts_equal(a: str, b: str) -> bool:
+    return compact_part(a) == compact_part(b)
 
 
-class SmcNormalizationTests(unittest.TestCase):
-    def test_compact_to_hyphenated(self):
-        self.assertEqual(normalize_smc_part("10KQ2H06M5N"), "10-KQ2H06-M5N")
+def parse_qty(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text or text in ("-", "—"):
+        return 0
+    match = re.search(r"-?\d+", text.replace(",", ""))
+    return max(0, int(match.group(0))) if match else 0
 
-    def test_preserve_existing_hyphens(self):
-        self.assertEqual(normalize_smc_part("10-KQ2H06-M5N"), "10-KQ2H06-M5N")
 
-    def test_lookup_keys_include_variants(self):
-        keys = smc_lookup_keys("10-KQ2H06-M5N")
-        self.assertIn("10-KQ2H06-M5N", keys)
-        self.assertTrue(any("KQ2H06" in k for k in keys))
+def parse_money(text: str) -> float | None:
+    match = re.search(
+        r"(?:MYR|RM)\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)",
+        str(text or ""),
+        re.I,
+    )
+    if not match:
+        return None
+    return float(match.group(1).replace(",", ""))
+
+
+def compute_lead_time_from_rows(rows: list[dict[str, Any]]) -> str:
+    for row in rows:
+        whs = str(row.get("whs") or "").upper().strip()
+        if whs not in PENINSULA_WAREHOUSES:
+            continue
+        if parse_qty(row.get("avail")) > 0:
+            return LT_EX_STOCK
+        if parse_qty(row.get("pnt1")) > 0 or parse_qty(row.get("pnt2")) > 0:
+            return LT_EX_STOCK
+    return LT_INDENT
+
+
+def pick_exact_part_rows(rows: list[dict[str, Any]], searched_part: str) -> list[dict[str, Any]]:
+    return [r for r in rows if parts_equal(str(r.get("pn") or ""), searched_part)]
+
+
+class SmcLeadTimeTests(unittest.TestCase):
+    def test_ex_stock_when_avail_in_jh(self):
+        rows = [{"whs": "JH", "avail": "5", "pnt1": "0", "pnt2": "0"}]
+        self.assertEqual(compute_lead_time_from_rows(rows), "1 week")
+
+    def test_ex_stock_when_pnt_assembly(self):
+        rows = [{"whs": "PG", "avail": "0", "pnt1": "3", "pnt2": "0"}]
+        self.assertEqual(compute_lead_time_from_rows(rows), "1 week")
+
+    def test_indent_when_no_peninsula_stock(self):
+        rows = [{"whs": "JH", "avail": "0", "pnt1": "0", "pnt2": "0"}]
+        self.assertEqual(compute_lead_time_from_rows(rows), "4-6 weeks")
+
+    def test_exact_part_match(self):
+        rows = [
+            {"pn": "C96SDB40-50C", "whs": "JH"},
+            {"pn": "C96SDB40-50C-M9B", "whs": "JH"},
+        ]
+        self.assertEqual(len(pick_exact_part_rows(rows, "C96SDB40-50C")), 1)
+
+    def test_parse_money_myr(self):
+        self.assertEqual(parse_money("MYR 285.28"), 285.28)
 
 
 if __name__ == "__main__":

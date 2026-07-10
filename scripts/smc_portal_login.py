@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open SMC portal in a dedicated Chrome profile — log in manually once."""
+"""Open SMC dealer portal — log in manually once (saved in chrome_smc_profile)."""
 
 from __future__ import annotations
 
@@ -16,37 +16,41 @@ from smc_portal_lookup import (  # noqa: E402
     close_driver,
     ensure_portal_session,
     get_driver,
-    portal_home_url,
+    portal_credentials,
+    portal_item_enquiry_url,
     portal_login_url,
+    search_portal_part,
 )
 
 
 def main() -> int:
+    user, _ = portal_credentials()
     print("=" * 72)
-    print("SMC Portal — manual login helper")
-    print(f"Profile: {SMC_CHROME_PROFILE}")
-    print(f"Login:  {portal_login_url()}")
-    print(f"Home:   {portal_home_url()}")
+    print("SMC Dealer Portal — login helper")
+    print(f"Profile:  {SMC_CHROME_PROFILE}")
+    print(f"Landing:  {portal_login_url()}")
+    print(f"Enquiry:  {portal_item_enquiry_url()}")
+    print(f"User:     {user or '(set SMC_PORTAL_USERNAME or USER_ID in .env)'}")
     print()
-    print("1. Chrome will open with the SMC profile (extensions are kept).")
-    print("2. Log in to the SMC portal if prompted.")
-    print("3. Leave this window open ~60s, then press Ctrl+C when done.")
+    print("Automated flow: Account/Index → SMC Dealer Login → Item Enquiry")
+    print("Press Ctrl+C when done to save session.")
     print("=" * 72)
 
     driver = get_driver()
-    driver.get(portal_login_url())
-    time.sleep(3)
-
     if ensure_portal_session(driver):
-        print("✅ Portal session looks logged in.")
+        print("✅ Logged in.")
+        test_part = sys.argv[1] if len(sys.argv) > 1 else ""
+        if test_part:
+            hit = search_portal_part(driver, test_part)
+            print(hit)
     else:
-        print("⚠️ Still on login page — complete login in Chrome, then re-run probe.")
+        print("⚠️ Login not complete — finish in Chrome window.")
 
     try:
         while True:
             time.sleep(5)
     except KeyboardInterrupt:
-        print("\n🛑 Done — session saved in chrome_smc_profile.")
+        print("\n🛑 Session saved.")
     finally:
         close_driver()
     return 0
@@ -54,3 +58,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
