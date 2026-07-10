@@ -86,7 +86,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.59-FASTER-WHATSAPP-STARTUP"
+VERSION = "v3.60-TEXT-RFQ-OVER-STALE-IMAGE"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -2912,6 +2912,9 @@ def get_latest_incoming_bubble(driver):
                     text = clean_bubble_text(container.text)
 
                 if text and not is_whatsapp_system_promotion(text):
+                    if text_has_explicit_part_number(text):
+                        print("📨 Latest incoming bubble is a text RFQ with part number.")
+                        return container
                     if is_trivial_ack(text):
                         for candidate in reversed(containers):
                             if bubble_contains_document(candidate):
@@ -3010,11 +3013,97 @@ def is_quote_without_part_number(text):
         return False
     if not re.search(r"\b(QUOTE|QUOTATION|RFQ|ENQ|PRICE|PLS QUOTE|KINDLY QUOTE|QUOTE ME)\b", text_u):
         return False
-    if re.search(r"[A-Z]{1,4}\d{3,}[A-Z0-9#\-/]*", text_u):
+    if text_has_explicit_part_number(text):
         return False
     if re.search(r"\b(QTY|PCS|PC|PIECES|PIECE|EA|EACH|UNIT|UNITS)\b", text_u):
         return True
     return len(text_u) < 80
+
+
+def text_has_explicit_part_number(text) -> bool:
+    """
+    True when a text bubble names a part number (standalone RFQ — do not pair with an older image).
+    E.g. 'Quote me 2 pcs of SMC C96SDB40-50C'
+    """
+    text_u = str(text or "").upper().strip()
+    if not text_u:
+        return False
+
+    brand_part = re.search(
+        r"\b(SMC|OMRON|BURKERT|BÜRKERT|FESTO|SICK|IFM|PANASONIC|KEYENCE|LEGRIS|PISCO|"
+        r"PARKER|ABB|SIEMENS|THK|LOCTITE)\b",
+        text_u,
+    )
+    if brand_part:
+        if re.search(r"[A-Z]{1,4}[-]?\d{2,}[A-Z0-9\-/]*", text_u):
+            return True
+        if re.search(r"\b[A-Z]\d{2}[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b", text_u):
+            return True
+
+    if re.search(r"\b[A-Z]\d{2}[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b", text_u):
+        return True
+    if re.search(r"\b[A-Z]{2,}\d{3,}[A-Z0-9#\-/]+\b", text_u):
+        return True
+    if re.search(r"\b\d{1,2}[-][A-Z]{2,}\d{2,}[A-Z0-9\-]*\b", text_u):
+        return True
+    return False
+
+
+def drop_stale_images_before_text_rfq(units):
+    """When a newer text RFQ names a part number, ignore older image bubbles in the lookback."""
+    if not units:
+        return units
+
+    latest_text_idx = -1
+    for unit in units:
+        if unit.get("kind") != "text":
+            continue
+        if not text_has_explicit_part_number(unit.get("text")):
+            continue
+        idx = unit.get("incoming_index")
+        if idx is None:
+            latest_text_idx = max(latest_text_idx, units.index(unit))
+        else:
+            latest_text_idx = max(latest_text_idx, int(idx))
+
+    if latest_text_idx < 0:
+        return units
+
+    kept = []
+    for pos, unit in enumerate(units):
+        if unit.get("kind") != "image":
+            kept.append(unit)
+            continue
+        img_idx = unit.get("incoming_index")
+        if img_idx is None:
+            img_pos = pos
+        else:
+            img_pos = int(img_idx)
+        if img_pos < latest_text_idx:
+            preview = str(unit.get("text") or "image")[:60]
+            print(
+                f"   ⏭️ Skip stale image — newer text RFQ has explicit part number: {preview!r}"
+            )
+            continue
+        kept.append(unit)
+    return kept
+
+
+def stale_image_data_ids(all_units, plan) -> list[str]:
+    """Image message ids skipped because a newer standalone text RFQ was processed."""
+    if not plan or plan[-1].get("kind") != "text":
+        return []
+    if not text_has_explicit_part_number(plan[-1].get("text")):
+        return []
+    plan_ids = {id(u) for u in plan}
+    ids = []
+    for unit in all_units or []:
+        if unit.get("kind") != "image" or id(unit) in plan_ids:
+            continue
+        data_id = str(unit.get("data_id") or "").strip()
+        if data_id:
+            ids.append(data_id)
+    return ids
 
 
 def is_support_without_part_number(text):
@@ -3174,12 +3263,61 @@ def classify_incoming_unit(container):
     return "empty", ""
 
 
+def _supplement_latest_text_rfq_units(driver, units):
+    """Ensure the newest text RFQ bubble is included when JS scrape missed it."""
+    if not units:
+        return units
+    if any(
+        u.get("kind") == "text" and text_has_explicit_part_number(u.get("text"))
+        for u in units[-2:]
+    ):
+        return units
+
+    containers = get_incoming_message_containers(driver)
+    known_ids = {str(u.get("data_id") or "").strip() for u in units if u.get("data_id")}
+    for container in reversed(containers):
+        if is_outgoing_message_container(container):
+            continue
+        kind, text = classify_incoming_unit(container)
+        if kind != "text" or not text_has_explicit_part_number(text):
+            continue
+        data_id = _data_id_from_container(container)
+        if data_id and data_id in known_ids:
+            break
+        print(f"📨 Supplemented missed text RFQ bubble: {text[:80]!r}")
+        units.append({
+            "container": container,
+            "data_id": data_id,
+            "incoming_index": len(units),
+            "kind": "text",
+            "text": normalize_unit_text(text),
+        })
+        break
+    return units
+
+
 def collect_incoming_units(driver, lookback=INCOMING_LOOKBACK):
     units = scrape_incoming_units_js(driver, lookback=lookback)
     if units:
-        return units
+        return _supplement_latest_text_rfq_units(driver, units)
 
-    print("⚠️ JS scrape empty — trying last incoming image fallback.")
+    print("⚠️ JS scrape empty — trying latest text RFQ fallback.")
+    containers = get_incoming_message_containers(driver)
+    for container in reversed(containers):
+        if is_outgoing_message_container(container):
+            continue
+        kind, text = classify_incoming_unit(container)
+        if kind == "text" and text_has_explicit_part_number(text):
+            print(f"✅ Text RFQ fallback matched: {text[:80]!r}")
+            return [{
+                "container": container,
+                "data_id": _data_id_from_container(container),
+                "incoming_index": None,
+                "kind": "text",
+                "text": normalize_unit_text(text),
+            }]
+
+    print("⚠️ Text RFQ fallback empty — trying last incoming image fallback.")
     container = relocate_last_incoming_image(driver, lookback=lookback)
     if container is not None:
         print("✅ Image-only fallback matched last incoming image bubble")
@@ -3236,6 +3374,8 @@ def plan_sequential_units(units, contact_name: str = "", contact_hint: str = "")
     if not units:
         return []
 
+    units = drop_stale_images_before_text_rfq(units)
+
     meaningful = [
         u for u in units
         if u["kind"] in ("image", "document", "text", "voice")
@@ -3263,9 +3403,18 @@ def plan_sequential_units(units, contact_name: str = "", contact_hint: str = "")
         print("📨 Sequential plan: image message (caption may be attached)")
         return [newest]
 
+    if newest["kind"] == "text" and text_has_explicit_part_number(newest.get("text")):
+        print("📨 Sequential plan: standalone text RFQ (explicit part number — no image pairing)")
+        return [newest]
+
     if newest["kind"] == "text" and prev and prev["kind"] == "image":
-        print("📨 Sequential plan: 1) image message  2) text caption")
-        return [prev, newest]
+        if is_quote_without_part_number(newest.get("text")) or is_support_without_part_number(
+            newest.get("text")
+        ):
+            print("📨 Sequential plan: 1) image message  2) text caption")
+            return [prev, newest]
+        print("📨 Sequential plan: text after image but message has part/brand — text only")
+        return [newest]
 
     if newest["kind"] == "image" and prev and prev["kind"] == "text":
         print("📨 Sequential plan: 1) image message  2) earlier text caption")
@@ -5675,6 +5824,7 @@ def process_open_chat(driver):
 
 def _process_open_chat_body(driver, raw_contact_name):
     plan = []
+    units = []
     contact_name = raw_contact_name or "WhatsApp Customer"
     voice_ok = True
     try:
@@ -5905,6 +6055,7 @@ def _process_open_chat_body(driver, raw_contact_name):
             plan,
             voice_ok=voice_ok,
             contact_hint=raw_contact_name,
+            all_units=units,
         )
 
 
@@ -6209,7 +6360,13 @@ def build_process_fingerprint(units, contact_name: str = "", contact_hint: str =
     return build_plan_fingerprint(plan)
 
 
-def finalize_chat_processing(contact_name, plan, voice_ok: bool = True, contact_hint: str = ""):
+def finalize_chat_processing(
+    contact_name,
+    plan,
+    voice_ok: bool = True,
+    contact_hint: str = "",
+    all_units=None,
+):
     if not plan:
         clear_wa_attachment_workspace()
         return
@@ -6222,6 +6379,10 @@ def finalize_chat_processing(contact_name, plan, voice_ok: bool = True, contact_
         return
     fingerprint = build_plan_fingerprint(plan)
     data_ids = [str(u.get("data_id") or "").strip() for u in plan if u.get("data_id")]
+    extra_ids = stale_image_data_ids(all_units, plan)
+    if extra_ids:
+        print(f"   📌 Marking {len(extra_ids)} skipped stale image(s) as processed")
+    data_ids = list(dict.fromkeys([*data_ids, *extra_ids]))
     store_key = contact_store_key(contact_name, contact_hint)
     mark_watch_contact_processed(store_key, fingerprint, data_ids)
     clear_wa_attachment_workspace()
