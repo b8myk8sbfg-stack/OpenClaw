@@ -85,8 +85,14 @@ from whatsapp_attachment_processor import (
     _execute_async_js,
 )
 from message_learning_store import apply_feedback_command
+from whatsapp_rfq_text import (
+    collect_trailing_text_rfqs,
+    is_standalone_text_rfq,
+    is_trivial_ack,
+    text_has_explicit_part_number,
+)
 
-VERSION = "v3.60-TEXT-RFQ-OVER-STALE-IMAGE"
+VERSION = "v3.61-MULTI-TEXT-RFQ-AFTER-BOT-REPLY"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -1676,6 +1682,16 @@ def latest_chat_bubble_is_outgoing(driver) -> bool:
     return False
 
 
+OPENCLAW_OUTGOING_REPLY_MARKERS = (
+    "thank you for your enquiry",
+    "unit price",
+    "lead time",
+    "robomatics",
+    "please find our quotation",
+    "quotation as follows",
+)
+
+
 def mark_incoming_units_human_handled(contact_name: str, units, contact_hint: str = ""):
     """Record pending customer bubbles as handled when staff replied manually last."""
     data_ids = [
@@ -1694,18 +1710,60 @@ def mark_incoming_units_human_handled(contact_name: str, units, contact_hint: st
     )
 
 
+def outgoing_bubble_looks_like_openclaw_reply(driver) -> bool:
+    """True when the latest outgoing bubble matches a Robomatics/OpenClaw quotation reply."""
+    try:
+        text = driver.execute_script(
+            """
+const panel = document.querySelector('#main [data-testid="conversation-panel-messages"]')
+    || document.querySelector('#main [role="application"]')
+    || document.querySelector('#main');
+if (!panel) return '';
+const bubbles = panel.querySelectorAll('[data-testid="msg-container"]');
+for (let i = bubbles.length - 1; i >= 0; i--) {
+    const bubble = bubbles[i];
+    if (bubble.classList && bubble.classList.contains('message-out')) {
+        return (bubble.innerText || '').slice(0, 2500);
+    }
+}
+return '';
+"""
+        )
+        normalized = str(text or "").lower()
+        return any(marker in normalized for marker in OPENCLAW_OUTGOING_REPLY_MARKERS)
+    except Exception as exc:
+        print(f"⚠️ Could not read latest outgoing bubble text: {exc}")
+        return False
+
+
 def should_skip_chat_human_replied_last(driver, contact_name: str, units, contact_hint: str = "") -> bool:
     """
-    When the latest bubble is outgoing, staff (or the bot) already replied.
-    Do not process older incoming messages in the lookback window.
+    When the latest bubble is outgoing, skip only if there is nothing left to answer.
+
+    If the bot already quoted but another customer RFQ bubble is still unprocessed
+    (common when two text messages arrive back-to-back), keep processing.
     """
     if not latest_chat_bubble_is_outgoing(driver):
         return False
+
+    unprocessed = filter_processable_units(units, contact_name, contact_hint)
+    if unprocessed:
+        if outgoing_bubble_looks_like_openclaw_reply(driver):
+            print(
+                f"ℹ️ Bot reply is latest but {len(unprocessed)} unprocessed customer message(s) "
+                "remain — continuing."
+            )
+            return False
+        print(
+            "ℹ️ Latest bubble is a manual staff reply with pending customer message(s) — "
+            "marking them handled (bot will not respond)."
+        )
+        mark_incoming_units_human_handled(contact_name, unprocessed, contact_hint=contact_hint)
+        return True
+
     print(
-        "ℹ️ Latest chat bubble is outgoing (manual reply from your phone or bot message). "
-        "OpenClaw ignores it and will NOT send another reply."
+        "ℹ️ Latest chat bubble is outgoing and no unprocessed customer messages remain — skipping."
     )
-    mark_incoming_units_human_handled(contact_name, units, contact_hint=contact_hint)
     return True
 
 
@@ -2869,15 +2927,6 @@ def bubble_contains_document(bubble):
         return False
 
 
-def is_trivial_ack(text):
-    compact = re.sub(r"[^a-zA-Z]", "", str(text or "")).upper()
-    return compact in {
-        "YA", "YAA", "YUP", "YES", "SURE", "OK", "OKAY", "K", "KK", "NOTED", "THANKS",
-        "THX", "TY", "GOOD", "FINE", "ALRIGHT", "SAME", "YEP", "YEAH", "ROGER", "COPY",
-        "GOTIT", "RECEIVED",
-    }
-
-
 def get_latest_incoming_bubble(driver):
     if not wait_for_chat_messages(driver, timeout=10):
         return None
@@ -3020,35 +3069,6 @@ def is_quote_without_part_number(text):
     return len(text_u) < 80
 
 
-def text_has_explicit_part_number(text) -> bool:
-    """
-    True when a text bubble names a part number (standalone RFQ — do not pair with an older image).
-    E.g. 'Quote me 2 pcs of SMC C96SDB40-50C'
-    """
-    text_u = str(text or "").upper().strip()
-    if not text_u:
-        return False
-
-    brand_part = re.search(
-        r"\b(SMC|OMRON|BURKERT|BÜRKERT|FESTO|SICK|IFM|PANASONIC|KEYENCE|LEGRIS|PISCO|"
-        r"PARKER|ABB|SIEMENS|THK|LOCTITE)\b",
-        text_u,
-    )
-    if brand_part:
-        if re.search(r"[A-Z]{1,4}[-]?\d{2,}[A-Z0-9\-/]*", text_u):
-            return True
-        if re.search(r"\b[A-Z]\d{2}[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b", text_u):
-            return True
-
-    if re.search(r"\b[A-Z]\d{2}[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b", text_u):
-        return True
-    if re.search(r"\b[A-Z]{2,}\d{3,}[A-Z0-9#\-/]+\b", text_u):
-        return True
-    if re.search(r"\b\d{1,2}[-][A-Z]{2,}\d{2,}[A-Z0-9\-]*\b", text_u):
-        return True
-    return False
-
-
 def drop_stale_images_before_text_rfq(units):
     """When a newer text RFQ names a part number, ignore older image bubbles in the lookback."""
     if not units:
@@ -3093,7 +3113,7 @@ def stale_image_data_ids(all_units, plan) -> list[str]:
     """Image message ids skipped because a newer standalone text RFQ was processed."""
     if not plan or plan[-1].get("kind") != "text":
         return []
-    if not text_has_explicit_part_number(plan[-1].get("text")):
+    if not is_standalone_text_rfq(plan[-1].get("text")):
         return []
     plan_ids = {id(u) for u in plan}
     ids = []
@@ -3403,9 +3423,16 @@ def plan_sequential_units(units, contact_name: str = "", contact_hint: str = "")
         print("📨 Sequential plan: image message (caption may be attached)")
         return [newest]
 
-    if newest["kind"] == "text" and text_has_explicit_part_number(newest.get("text")):
-        print("📨 Sequential plan: standalone text RFQ (explicit part number — no image pairing)")
-        return [newest]
+    trailing_rfqs = collect_trailing_text_rfqs(working)
+    if trailing_rfqs:
+        if len(trailing_rfqs) == 1:
+            print("📨 Sequential plan: standalone text RFQ (explicit part number — no image pairing)")
+        else:
+            print(
+                f"📨 Sequential plan: {len(trailing_rfqs)} standalone text RFQs "
+                "(back-to-back — process together)"
+            )
+        return trailing_rfqs
 
     if newest["kind"] == "text" and prev and prev["kind"] == "image":
         if is_quote_without_part_number(newest.get("text")) or is_support_without_part_number(
@@ -3456,6 +3483,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
     copilot_items = []
     document_items = []
     latest_message = ""
+    text_rfq_parts = []
     image_path = None
     image_analysis = None
     media_info = None
@@ -3593,6 +3621,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             if is_trivial_ack(unit_text) and (copilot_items or image_path or document_items):
                 print(f"   📝 Text step: skipping ack {unit_text!r} — keeping photo/document extraction")
                 continue
+            normalized_text = normalize_unit_text(unit_text)
+            if normalized_text:
+                text_rfq_parts.append(normalized_text)
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
             print("   📝 Text step: caption saved — unified analyze at end of plan")
@@ -3622,6 +3653,15 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             plan[-1]["container"] if plan else None,
             caption_text=latest_message,
         )
+
+    if (
+        len(text_rfq_parts) > 1
+        and not image_path
+        and not processed_voice
+        and not document_items
+    ):
+        latest_message = "\n\n".join(text_rfq_parts)
+        print(f"   📝 Combined {len(text_rfq_parts)} text RFQ message(s) for unified analyze")
 
     if processed_voice or enrichment.get("voice_path") or enrichment.get("transcript"):
         media_info.media_type = "voice"
