@@ -30,6 +30,26 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
 BASE_DIR = os.getenv("OPENCLAW_BASE_DIR", "/Users/evon/OpenClaw")
+
+
+def _load_env() -> None:
+    """Load .env from OpenClaw install dir (scripts do not inherit shell exports)."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    for candidate in (
+        os.path.join(BASE_DIR, ".env"),
+        os.path.expanduser("~/OpenClaw/.env"),
+        os.path.expanduser("~/openclaw/.env"),
+    ):
+        if os.path.isfile(candidate):
+            load_dotenv(candidate, override=False)
+
+
+_load_env()
+BASE_DIR = os.getenv("OPENCLAW_BASE_DIR", BASE_DIR)
+
 DEFAULT_BASE_URL = "https://my.smccorporation.co:8001"
 DEFAULT_HOME_URL = f"{DEFAULT_BASE_URL}/Home"
 DEFAULT_LOGIN_URL = f"{DEFAULT_BASE_URL}/Account/Index?ReturnUrl=%2fHome"
@@ -155,6 +175,7 @@ def portal_item_enquiry_url() -> str:
 
 def portal_credentials() -> tuple[str, str]:
     """Read dealer credentials from env (never log the password)."""
+    _load_env()
     user = (
         os.getenv("SMC_PORTAL_USERNAME")
         or os.getenv("SMC_PORTAL_USER_ID")
@@ -445,16 +466,99 @@ def _find_first(driver, selectors: list[str]):
     return None
 
 
+def _wait_for_page(driver, timeout: float = 20) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            ready = driver.execute_script("return document.readyState")
+            body_len = len((driver.find_element(By.TAG_NAME, "body").text or "").strip())
+            if ready == "complete" and body_len > 20:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _on_dealer_login_page(driver) -> bool:
+    url = str(driver.current_url or "").lower()
+    if "/account/login" in url:
+        return True
+    return _input_by_label(driver, "User Id") is not None or _input_by_label(driver, "User ID") is not None
+
+
+def _click_element_by_text(driver, text: str) -> bool:
+    """Click link/button whose visible text contains `text` (JS — works when Selenium click fails)."""
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                const needle = String(arguments[0] || '').toLowerCase();
+                const nodes = document.querySelectorAll(
+                    'a, button, input[type=submit], input[type=button], [role=link]'
+                );
+                for (const el of nodes) {
+                    const label = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+                    if (!label.includes(needle)) continue;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return true;
+                }
+                return false;
+                """,
+                text,
+            )
+        )
+    except Exception:
+        return False
+
+
 def _click_link_by_text(driver, text: str) -> bool:
+    if _click_element_by_text(driver, text):
+        return True
     xpath = f"//a[contains(normalize-space(.), {json.dumps(text)})]"
     try:
         for el in driver.find_elements(By.XPATH, xpath):
             if el.is_displayed():
-                el.click()
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                driver.execute_script("arguments[0].click();", el)
                 return True
     except Exception:
         pass
     return False
+
+
+def _go_to_dealer_login_page(driver) -> bool:
+    """Land on the Dealer Login form — direct URL first, then click from landing page."""
+    print("🌐 [SMC] Navigating to Dealer Login...")
+    driver.get(portal_dealer_login_url())
+    _wait_for_page(driver, timeout=15)
+    time.sleep(1)
+    if _on_dealer_login_page(driver):
+        print(f"✅ [SMC] Dealer Login page ready: {driver.current_url}")
+        return True
+
+    print("🔄 [SMC] Direct URL missed — trying landing page link click...")
+    driver.get(portal_login_url())
+    _wait_for_page(driver, timeout=15)
+    time.sleep(1)
+
+    for label in ("SMC Dealer Login", "Dealer Login", "Dealer's Login"):
+        print(f"   🖱️ [SMC] Clicking {label!r}...")
+        if _click_link_by_text(driver, label):
+            time.sleep(2)
+            if _on_dealer_login_page(driver):
+                print(f"✅ [SMC] Dealer Login page ready: {driver.current_url}")
+                return True
+
+    driver.get(portal_dealer_login_url())
+    _wait_for_page(driver, timeout=15)
+    ok = _on_dealer_login_page(driver)
+    if ok:
+        print(f"✅ [SMC] Dealer Login page ready: {driver.current_url}")
+    else:
+        print(f"⚠️ [SMC] Still not on Dealer Login. URL={driver.current_url}")
+    return ok
 
 
 def _input_by_label(driver, label: str):
@@ -490,30 +594,25 @@ def _page_looks_logged_in(driver) -> bool:
 
 
 def _click_dealer_login(driver) -> bool:
-    if _click_link_by_text(driver, "SMC Dealer Login"):
-        time.sleep(1.5)
-        return True
-    driver.get(portal_dealer_login_url())
-    time.sleep(1.5)
-    return "/account/login" in str(driver.current_url or "").lower()
+    return _go_to_dealer_login_page(driver)
 
 
 def _dealer_login(driver, username: str, password: str) -> bool:
     if not username or not password:
         return False
 
-    url = str(driver.current_url or "").lower()
-    if "/account/login" not in url:
-        if not _click_dealer_login(driver):
-            driver.get(portal_dealer_login_url())
-            time.sleep(1.5)
+    if not _on_dealer_login_page(driver):
+        if not _go_to_dealer_login_page(driver):
+            return False
 
     user_el = _input_by_label(driver, "User Id") or _input_by_label(driver, "User ID")
     pass_el = _input_by_label(driver, "Password")
     if not user_el or not pass_el:
-        print("⚠️ [SMC] Dealer login fields not found.")
+        print("⚠️ [SMC] Dealer login fields not found on page.")
+        print(f"   URL: {driver.current_url}")
         return False
 
+    print(f"🔐 [SMC] Filling login for {username!r}...")
     user_el.clear()
     user_el.send_keys(username)
     pass_el.clear()
@@ -522,41 +621,57 @@ def _dealer_login(driver, username: str, password: str) -> bool:
     submit = _find_first(driver, [
         "//input[@value='Log in']",
         "//button[contains(.,'Log in')]",
+        "//input[contains(@value,'Log in')]",
         "input[type='submit']",
         "button[type='submit']",
     ])
     if submit:
-        submit.click()
+        driver.execute_script("arguments[0].click();", submit)
     else:
         pass_el.send_keys(Keys.RETURN)
-    time.sleep(2.5)
-    return _page_looks_logged_in(driver)
+    time.sleep(3)
+    if _page_looks_logged_in(driver):
+        print(f"✅ [SMC] Logged in — {driver.current_url}")
+        return True
+    print(f"⚠️ [SMC] Login submit done but session not detected. URL={driver.current_url}")
+    return False
 
 
 def ensure_portal_session(driver, force_reload: bool = False) -> bool:
     global _SESSION_READY
+    _load_env()
+
     if not force_reload and _SESSION_READY and _page_looks_logged_in(driver):
         return True
 
-    driver.get(portal_login_url())
-    time.sleep(2)
+    current = str(driver.current_url or "").lower()
+    if portal_base_url().lower() not in current:
+        print(f"🌐 [SMC] Opening portal: {portal_login_url()}")
+        driver.get(portal_login_url())
+        _wait_for_page(driver)
 
     if _page_looks_logged_in(driver):
         _SESSION_READY = True
+        print("✅ [SMC] Already logged in.")
         return True
 
-    username, password = portal_credentials()
-    if username and password:
-        print(f"🔐 [SMC] Dealer login as {username!r}...")
-        if _dealer_login(driver, username, password):
-            _SESSION_READY = True
-            print("✅ [SMC] Dealer login succeeded.")
-            return True
+    # Always open Dealer Login form before checking credentials
+    if not _on_dealer_login_page(driver):
+        _go_to_dealer_login_page(driver)
 
-    print(
-        "⚠️ [SMC] Not logged in. Set SMC_PORTAL_USERNAME + SMC_PORTAL_PASSWORD in .env "
-        "or run: uv run python scripts/smc_portal_login.py"
-    )
+    username, password = portal_credentials()
+    if not username or not password:
+        print(
+            "⚠️ [SMC] No credentials found in .env — set SMC_PORTAL_USERNAME + SMC_PORTAL_PASSWORD "
+            "(or USER_ID + PASSWORD). Dealer Login page is open for manual login."
+        )
+        return _page_looks_logged_in(driver)
+
+    if _dealer_login(driver, username, password):
+        _SESSION_READY = True
+        return True
+
+    print("⚠️ [SMC] Auto-login failed — complete login manually in Chrome.")
     return False
 
 

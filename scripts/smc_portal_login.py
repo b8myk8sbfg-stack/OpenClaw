@@ -11,6 +11,20 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+try:
+    from dotenv import load_dotenv
+
+    for _env in (
+        os.path.join(_REPO_ROOT, ".env"),
+        os.path.expanduser("~/OpenClaw/.env"),
+        os.path.expanduser("~/openclaw/.env"),
+    ):
+        if os.path.isfile(_env):
+            load_dotenv(_env)
+            break
+except ImportError:
+    pass
+
 from smc_portal_lookup import (  # noqa: E402
     SMC_CHROME_PROFILE,
     close_driver,
