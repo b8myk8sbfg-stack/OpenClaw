@@ -5,6 +5,7 @@ import json
 import datetime
 from dotenv import load_dotenv
 from O365 import Account
+from openclaw_email_config import get_primary_mailbox
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
@@ -190,7 +191,7 @@ def get_mailbox():
         print("❌ [ROUTER] Microsoft account authentication failed.")
         return None
 
-    return acc.mailbox(resource="evon@robomatics.sg")
+    return acc.mailbox(resource=get_primary_mailbox())
 
 
 def send_supplier_email(brand, items, ref, customer_name=None, customer_contact=None):

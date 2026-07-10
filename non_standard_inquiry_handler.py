@@ -5,6 +5,7 @@ import datetime
 import requests
 from dotenv import load_dotenv
 from O365 import Account
+from openclaw_email_config import get_primary_mailbox
 
 load_dotenv()
 
@@ -169,7 +170,7 @@ def get_mailbox():
         print("❌ [NON-STANDARD] Microsoft authentication failed.")
         return None
 
-    return acc.mailbox(resource="evon@robomatics.sg")
+    return acc.mailbox(resource=get_primary_mailbox())
 
 
 def build_technical_email_body(customer_name, customer_contact, channel, items, source_message, all_suggestions):
