@@ -1,0 +1,6 @@
+{
+  "customer_hint": "Robo",
+  "customer_code": "MYC0003071",
+  "item_enquiry_url": "https://my.smccorporation.co:8001/ItemEnquiry",
+  "notes": "Credentials go in .env only — never commit passwords to this file."
+}

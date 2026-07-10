@@ -14,12 +14,34 @@ from O365 import Account
 
 from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
-from inquiry_extraction_helper import extract_clean_items_from_text
-from openclaw_main import extract_rfq_with_copilot
+from openclaw_inquiry_engine import MARKUP_DIVISOR
+from openclaw_busy import (
+    clear_busy,
+    clear_stale_busy,
+    flip_channel_turn,
+    get_channel_turn,
+    is_busy,
+    is_channel_turn,
+    set_busy,
+    throttled_log,
+    wait_until_idle,
+)
+from openclaw_email_config import (
+    email_replies_go_to_monitor,
+    get_email_monitor_recipients,
+    get_email_reply_mode,
+    get_monitored_mailboxes,
+    get_primary_mailbox,
+)
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
+from email_inquiry_handler import (
+    build_supplier_reply_monitor_html,
+    process_unified_email_inquiry,
+    send_email_monitor_preview,
+)
 
-VERSION = "v1.14-EMAIL-FIFO-ONE"
+VERSION = "v1.17-EMAIL-UNIFIED-MONITOR-MODE"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -801,7 +823,7 @@ def process_supplier_replies(mailbox):
 
                     if cost_val:
                         try:
-                            sell_price = float(str(cost_val).replace(',', '')) / 0.8
+                            sell_price = float(str(cost_val).replace(',', '')) / MARKUP_DIVISOR
 
                             formatted_rows.append({
                                 'desc': desc,
@@ -834,28 +856,45 @@ def process_supplier_replies(mailbox):
                     print(f"      ⚠️ No matching supplier row found. Marked as TBC.")
 
             if formatted_rows:
-                update_msg = mailbox.new_message()
-                update_msg.to.add(c_email)
-                update_msg.subject = f"Update: Quotation for Inquiry {ref_code}"
-                update_msg.body = (
-                    f"Hi {c_name},<br><br>"
-                    f"Please find the updated price and lead time for your inquiry:<br><br>"
-                    f"{build_email_table(formatted_rows, True)}<br><br>"
-                    f"{SIGNATURE}"
-                )
-                update_msg.body_type = 'html'
-                update_msg.send()
+                if email_replies_go_to_monitor():
+                    monitor_body = build_supplier_reply_monitor_html(
+                        customer_name=c_name,
+                        customer_email=c_email,
+                        ref_code=ref_code,
+                        subject=msg.subject or "",
+                        formatted_rows=formatted_rows,
+                    )
+                    monitor_msg = mailbox.new_message()
+                    for recipient in get_email_monitor_recipients():
+                        monitor_msg.to.add(recipient)
+                    monitor_msg.subject = f"[OpenClaw Monitor] Supplier reply {ref_code}"
+                    monitor_msg.body = monitor_body
+                    monitor_msg.body_type = "html"
+                    monitor_msg.send()
+                    print("📣 Supplier-reply monitor preview sent (customer NOT emailed)")
+                    print(f"   To: {', '.join(get_email_monitor_recipients())}")
+                else:
+                    update_msg = mailbox.new_message()
+                    update_msg.to.add(c_email)
+                    update_msg.subject = f"Update: Quotation for Inquiry {ref_code}"
+                    update_msg.body = (
+                        f"Hi {c_name},<br><br>"
+                        f"Please find the updated price and lead time for your inquiry:<br><br>"
+                        f"{build_email_table(formatted_rows, True)}<br><br>"
+                        f"{SIGNATURE}"
+                    )
+                    update_msg.body_type = 'html'
+                    update_msg.send()
+
+                    print(f"📧 Final Quotation Sent")
+                    print(f"   To: {c_email}")
+                    print(f"   Customer: {c_name}")
+                    print(f"   Ref: {ref_code}")
+                    print(f"   Subject: Update: Quotation for Inquiry {ref_code}")
+                    print(f"   Items Sent: {len(formatted_rows)}")
 
                 update_pending_status(ref_code, "CUSTOMER_UPDATED", replied_at=now_iso())
-
                 msg.mark_as_read()
-
-                print(f"📧 Final Quotation Sent")
-                print(f"   To: {c_email}")
-                print(f"   Customer: {c_name}")
-                print(f"   Ref: {ref_code}")
-                print(f"   Subject: Update: Quotation for Inquiry {ref_code}")
-                print(f"   Items Sent: {len(formatted_rows)}")
                 log_line()
                 handled_one = True
                 break
@@ -958,6 +997,218 @@ def load_warehouse_map():
 STOCK_DB = load_warehouse_map()
 
 
+
+
+def _plain_reply_to_html(text: str) -> str:
+    import html as html_module
+    return "<br>".join(html_module.escape(line) for line in str(text or "").splitlines())
+
+
+def handle_customer_inquiry_email(msg, mailbox, mailbox_addr: str) -> bool:
+    """
+    Process one customer inquiry email. Returns True when FIFO should stop (handled one).
+  """
+    sender_email = msg.sender.address.lower()
+    raw_body = msg.body if msg.body else ""
+    body_clean = clean_email_body(raw_body)
+
+    possible_ref = find_ref_code(f"{msg.subject} {body_clean}")
+    if possible_ref:
+        print("📬 Supplier/human reply ref detected during customer scan. Skipping new inquiry processing.")
+        print(f"   Ref: {possible_ref}")
+        print(f"   From: {msg.sender.address}")
+        print(f"   Subject: {msg.subject}")
+        msg.mark_as_read()
+        return False
+
+    attachment_paths = save_email_attachments(
+        msg, ref_prefix=re.sub(r"[^A-Za-z0-9._-]+", "_", msg.subject or "email")[:40]
+    )
+    document_items = []
+    if attachment_paths:
+        enriched = enrich_email_body_from_attachments(body_clean, attachment_paths)
+        body_clean = enriched.get("body") or body_clean
+        document_items = enriched.get("document_items") or []
+        print(f"📎 Enriched email body from {len(attachment_paths)} attachment(s).")
+
+    email_class = classify_email(msg.sender.address, msg.subject or "", body_clean)
+    log_email_classification(msg.sender.address, msg.subject or "", body_clean, email_class)
+
+    print("")
+    print("-" * 90)
+    print("🏷️ EMAIL CLASSIFICATION (after attachment enrichment)")
+    print(email_class.summary())
+    print("-" * 90)
+
+    if email_class.should_skip:
+        print(f"🚫 Email skipped ({email_class.intent}). Marking as read.")
+        print(f"   From: {msg.sender.address}")
+        print(f"   Subject: {msg.subject}")
+        print(f"   Reason: {email_class.reasoning}")
+        msg.mark_as_read()
+        log_email_classification(
+            msg.sender.address, msg.subject or "", body_clean, email_class,
+            status=f"SKIPPED_{email_class.intent.upper()}",
+        )
+        return False
+
+    internal_sender = "robomatics.sg" in sender_email
+    reply_email = "RE:" in (msg.subject or "").upper()
+    inquiry_like = is_inquiry_like(msg.subject, body_clean)
+
+    if internal_sender and not reply_email and not inquiry_like:
+        print("ℹ️ Internal non-inquiry email skipped and marked as read.")
+        print(f"   From: {msg.sender.address}")
+        print(f"   Subject: {msg.subject}")
+        msg.mark_as_read()
+        return False
+
+    if internal_sender and inquiry_like:
+        print("📩 Internal inquiry-like email detected. Processing instead of skipping.")
+        print(f"   From: {msg.sender.address}")
+        print(f"   Subject: {msg.subject}")
+
+    print("")
+    log_line()
+    print("📩 New Inquiry Detected")
+    print(f"   Mailbox: {mailbox_addr}")
+    print(f"   From: {msg.sender.address}")
+    print(f"   Sender Name: {msg.sender.name}")
+    print(f"   Subject: {msg.subject}")
+
+    c_name = msg.sender.name if msg.sender.name else "Customer"
+    c_email = msg.sender.address
+
+    result = process_unified_email_inquiry(
+        subject=msg.subject or "",
+        body_clean=body_clean,
+        attachment_paths=attachment_paths,
+        document_items=document_items,
+    )
+
+    if not result.has_items and not result.formatted_rows and not result.voltage_selections:
+        print("ℹ️ No parts detected in this email. No reply sent.")
+        log_line()
+        return False
+
+    if email_replies_go_to_monitor():
+        print(
+            f"🧪 Email monitor mode ({get_email_reply_mode()}). "
+            f"Customer NOT emailed — preview to {', '.join(get_email_monitor_recipients())}."
+        )
+        send_email_monitor_preview(
+            mailbox,
+            customer_name=c_name,
+            customer_email=c_email,
+            mailbox_addr=mailbox_addr,
+            subject=msg.subject or "(no subject)",
+            classification_summary=email_class.summary(),
+            result=result,
+            attachment_names=[os.path.basename(p) for p in attachment_paths],
+        )
+        msg.mark_as_read()
+        log_line()
+        print("✅ Monitor preview sent — FIFO pause before next email check")
+        return True
+
+    # ── Production: send customer reply + supplier RFQ + OBM ──
+    formatted_initial_rows = list(result.formatted_rows)
+    tbc_by_brand = dict(result.tbc_by_brand)
+    non_standard_items = list(result.skipped or [])
+
+    if formatted_initial_rows or result.voltage_selections:
+        cr = msg.reply()
+        if result.voltage_selections or not formatted_initial_rows:
+            cr.body = (
+                f"Hi {c_name},<br><br>"
+                f"{_plain_reply_to_html(result.customer_reply)}<br><br>"
+                f"{SIGNATURE}"
+            )
+        else:
+            cr.body = (
+                f"Hi {c_name},<br><br>"
+                f"Thank you for your inquiry. Here is the initial status of your items:"
+                f"<br><br>{build_email_table(formatted_initial_rows, True)}"
+                f"<br><br>{SIGNATURE}"
+            )
+        cr.body_type = "html"
+        cr.send()
+        msg.mark_as_read()
+
+        print("✅ Initial Reply Sent")
+        print(f"   To: {c_email}")
+        print(f"   Customer: {c_name}")
+        print(f"   Original Subject: {msg.subject}")
+
+        if non_standard_items:
+            try:
+                handle_non_standard_items(
+                    customer_name=c_name,
+                    customer_contact=c_email,
+                    channel="EMAIL",
+                    items=non_standard_items,
+                    source_message=body_clean,
+                )
+            except Exception as exc:
+                print(f"❌ Non-standard routing failed: {exc}")
+
+        try:
+            create_obm_quotation_from_inquiry(
+                email_body=body_clean,
+                items=formatted_initial_rows,
+                customer_name=c_name,
+                customer_email=c_email,
+                source_subject=msg.subject,
+                mailbox=mailbox,
+            )
+        except Exception as exc:
+            print(f"❌ OBM quotation integration error: {exc}")
+
+        for brd, items in tbc_by_brand.items():
+            brd = str(brd or "UNKNOWN").strip().upper()
+            ref = f"REQ-{datetime.datetime.now().strftime('%Y%m%d')}-{brd}-{gen_unique_id()}"
+            item_log = "; ".join([f"{i['desc']}|{i['qty']}" for i in items])
+
+            file_exists = os.path.exists(PENDING_CSV)
+            with open(PENDING_CSV, "a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=PENDING_FIELDS)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow({
+                    "ref": ref,
+                    "name": c_name,
+                    "email": c_email,
+                    "brand": brd,
+                    "items": item_log,
+                    "created_at": now_iso(),
+                    "supplier_status": "PENDING",
+                    "supplier_replied_at": "",
+                    "last_checked_at": now_iso(),
+                    "manager_alerted_at": "",
+                })
+
+            supplier_email = get_routing_email(brd)
+            sm = mailbox.new_message()
+            sm.to.add(supplier_email)
+            sm.subject = f"[{brd}] Inquiry / Manual Verification - Ref: {ref}"
+            rfq_table = build_email_table(items, is_rfq=True)
+            sm.body = (
+                f"Hi,<br><br>"
+                f"Please quote / verify Price and Lead Time for the following items:"
+                f"<br><br>"
+                f"[TABLE_START]{rfq_table}[TABLE_END]"
+                f"<br><br>"
+                f"Ref: {ref}<br><br>"
+                f"{SIGNATURE}"
+            )
+            sm.body_type = "html"
+            sm.send()
+            print(f"📧 RFQ / Manual Verification Sent | To: {supplier_email} | Ref: {ref}")
+
+    log_line()
+    print("✅ Customer inquiry fully processed — FIFO pause before next email check")
+    return True
+
 def process_latest_inquiry():
     acc = Account(
         (os.getenv('MICROSOFT_CLIENT_ID'), os.getenv('MICROSOFT_CLIENT_SECRET')),
@@ -969,624 +1220,36 @@ def process_latest_inquiry():
         print("❌ Microsoft account authentication failed.")
         return
 
-    mailbox = acc.mailbox(resource='evon@robomatics.sg')
+    monitored_mailboxes = get_monitored_mailboxes()
+    print(f"📬 Monitored mailboxes: {', '.join(monitored_mailboxes)}")
 
-    process_supplier_replies(mailbox)
-    alert_manager_for_overdue_pending(mailbox)
+    for mailbox_addr in monitored_mailboxes:
+        process_supplier_replies(acc.mailbox(resource=mailbox_addr))
 
-    try:
-        print("📥 Checking unread customer inquiry emails (FIFO — one email per cycle)...")
+    alert_manager_for_overdue_pending(acc.mailbox(resource=get_primary_mailbox()))
 
-        messages = list(mailbox.get_messages(limit=5, query='isRead eq false'))
+    processed_one = False
+    for mailbox_addr in monitored_mailboxes:
+        if processed_one:
+            break
 
-        for msg in messages:
-            sender_email = msg.sender.address.lower()
-            raw_body = msg.body if msg.body else ""
-            body_clean = clean_email_body(raw_body)
-            body_upper = body_clean.upper()
+        mailbox = acc.mailbox(resource=mailbox_addr)
 
-            email_class = classify_email(msg.sender.address, msg.subject or "", body_clean)
-            log_email_classification(msg.sender.address, msg.subject or "", body_clean, email_class)
-
-            print("")
-            print("-" * 90)
-            print("🏷️ EMAIL CLASSIFICATION")
-            print(email_class.summary())
-            print("-" * 90)
-
-            if email_class.should_skip:
-                print(f"🚫 Email skipped ({email_class.intent}). Marking as read.")
-                print(f"   From: {msg.sender.address}")
-                print(f"   Subject: {msg.subject}")
-                print(f"   Reason: {email_class.reasoning}")
-                msg.mark_as_read()
-                log_email_classification(
-                    msg.sender.address, msg.subject or "", body_clean, email_class,
-                    status=f"SKIPPED_{email_class.intent.upper()}",
-                )
-                continue
-
-            # Any unread email containing REQ ref is supplier/human reply only.
-            # process_supplier_replies() runs before this customer-inquiry loop.
-            # If still here, do NOT treat it as a new inquiry.
-            possible_ref = find_ref_code(f"{msg.subject} {body_clean}")
-            if possible_ref:
-                print("📬 Supplier/human reply ref detected during customer scan. Skipping new inquiry processing.")
-                print(f"   Ref: {possible_ref}")
-                print(f"   From: {msg.sender.address}")
-                print(f"   Subject: {msg.subject}")
-                msg.mark_as_read()
-                continue
-
-            internal_sender = "robomatics.sg" in sender_email
-            reply_email = "RE:" in msg.subject.upper()
-            inquiry_like = is_inquiry_like(msg.subject, body_clean)
-
-            if internal_sender and not reply_email and not inquiry_like:
-                print("ℹ️ Internal non-inquiry email skipped and marked as read.")
-                print(f"   From: {msg.sender.address}")
-                print(f"   Subject: {msg.subject}")
-                msg.mark_as_read()
-                continue
-
-            if internal_sender and inquiry_like:
-                print("📩 Internal inquiry-like email detected. Processing instead of skipping.")
-                print(f"   From: {msg.sender.address}")
-                print(f"   Subject: {msg.subject}")
-
-            print("")
-            log_line()
-            print(f"📩 New Inquiry Detected")
-            print(f"   From: {msg.sender.address}")
-            print(f"   Sender Name: {msg.sender.name}")
-            print(f"   Subject: {msg.subject}")
-
-            attachment_paths = save_email_attachments(
-                msg, ref_prefix=re.sub(r"[^A-Za-z0-9._-]+", "_", msg.subject or "email")[:40]
-            )
-            if attachment_paths:
-                enriched = enrich_email_body_from_attachments(body_clean, attachment_paths)
-                body_clean = enriched.get("body") or body_clean
-                body_upper = body_clean.upper()
-                print(f"📎 Enriched email body from {len(attachment_paths)} attachment(s).")
-
-            c_name = msg.sender.name if msg.sender.name else "Customer"
-            c_email = msg.sender.address
-
-            print(f"--- DEBUG RAW BODY START ---")
-            print(body_clean)
-            print(f"--- DEBUG RAW BODY END ---")
-            print(f"📊 Database Pattern Count: {len(STOCK_DB)}")
-
-            # =========================================================
-            # CLEAN EXTRACTION HELPER FIRST
-            # Handles messy customer wording such as:
-            # - Omron H3Y-4-C 110VAC 10sec timer – Qty ; 2 Unit
-            # - Omron MY4N-GS/MY4N-GS-R 110VAC Relay – Qty : 4 Unit
-            # =========================================================
-            quote_items = []
-            missing_layer2_items = []
-            has_partial = False
-            detected_parts_norm = set()
-
-            clean_items = []
-
-            try:
-                clean_items = extract_clean_items_from_text(body_clean)
-            except Exception as e:
-                print(f"⚠️ Clean extractor failed, falling back to AutoClaw original extraction: {e}")
-                clean_items = []
-
-            if clean_items:
-                print(f"🧠 Clean extractor returned {len(clean_items)} item(s). Using clean extraction path.")
-
-                for ci in clean_items:
-                    brand = ci.get("brand") or "UNKNOWN"
-                    part_no = ci.get("part_no") or ci.get("search_text") or ""
-                    qty = int(ci.get("qty") or 1)
-
-                    if ci.get("matched") and ci.get("matched_stock_id"):
-                        api_pid = ci.get("matched_stock_id")
-
-                        quote_items.append({
-                            "data": {
-                                "api_pid": api_pid,
-                                "regex": "",
-                                "len": len(api_pid),
-                                "is_partial": False,
-                                "norm": normalize_part(api_pid),
-                            },
-                            "qty": qty,
-                            "matched_text": ci.get("matched_stock_name") or part_no,
-                            "extractor_source": ci.get("source"),
-                            "extractor_confidence": ci.get("confidence"),
-                        })
-
-                        detected_parts_norm.add(normalize_part(api_pid))
-                        detected_parts_norm.add(normalize_part(part_no))
-
-                        print(
-                            f"   ✅ Clean extracted match | "
-                            f"Brand: {brand} | Part: {part_no} | "
-                            f"Stock ID: {api_pid} | Qty: {qty} | "
-                            f"Confidence: {ci.get('confidence')}"
-                        )
-
-                    else:
-                        missing_layer2_items.append({
-                            "brand": brand,
-                            "part_no": part_no,
-                            "qty": qty,
-                            "norm": normalize_part(part_no),
-                            "source": ci.get("source") or "CLEAN_EXTRACTOR_NOT_FOUND",
-                        })
-
-                        print(
-                            f"   🧩 Clean extracted non-standard item | "
-                            f"Brand: {brand} | Part: {part_no} | Qty: {qty}"
-                        )
-
-            else:
-                print("ℹ️ Clean extractor found no item. Using AutoClaw original extraction path.")
-
-                matches = []
-
-                for item in STOCK_DB:
-                    for m in re.finditer(item['regex'], body_upper):
-                        matches.append({
-                            "start": m.start(1),
-                            "end": m.end(1),
-                            "matched_text": m.group(1),
-                            "item": item
-                        })
-
-                matches.sort(key=lambda x: x['start'])
-
-                final_list = []
-                last_end = -1
-                has_partial = False
-
-                for m in matches:
-                    if m['start'] >= last_end:
-                        final_list.append(m)
-                        last_end = m['end']
-
-                        if m['item']['is_partial']:
-                            has_partial = True
-
-                        print(
-                            f"   🔎 Layer 1 Stock Match Found | "
-                            f"API PID: {m['item']['api_pid']} | "
-                            f"Matched Text: {m['matched_text']} | "
-                            f"{'Partial' if m['item']['is_partial'] else 'Exact/Normal'}"
-                        )
-
-                detected_parts_norm = set()
-
-                for m in final_list:
-                    detected_parts_norm.add(normalize_part(m['item']['api_pid']))
-                    detected_parts_norm.add(normalize_part(m['matched_text']))
-
-                    q_match = re.search(
-                        r'(?:QTY|QUANTITY)\s*:?\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|NOS)?',
-                        body_upper[m['end']: m['end'] + 80]
-                    )
-
-                    qty = int(q_match.group(1)) if q_match else 1
-
-                    quote_items.append({
-                        "data": m['item'],
-                        "qty": qty,
-                        "matched_text": m.get("matched_text", "")
-                    })
-
-                    print(f"      Qty Detected: {qty}")
-
-                structured_items = extract_structured_rfq_items(body_upper)
-
-                if structured_items:
-                    print(f"🧩 Layer 2 Structured RFQ Extraction Found: {len(structured_items)} item(s)")
-
-                if structured_items:
-                    structured_norms = {x["norm"] for x in structured_items}
-                    filtered_quote_items = []
-
-                    for qi in quote_items:
-                        qi_api_norm = normalize_part(qi.get("data", {}).get("api_pid", ""))
-                        qi_match_norm = normalize_part(qi.get("matched_text", ""))
-
-                        if qi_api_norm in structured_norms or qi_match_norm in structured_norms:
-                            filtered_quote_items.append(qi)
-                        else:
-                            print(
-                                f"   ⚠️ Ignoring broad Layer 1 match because explicit P/N/Model was detected | "
-                                f"API PID: {qi.get('data', {}).get('api_pid', '')} | "
-                                f"Matched Text: {qi.get('matched_text', '')}"
-                            )
-
-                    quote_items = filtered_quote_items
-
-                for rfq in structured_items:
-                    if rfq["norm"] not in detected_parts_norm:
-                        print(
-                            f"   🆕 Layer 2 Missing Part Detected | "
-                            f"Brand: {rfq['brand']} | "
-                            f"Part No: {rfq['part_no']} | "
-                            f"Qty: {rfq['qty']} | "
-                            f"Source: {rfq['source']}"
-                        )
-
-                        if rfq["brand"] == "UNKNOWN":
-                            print("      ⚠️ Customer did not specify brand. Routing will use DEFAULT.")
-
-                        missing_layer2_items.append(rfq)
-
-            # Copilot is an additional extraction layer. It fills gaps left by the
-            # deterministic extractors without replacing their trusted results.
-            copilot_items = extract_rfq_with_copilot(body_clean)
-            if copilot_items:
-                print(f"🤖 Copilot RFQ extraction found {len(copilot_items)} item(s).")
-
-            known_norms = set(detected_parts_norm)
-            known_norms.update(
-                normalize_part(item.get("part_no", ""))
-                for item in missing_layer2_items
+        try:
+            print(
+                f"📥 Checking unread customer inquiry emails in {mailbox_addr} "
+                "(FIFO — one email per cycle)..."
             )
 
-            for copilot_item in copilot_items:
-                part_no = copilot_item["part_no"]
-                qty = copilot_item["qty"]
-                part_norm = normalize_part(part_no)
-                if not part_norm or part_norm in known_norms:
-                    continue
-
-                stock_match = next(
-                    (
-                        stock_item for stock_item in STOCK_DB
-                        if normalize_part(stock_item.get("api_pid", "")) == part_norm
-                    ),
-                    None,
-                )
-
-                if stock_match:
-                    quote_items.append({
-                        "data": stock_match,
-                        "qty": qty,
-                        "matched_text": part_no,
-                        "extractor_source": "COPILOT_LOCAL",
-                    })
-                    detected_parts_norm.add(part_norm)
-                    print(f"   ✅ Copilot stock match | Part: {part_no} | Qty: {qty}")
-                else:
-                    missing_layer2_items.append({
-                        "brand": "UNKNOWN",
-                        "part_no": part_no,
-                        "qty": qty,
-                        "norm": part_norm,
-                        "source": "COPILOT_LOCAL",
-                    })
-                    print(f"   🧩 Copilot non-standard item | Part: {part_no} | Qty: {qty}")
-                known_norms.add(part_norm)
-
-            if not quote_items and not missing_layer2_items:
-                print("ℹ️ No parts detected in this email. No reply sent.")
-                log_line()
-                continue
-
-            formatted_initial_rows = []
-            tbc_by_brand = {}
-            non_standard_items = []
-
-            auth = HTTPBasicAuth(
-                os.getenv('OBM_API_KEY'),
-                os.getenv('OBM_API_SECRET')
-            )
-
-            base = os.getenv('OBM_API_URL').rstrip('/')
-
-            for itm in quote_items:
-                api_id = itm['data']['api_pid']
-
-                try:
-                    print(f"⚙️ Checking OBM API for: {api_id}")
-
-                    obm = requests.get(
-                        f"{base}/GetProduct",
-                        auth=auth,
-                        params={"pid": api_id},
-                        verify=False
-                    ).json()
-
-                    p_res = requests.get(
-                        f"{base}/GetPurProductPrice",
-                        auth=auth,
-                        params={"pid": api_id},
-                        verify=False
-                    ).json()
-
-                    brand = str(obm.get('brand', 'UNKNOWN') or 'UNKNOWN').upper()
-                    pn = str(obm.get('product_name', '') or '').strip()
-                    model = str(obm.get('model', '') or '').strip()
-
-                    full_desc = f"{brand} {pn}".strip()
-
-                    if model and model.upper() not in pn.upper():
-                        full_desc += f" ({model})"
-
-                    try:
-                        cost = float(p_res.get('unit_price', {}).get('price') or 0)
-                    except Exception:
-                        cost = 0.0
-
-                    try:
-                        total_stock_qty = float(obm.get('stock_qty', 0) or 0)
-                    except Exception:
-                        total_stock_qty = 0.0
-
-                    store_qty = get_store_qty_from_product(obm)
-                    usable_store_qty = int(store_qty) if store_qty > 0 else 0
-                    requested_qty = int(itm['qty'])
-
-                    print(f"   API Product: {full_desc}")
-                    print(f"   Brand: {brand}")
-                    print(f"   Total Stock Qty from OBM: {total_stock_qty}")
-                    print(f"   STORE Qty Used by Bot: {usable_store_qty}")
-                    print(f"   Cost: RM {cost}")
-                    print(f"   Customer Qty: {requested_qty}")
-
-                    if usable_store_qty > 0 and cost > 0:
-                        quoted_qty = min(requested_qty, usable_store_qty)
-                        balance_qty = max(requested_qty - quoted_qty, 0)
-                        sell_price = cost / 0.8
-
-                        formatted_initial_rows.append({
-                            'desc': full_desc,
-                            'qty': quoted_qty,
-                            'price': f"{sell_price:,.2f}",
-                            'lt': "Ex-Stock (STORE)",
-                            'pid': api_id
-                        })
-
-                        print(f"   ✅ STORE stock available. Quoting Qty {quoted_qty}: RM {sell_price:,.2f}")
-
-                        if balance_qty > 0:
-                            balance_desc = f"{full_desc} (Balance Qty)"
-
-                            formatted_initial_rows.append({
-                                'desc': balance_desc,
-                                'qty': balance_qty,
-                                'price': "[TBC]",
-                                'lt': "[TBC]",
-                                'pid': api_id
-                            })
-
-                            append_supplier_rfq_item(
-                                tbc_by_brand=tbc_by_brand,
-                                brand=brand,
-                                desc=balance_desc,
-                                qty=balance_qty,
-                                pid=api_id
-                            )
-
-                            print(f"   ⚠️ Requested Qty exceeds STORE stock. Balance Qty {balance_qty} added to supplier RFQ.")
-
-                    else:
-                        formatted_initial_rows.append({
-                            'desc': full_desc,
-                            'qty': requested_qty,
-                            'price': "[TBC]",
-                            'lt': "[TBC]",
-                            'pid': api_id
-                        })
-
-                        append_supplier_rfq_item(
-                            tbc_by_brand=tbc_by_brand,
-                            brand=brand,
-                            desc=full_desc,
-                            qty=requested_qty,
-                            pid=api_id
-                        )
-
-                        print(f"   ⚠️ No usable STORE stock or no cost. Full quantity added to manual verification queue.")
-
-                except Exception as e:
-                    print(f"   ❌ API Failure for {api_id}: {e}")
-
-            for missing in missing_layer2_items:
-                brand = str(missing.get("brand") or "UNKNOWN").strip().upper()
-                part_no = missing["part_no"]
-
-                if brand == "UNKNOWN":
-                    desc = f"UNKNOWN BRAND {part_no}"
-                else:
-                    desc = f"{brand} {part_no}"
-
-                formatted_initial_rows.append({
-                    'desc': desc,
-                    'qty': missing['qty'],
-                    'price': "[TBC]",
-                    'lt': "[TBC]",
-                    'pid': part_no
-                })
-
-                # IMPORTANT RULE v1.11:
-                # - Known brand but exact stock not found -> send to supplier/manual RFQ.
-                # - Unknown brand -> technical non-standard sourcing.
-                # This prevents known-brand items from going to SerpAPI/support unnecessarily.
-                if brand != "UNKNOWN":
-                    if brand not in tbc_by_brand:
-                        tbc_by_brand[brand] = []
-
-                    tbc_by_brand[brand].append({
-                        "desc": desc,
-                        "qty": missing['qty']
-                    })
-
-                    print(f"   📡 Known-brand unmatched item routed to supplier RFQ.")
-                    print(f"      Brand: {brand}")
-                    print(f"      Description: {desc}")
-                    print(f"      Qty: {missing['qty']}")
-                else:
-                    non_standard_items.append({
-                        "brand": brand,
-                        "part_no": part_no,
-                        "qty": missing['qty'],
-                        "desc": desc,
-                        "reason": "Unknown brand / not found in warehouse"
-                    })
-
-                    print(f"   🧩 Unknown-brand item routed to technical verification.")
-                    print(f"      Brand: {brand}")
-                    print(f"      Description: {desc}")
-                    print(f"      Qty: {missing['qty']}")
-
-            if formatted_initial_rows:
-                remark = ""
-
-                if has_partial:
-                    remark += (
-                        "<br><span style='color:red;'>"
-                        "⚠️ Remark: Some items were partially matched. "
-                        "Please re-confirm specifications before purchase."
-                        "</span>"
-                    )
-
-                if missing_layer2_items:
-                    remark += (
-                        "<br><span style='color:red;'>"
-                        "⚠️ Remark: Some items were not found in system and have been sent "
-                        "for manual verification."
-                        "</span>"
-                    )
-
-                cr = msg.reply()
-
-                cr.body = (
-                    f"Hi {c_name},<br><br>"
-                    f"Thank you for your inquiry. Here is the initial status of your items:"
-                    f"<br><br>{build_email_table(formatted_initial_rows, True)}"
-                    f"{remark}<br><br>{SIGNATURE}"
-                )
-
-                cr.body_type = 'html'
-                cr.send()
-
-                msg.mark_as_read()
-
-                print(f"✅ Initial Reply Sent")
-                print(f"   To: {c_email}")
-                print(f"   Customer: {c_name}")
-                print(f"   Original Subject: {msg.subject}")
-                print(f"   Items in Initial Reply: {len(formatted_initial_rows)}")
-
-                if non_standard_items:
-                    try:
-                        print("")
-                        print("🧩 Routing non-standard items to technical team...")
-
-                        handle_non_standard_items(
-                            customer_name=c_name,
-                            customer_contact=c_email,
-                            channel="EMAIL",
-                            items=non_standard_items,
-                            source_message=body_clean
-                        )
-
-                        print("✅ Non-standard items routed successfully.")
-
-                    except Exception as e:
-                        print(f"❌ Non-standard routing failed: {e}")
-
-                try:
-                    quote_response = create_obm_quotation_from_inquiry(
-                        email_body=body_clean,
-                        items=formatted_initial_rows,
-                        customer_name=c_name,
-                        customer_email=c_email,
-                        source_subject=msg.subject,
-                        mailbox=mailbox
-                    )
-
-                    if quote_response:
-                        print("🧾 OBM quotation attempt completed.")
-                        print(f"   Quote No: {quote_response.get('quote_no', '')}")
-                        print(f"   API Status: {quote_response.get('api_status', '')}")
-                        print(f"   Error: {quote_response.get('error', '')}")
-                        print(f"   Message: {quote_response.get('error_msg', '')}")
-
-                except Exception as e:
-                    print(f"❌ OBM quotation integration error: {e}")
-
-                for brd, items in tbc_by_brand.items():
-                    brd = str(brd or "UNKNOWN").strip().upper()
-
-                    ref_brand = brd if brd else "UNKNOWN"
-                    ref = f"REQ-{datetime.datetime.now().strftime('%Y%m%d')}-{ref_brand}-{gen_unique_id()}"
-
-                    item_log = "; ".join([
-                        f"{i['desc']}|{i['qty']}" for i in items
-                    ])
-
-                    file_exists = os.path.exists(PENDING_CSV)
-
-                    with open(PENDING_CSV, 'a', newline='', encoding='utf-8') as f:
-                        writer = csv.DictWriter(f, fieldnames=PENDING_FIELDS)
-
-                        if not file_exists:
-                            writer.writeheader()
-
-                        writer.writerow({
-                            "ref": ref,
-                            "name": c_name,
-                            "email": c_email,
-                            "brand": brd,
-                            "items": item_log,
-                            "created_at": now_iso(),
-                            "supplier_status": "PENDING",
-                            "supplier_replied_at": "",
-                            "last_checked_at": now_iso(),
-                            "manager_alerted_at": ""
-                        })
-
-                    supplier_email = get_routing_email(brd)
-
-                    sm = mailbox.new_message()
-                    sm.to.add(supplier_email)
-
-                    sm.subject = f"[{brd}] Inquiry / Manual Verification - Ref: {ref}"
-
-                    rfq_table = build_email_table(items, is_rfq=True)
-
-                    sm.body = (
-                        f"Hi,<br><br>"
-                        f"Please quote / verify Price and Lead Time for the following items:"
-                        f"<br><br>"
-                        f"[TABLE_START]{rfq_table}[TABLE_END]"
-                        f"<br><br>"
-                        f"Ref: {ref}<br><br>"
-                        f"{SIGNATURE}"
-                    )
-
-                    sm.body_type = 'html'
-                    sm.send()
-
-                    print(f"📧 RFQ / Manual Verification Sent")
-                    print(f"   To: {supplier_email}")
-                    print(f"   Brand: {brd}")
-                    print(f"   Ref: {ref}")
-                    print(f"   Subject: [{brd}] Inquiry / Manual Verification - Ref: {ref}")
-                    print(f"   Customer: {c_name}")
-                    print(f"   Customer Email: {c_email}")
-                    print(f"   Items:")
-                    for i in items:
-                        print(f"      - {i['desc']} | Qty: {i['qty']}")
-
-                log_line()
-                print("✅ Customer inquiry fully processed — FIFO pause before next email check")
-                break
-
-    except Exception as e:
-        print(f"❌ Core Error: {e}")
+            messages = list(mailbox.get_messages(limit=5, query='isRead eq false'))
+
+            for msg in messages:
+                if handle_customer_inquiry_email(msg, mailbox, mailbox_addr):
+                    processed_one = True
+                    break
+
+        except Exception as e:
+            print(f"❌ Core Error ({mailbox_addr}): {e}")
 
 
 if __name__ == "__main__":
@@ -1595,18 +1258,40 @@ if __name__ == "__main__":
     print(f"📁 Pending CSV: {PENDING_CSV}")
     print(f"👨‍💼 Manager Email: {MANAGER_EMAIL}")
     print(f"🧪 Testing Routing Email: {TEST_ROUTING_EMAIL}")
+    print(f"📬 Monitored mailboxes: {', '.join(get_monitored_mailboxes())}")
+    print(f"📧 Email reply mode: {get_email_reply_mode()}")
+    print(f"📣 Email monitor recipients: {', '.join(get_email_monitor_recipients())}")
+    clear_stale_busy()
     log_line()
+
+    IDLE_POLL = float(os.getenv("OPENCLAW_IDLE_POLL_SECONDS", "2"))
 
     while True:
         try:
-            process_latest_inquiry()
+            if is_busy():
+                wait_until_idle(poll_seconds=IDLE_POLL, label="email-engine")
+                continue
+            if not is_channel_turn("email"):
+                throttled_log(
+                    "email-not-turn",
+                    f"⏸️ Not email turn (current={get_channel_turn()}) — waiting...",
+                )
+                time.sleep(IDLE_POLL)
+                continue
+
+            set_busy("email", "processing_inbox")
+            try:
+                process_latest_inquiry()
+            finally:
+                clear_busy()
+                flip_channel_turn()
 
         except requests.exceptions.ConnectionError:
-            print("🌐 Network issues detected. Retrying in 60 seconds...")
+            clear_busy()
+            print("🌐 Network issues detected. Retrying shortly...")
 
         except Exception as e:
+            clear_busy()
             print(f"⚠️ Unexpected error: {e}")
 
-        print("⏳ Sleeping 30 seconds before next check...")
-        log_line()
-        time.sleep(30)
+        time.sleep(IDLE_POLL)
