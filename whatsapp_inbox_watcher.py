@@ -24,7 +24,11 @@ from openclaw_inquiry_engine import (
 from channel_router import send_supplier_rfq
 from non_standard_inquiry_handler import handle_non_standard_items
 from image_inquiry_analyzer import analyze_inquiry_image
-from openclaw_main import extract_rfq_with_copilot, build_ai_research_summary
+from openclaw_main import (
+    build_ai_research_summary,
+    build_copilot_malfunction_alert,
+    unified_analyze,
+)
 from whatsapp_message_classifier import (
     INTENT_TYPES,
     build_classification_monitor_message,
@@ -40,7 +44,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.37-VOICE-DOWNLOAD-FIX"
+VERSION = "v3.38-COPILOT-OPENAI-FALLBACK"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -2913,6 +2917,64 @@ def plan_sequential_units(units, contact_name: str = ""):
     return [newest]
 
 
+def send_copilot_malfunction_alert(driver, alert_message):
+    """Notify the monitor chat when Copilot fails during unified_analyze."""
+    if not alert_message:
+        return False
+    print("")
+    print("=" * 90)
+    print("⚠️ COPILOT MALFUNCTION ALERT")
+    print(alert_message)
+    print("=" * 90)
+    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
+        print("❌ Could not open monitor chat for Copilot malfunction alert.")
+        return False
+    return send_reply_in_current_chat(driver, alert_message)
+
+
+def run_unified_analyze(
+    driver,
+    contact_name,
+    raw_text="",
+    image_path=None,
+    original_message="",
+    customer_reply="",
+):
+    """Run unified_analyze and alert the monitor when Copilot is unavailable."""
+    result = unified_analyze(raw_text, image_path=image_path)
+    if result.get("copilot_failed") and result.get("error"):
+        caption = customer_reply or ""
+        if result.get("fallback_used") and result.get("items"):
+            caption = (
+                f"{caption}\n\nNote: OpenAI fallback succeeded with "
+                f"{len(result['items'])} extracted part(s)."
+            ).strip()
+        elif result.get("fallback_used"):
+            caption = (
+                f"{caption}\n\nNote: OpenAI fallback was attempted but found no parts."
+            ).strip()
+        elif not os.getenv("OPENAI_API_KEY"):
+            caption = (
+                f"{caption}\n\nNote: OpenAI fallback skipped — OPENAI_API_KEY is not set."
+            ).strip()
+        send_copilot_malfunction_alert(
+            driver,
+            build_copilot_malfunction_alert(
+                operation="unified_analyze",
+                customer_name=contact_name,
+                error=result["error"],
+                caption=caption,
+                original_message=original_message or raw_text,
+            ),
+        )
+    elif result.get("fallback_used") and result.get("items"):
+        print(
+            f"   ✅ OpenAI fallback extracted {len(result['items'])} item(s) "
+            "after Copilot failure"
+        )
+    return result
+
+
 def process_units_sequentially(driver, contact_name, plan, customer_contact):
     """
     Read each WhatsApp bubble one-by-one. Returns merged inquiry payload
@@ -2973,12 +3035,20 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             image_path = capture_bubble_image(
                 driver, container, contact_name, message_data_id=message_data_id
             )
-            items = extract_rfq_with_copilot(caption, image_path=image_path)
+            analysis_result = run_unified_analyze(
+                driver,
+                contact_name,
+                caption,
+                image_path=image_path,
+                original_message=caption,
+            )
+            items = analysis_result.get("items") or []
             if items:
                 copilot_items = items
-                print(f"   👁️ Image step: Copilot extracted {len(items)} item(s)")
+                source = analysis_result.get("source") or "copilot"
+                print(f"   👁️ Image step: {source} extracted {len(items)} item(s)")
             elif image_path:
-                print("   ⚠️ Image step: photo captured but Copilot found no parts yet.")
+                print("   ⚠️ Image step: photo captured but extraction found no parts yet.")
 
         elif kind == "voice":
             processed_voice = True
@@ -3033,10 +3103,18 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
                 print("   ⚠️ Voice step: download/transcribe failed — will retry next cycle.")
             inquiry_for_extract = transcript or latest_message
             if not copilot_items and inquiry_for_extract:
-                items = extract_rfq_with_copilot(inquiry_for_extract, image_path=None)
+                analysis_result = run_unified_analyze(
+                    driver,
+                    contact_name,
+                    inquiry_for_extract,
+                    image_path=None,
+                    original_message=inquiry_for_extract,
+                )
+                items = analysis_result.get("items") or []
                 if items:
                     copilot_items = items
-                    print(f"   🎤 Voice step: Copilot extracted {len(items)} item(s) from transcript")
+                    source = analysis_result.get("source") or "copilot"
+                    print(f"   🎤 Voice step: {source} extracted {len(items)} item(s) from transcript")
                 else:
                     print("   🎤 Voice step: running inquiry engine on transcript text...")
 
@@ -3059,10 +3137,18 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             latest_message = unit_text
             media_info = detect_bubble_media(container, caption_text=unit_text)
             if not copilot_items and not document_items:
-                items = extract_rfq_with_copilot(unit_text, image_path=None)
+                analysis_result = run_unified_analyze(
+                    driver,
+                    contact_name,
+                    unit_text,
+                    image_path=None,
+                    original_message=unit_text,
+                )
+                items = analysis_result.get("items") or []
                 if items:
                     copilot_items = items
-                    print(f"   📝 Text step: Copilot extracted {len(items)} item(s)")
+                    source = analysis_result.get("source") or "copilot"
+                    print(f"   📝 Text step: {source} extracted {len(items)} item(s)")
             else:
                 print("   📝 Text step: caption/qty merged with prior image/document extraction.")
 
@@ -3834,12 +3920,33 @@ def process_customer_inquiry(
 
     if pre_extracted_copilot_items:
         copilot_items = pre_extracted_copilot_items
+        extraction_source = "copilot"
         print(f"🤖 Using {len(copilot_items)} item(s) from sequential extraction.")
     else:
-        copilot_items = extract_rfq_with_copilot(latest_message, image_path=image_path)
+        analysis_result = unified_analyze(latest_message, image_path=image_path)
+        copilot_items = analysis_result.get("items") or []
+        extraction_source = analysis_result.get("source") or "none"
+        if analysis_result.get("copilot_failed") and analysis_result.get("error"):
+            send_copilot_malfunction_alert(
+                driver,
+                build_copilot_malfunction_alert(
+                    operation="unified_analyze",
+                    customer_name=contact_name,
+                    error=analysis_result["error"],
+                    original_message=latest_message,
+                ),
+            )
 
     if copilot_items:
-        print(f"🤖 Copilot is primary: processing {len(copilot_items)} visually extracted item(s).")
+        source_label = "OPENAI_VISUAL" if extraction_source == "openai" and image_path else (
+            "OPENAI_TEXT" if extraction_source == "openai" else (
+                "COPILOT_VISUAL" if image_path else "COPILOT_TEXT"
+            )
+        )
+        print(
+            f"🤖 {extraction_source.title()} is primary: processing "
+            f"{len(copilot_items)} extracted item(s)."
+        )
         structured_items = []
         existing_norms = set()
         for item in copilot_items:
@@ -3853,10 +3960,10 @@ def process_customer_inquiry(
                 "desc": part_no,
                 "qty": int(item["qty"]),
                 "norm": part_norm,
-                "source": "COPILOT_VISUAL" if image_path else "COPILOT_TEXT",
+                "source": source_label,
             })
             existing_norms.add(part_norm)
-            print(f"   👁️ Copilot identified | Part: {part_no} | Qty: {item['qty']}")
+            print(f"   👁️ Extraction identified | Part: {part_no} | Qty: {item['qty']}")
 
         formatted_rows, tbc_by_brand, skipped = process_structured_items(structured_items)
         result = {
@@ -3933,10 +4040,10 @@ def process_customer_inquiry(
             )
         elif image_analysis:
             reply = (
-                "Hi, I analyzed your photo but could not match the parts in our system.\n\n"
-                "Please send a clearer label/nameplate photo, or type:\n"
-                "E3Z-T61 Qty:1\n"
-                "178902 Qty:2"
+                "Hi, thank you for your message.\n"
+                "I received your photo but could not read the product label clearly enough to quote accurately.\n"
+                "Please resend a closer photo of the nameplate/label, or type the exact part number and quantity, for example:\n"
+                "ABC-12345 Qty:2"
             )
         elif voice_enrichment and (
             voice_enrichment.get("transcript")
