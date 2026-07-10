@@ -387,6 +387,11 @@ OMRON link examples (E5CC-RX2ASM-800):
   GOOD product page: https://industrial.omron.eu/en/products/E5CC-RX2ASM-000
   BAD (too generic): https://www.omron.com/products/family/E5CC
 
+SMC link examples (C96SDB40-50C):
+  GOOD product page: https://www.smcworld.com/webcatalog/s3s/en-my/detail/?partNumber=C96SDB40-50C
+  GOOD series overview: https://www.smcworld.com/webcatalog/s3s/en-my/list/C96-C96SD-2-E
+  BAD (invalid search): https://www.smcworld.com/webcatalog/en-my/search/?q=C96SDB40-50C
+
 Keep technical_summary under 400 words. Plain text only — no markdown, no ** bold, no code fences.
 If you do not know a spec or URL with confidence, omit it — never invent datasheet links.
 
@@ -2481,6 +2486,7 @@ PART_PREFIX_BRANDS = (
     (("150-C", "1492-", "1734-", "1756-", "1769-"), "ALLEN BRADLEY"),
     (("LC1D", "LC1F", "GV2", "GV3"), "SCHNEIDER"),
     (("E3S", "E3X"), "OMRON"),
+    (("C96", "CQ2", "CDQ2", "CY1", "MXS", "MXQ", "SY", "VXZ", "AF"), "SMC"),
 )
 
 BRAND_CATALOG_DOMAINS = {
@@ -2678,6 +2684,40 @@ def _sanitize_product_research_text(text: str, part_no: str, brand: str = "UNKNO
     return cleaned
 
 
+def _smc_research_prompt_appendix(part_no: str) -> str:
+    """Official SMC catalogue URL hints for product research prompts."""
+    try:
+        from product_verification import guess_smc_series_list_slug, resolve_smc_official_links
+
+        official = resolve_smc_official_links(part_no)
+        product_page = str(official.get("product_page_url") or "").strip()
+        type_page = str(official.get("type_page_url") or "").strip()
+        list_slug = guess_smc_series_list_slug(part_no)
+    except Exception:
+        product_page = (
+            f"https://www.smcworld.com/webcatalog/s3s/en-my/detail/?partNumber={part_no}"
+        )
+        type_page = ""
+        list_slug = ""
+
+    lines = [
+        "\nSMC official catalogue (Malaysia en-my) — use these as starting points:",
+        f"- Product detail page: {product_page}",
+    ]
+    if type_page:
+        lines.append(f"- Series catalog list: {type_page}")
+    if list_slug:
+        lines.append(f"- Series list slug: {list_slug}")
+    lines.extend(
+        [
+            "- Also check smc.eu and smcmy.com.my for PDF datasheets linked from the detail page.",
+            "- NEVER use smcworld.com /search/?q= URLs — they are invalid for customer replies.",
+            "- Find the official PDF datasheet or state 'PDF available from product page'.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _product_research_prompt(part_no: str, brand: str = "UNKNOWN", article_number: str = "") -> str:
     brand_line = f" by {brand}" if brand and brand != "UNKNOWN" else ""
     inferred = _infer_brand_from_part_no(part_no)
@@ -2691,6 +2731,11 @@ def _product_research_prompt(part_no: str, brand: str = "UNKNOWN", article_numbe
         article_line = (
             f"\nArticle Number / Order Code (search this FIRST on the manufacturer site): {article_number}\n"
         )
+    smc_appendix = ""
+    brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
+    inferred_u = str(inferred or "").upper()
+    if brand_u == "SMC" or inferred_u == "SMC":
+        smc_appendix = _smc_research_prompt_appendix(part_no)
     return (
         f"Research the EXACT industrial automation catalog part.{article_line}"
         f"Type / part number: {part_no}{brand_line}.{brand_note}\n"
@@ -2704,7 +2749,8 @@ def _product_research_prompt(part_no: str, brand: str = "UNKNOWN", article_numbe
         "5. Return links ONLY when they match this exact item.\n"
         "6. Provide official product webpage and official PDF datasheet when available.\n"
         "7. State PDF status: Direct PDF | PDF available from product page | No PDF available.\n"
-        "8. Never use third-party websites unless the manufacturer has no official documentation.\n\n"
+        "8. Never use third-party websites unless the manufacturer has no official documentation.\n"
+        f"{smc_appendix}\n"
         "Write a technical summary for a sales quotation reply (plain text, WhatsApp-friendly).\n\n"
         "Include ONLY when accurate for THIS exact item:\n"
         "- One-sentence product overview (correct product category)\n"
@@ -2777,10 +2823,11 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN", article_num
         return ""
 
     print(f"[COPILOT RESEARCH] Looking up {part_no} ({brand})...")
+    is_smc = brand == "SMC" or _infer_brand_from_part_no(part_no) == "SMC"
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
         api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
-        timeout=45.0,
+        timeout=90.0 if is_smc else 45.0,
         max_retries=1,
     )
     prompt = _product_research_prompt(part_no, brand, article_number=article_number)
@@ -2894,6 +2941,24 @@ def _sanitize_item_catalog_url(url: str, part_no: str, brand: str) -> str:
     return url
 
 
+def _merge_research_catalog_into_item(item: dict, research_text: str, part_no: str, brand: str) -> None:
+    """Pull Product page / Datasheet lines from research text into item fields."""
+    if not isinstance(item, dict) or not str(research_text or "").strip():
+        return
+    for line in str(research_text).splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("datasheet:"):
+            url = _sanitize_item_catalog_url(stripped.split(":", 1)[1].strip(), part_no, brand)
+            if url and not str(item.get("datasheet_url") or "").strip():
+                item["datasheet_url"] = url
+        elif lower.startswith("product page:"):
+            url = _sanitize_item_catalog_url(stripped.split(":", 1)[1].strip(), part_no, brand)
+            if url and not str(item.get("product_page_url") or "").strip():
+                item["product_page_url"] = url
+                item["catalog_url"] = url
+
+
 def _format_catalog_links_for_item(item: dict, part_no: str, brand: str) -> list:
     """Build Datasheet / Product page lines for customer replies."""
     lines = []
@@ -2997,6 +3062,13 @@ def build_product_details_for_reply(
                     item["verification_confidence"] = value
                 else:
                     item[field] = value
+
+        if brand == "SMC" and not str(item.get("datasheet_url") or "").strip():
+            smc_research = research_part_for_quotation(part_no, brand)
+            _merge_research_catalog_into_item(item, smc_research, part_no, brand)
+            if str(item.get("pdf_status") or "").strip() in ("", "PDF available from product page"):
+                if str(item.get("datasheet_url") or "").strip():
+                    item["pdf_status"] = "Direct PDF"
 
         catalog_lines = format_verification_links_for_reply(item)
         if not catalog_lines:

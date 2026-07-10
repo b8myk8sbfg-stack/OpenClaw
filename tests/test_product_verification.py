@@ -1,6 +1,11 @@
 import unittest
 
-from product_verification import enrich_item_catalog_links, resolve_burkert_official_links
+from product_verification import (
+    enrich_item_catalog_links,
+    guess_smc_series_list_slug,
+    resolve_burkert_official_links,
+    resolve_smc_official_links,
+)
 
 
 class ProductVerificationTests(unittest.TestCase):
@@ -34,6 +39,27 @@ class ProductVerificationTests(unittest.TestCase):
         enrich_item_catalog_links(item, row)
         self.assertTrue(str(item.get("product_page_url") or "").startswith("https://www.burkert.com/en/item/"))
         self.assertIn("ds6519-standard-eu-en.pdf", str(item.get("datasheet_url") or ""))
+
+    def test_smc_official_detail_link(self):
+        links = resolve_smc_official_links("C96SDB40-50C")
+        self.assertEqual(
+            links["product_page_url"],
+            "https://www.smcworld.com/webcatalog/s3s/en-my/detail/?partNumber=C96SDB40-50C",
+        )
+        self.assertEqual(links["match_confidence"], "Exact Match")
+        self.assertNotIn("/search/?q=", links["product_page_url"])
+
+    def test_smc_series_list_slug(self):
+        self.assertEqual(guess_smc_series_list_slug("C96SDB40-50C"), "C96-C96SD-2-E")
+
+    def test_enrich_smc_item_sets_detail_url(self):
+        item = {"brand": "SMC", "part_no": "C96SDB40-50C", "technical_specs": ["Bore: 40mm"]}
+        enrich_item_catalog_links(item, {})
+        self.assertIn(
+            "/webcatalog/s3s/en-my/detail/?partNumber=C96SDB40-50C",
+            str(item.get("product_page_url") or ""),
+        )
+        self.assertIn("C96-C96SD-2-E", str(item.get("type_page_url") or ""))
 
 
 if __name__ == "__main__":
