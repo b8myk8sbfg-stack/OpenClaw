@@ -2486,7 +2486,7 @@ PART_PREFIX_BRANDS = (
     (("150-C", "1492-", "1734-", "1756-", "1769-"), "ALLEN BRADLEY"),
     (("LC1D", "LC1F", "GV2", "GV3"), "SCHNEIDER"),
     (("E3S", "E3X"), "OMRON"),
-    (("C96", "CQ2", "CDQ2", "CY1", "MXS", "MXQ", "SY", "VXZ", "AF"), "SMC"),
+    (("C96", "CQ2", "CDQ2", "CY1", "MXS", "MXQ", "SY", "VXZ", "AF", "ZFC", "ZS"), "SMC"),
 )
 
 BRAND_CATALOG_DOMAINS = {

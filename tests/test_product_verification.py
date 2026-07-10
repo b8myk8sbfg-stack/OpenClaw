@@ -61,6 +61,14 @@ class ProductVerificationTests(unittest.TestCase):
         )
         self.assertIn("C96-C96SD-2-E", str(item.get("type_page_url") or ""))
 
+    def test_enrich_infers_smc_brand_for_zfc_part(self):
+        item = {"brand": "", "part_no": "ZFC-EL-4", "technical_specs": ["Model: ZFC-EL-4"]}
+        enrich_item_catalog_links(item, {})
+        self.assertIn(
+            "/webcatalog/s3s/en-my/detail/?partNumber=ZFC-EL-4",
+            str(item.get("product_page_url") or ""),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

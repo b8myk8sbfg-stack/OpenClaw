@@ -676,49 +676,143 @@ def ensure_portal_session(driver, force_reload: bool = False) -> bool:
 
 
 def _select_customer(driver) -> bool:
+    if _customer_is_selected(driver):
+        print("ℹ️ [SMC] Customer already selected on Item Enquiry form.")
+        return True
+
     hint = customer_search_hint()
     match_code = customer_select_match()
+    hints_to_try: list[str] = []
+    for candidate in (hint, match_code, "ROBOMATICS", f"{match_code} | ROBOMATICS"):
+        candidate = str(candidate or "").strip()
+        if candidate and candidate not in hints_to_try:
+            hints_to_try.append(candidate)
 
     field = _input_by_label(driver, "Customer Code/Name")
     if not field:
         print("⚠️ [SMC] Customer Code/Name field not found.")
         return False
 
+    for try_hint in hints_to_try:
+        if _attempt_customer_autocomplete(driver, field, try_hint, match_code):
+            print(f"✅ [SMC] Customer selected using hint {try_hint!r}")
+            return True
+
+    if _customer_is_selected(driver):
+        print("ℹ️ [SMC] Customer field populated after autocomplete attempts.")
+        return True
+
+    print(f"⚠️ [SMC] Could not select customer {match_code} from autocomplete.")
+    return False
+
+
+def _customer_field(driver):
+    return _input_by_label(driver, "Customer Code/Name")
+
+
+def _customer_field_value(driver) -> str:
+    field = _customer_field(driver)
+    if not field:
+        return ""
     try:
+        return str(field.get_attribute("value") or "").strip()
+    except Exception:
+        return ""
+
+
+def _customer_is_selected(driver) -> bool:
+    val = _customer_field_value(driver).upper()
+    match_code = customer_select_match().upper()
+    return bool(val) and (match_code in val or "ROBOMATICS" in val)
+
+
+def _attempt_customer_autocomplete(driver, field, hint: str, match_code: str) -> bool:
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", field)
+        field.click()
         field.clear()
         field.send_keys(hint)
-        time.sleep(1.5)
     except Exception as exc:
-        print(f"⚠️ [SMC] Could not type customer hint: {exc}")
+        print(f"⚠️ [SMC] Could not type customer hint {hint!r}: {exc}")
         return False
 
-    # Autocomplete dropdown (Kendo / jQuery UI / plain list)
+    time.sleep(1.2)
+    if _click_customer_autocomplete_option(driver, match_code):
+        time.sleep(0.8)
+        if _customer_is_selected(driver):
+            return True
+
+    try:
+        field.send_keys(Keys.ARROW_DOWN)
+        time.sleep(0.25)
+        field.send_keys(Keys.ENTER)
+        time.sleep(0.8)
+    except Exception:
+        pass
+    if _customer_is_selected(driver):
+        return True
+
+    try:
+        field.send_keys(Keys.TAB)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    return _customer_is_selected(driver)
+
+
+def _click_customer_autocomplete_option(driver, match_code: str) -> bool:
+    match_u = str(match_code or "").upper()
     option_xpaths = [
         f"//li[contains(., {json.dumps(match_code)})]",
         f"//*[contains(@class,'k-list')]//*[contains(., {json.dumps(match_code)})]",
-        f"//ul[contains(@class,'ui-autocomplete')]//li[contains(., {json.dumps(match_code)})]",
+        f"//*[contains(@class,'k-list-item') and contains(., {json.dumps(match_code)})]",
+        "//ul[contains(@class,'ui-autocomplete')]//li[contains(., 'ROBOMATICS')]",
         f"//*[contains(., 'ROBOMATICS') and contains(., {json.dumps(match_code)})]",
+        "//*[@role='option' and contains(., 'ROBOMATICS')]",
     ]
     for xpath in option_xpaths:
         try:
             for el in driver.find_elements(By.XPATH, xpath):
-                if el.is_displayed():
+                if not el.is_displayed():
+                    continue
+                try:
                     el.click()
-                    time.sleep(1)
-                    return True
+                except Exception:
+                    driver.execute_script("arguments[0].click();", el)
+                return True
         except Exception:
             continue
 
-    # Already selected from saved session?
     try:
-        val = field.get_attribute("value") or ""
-        if match_code in val.upper():
-            return True
+        clicked = driver.execute_script(
+            """
+const matchCode = arguments[0].toUpperCase();
+function visible(el) {
+    if (!el) return false;
+    const st = window.getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden' && el.offsetParent !== null;
+}
+const selectors = [
+    '.k-list .k-list-item', '.k-list-item', '.k-item',
+    'ul.ui-autocomplete li', '[role="option"]', '.k-popup li'
+];
+for (const sel of selectors) {
+    for (const el of document.querySelectorAll(sel)) {
+        if (!visible(el)) continue;
+        const text = (el.innerText || '').toUpperCase();
+        if (text.includes(matchCode) || text.includes('ROBOMATICS')) {
+            el.click();
+            return true;
+        }
+    }
+}
+return false;
+""",
+            match_u,
+        )
+        return bool(clicked)
     except Exception:
-        pass
-
-    print(f"⚠️ [SMC] Could not select customer {match_code} from autocomplete.")
-    return False
+        return False
 
 
 def _navigate_item_enquiry(driver) -> bool:
@@ -762,6 +856,7 @@ def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
         return []
 
     if not _select_customer(driver):
+        print("⚠️ [SMC] Customer not selected — cannot run Item Enquiry.")
         return []
 
     part_field = _input_by_label(driver, "Part No.")

@@ -226,6 +226,13 @@ def enrich_item_catalog_links(item: dict, row: dict | None = None) -> dict[str, 
     row = row or {}
     brand = str(item.get("brand") or row.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
     part_no = str(item.get("part_no") or row.get("customer_part") or "").strip()
+    if brand in ("UNKNOWN", "") and part_no:
+        from brand_inference import infer_brand_from_part
+
+        inferred = infer_brand_from_part(part_no)
+        if inferred != "UNKNOWN":
+            brand = inferred
+            item.setdefault("brand", inferred)
     technical_specs = item.get("technical_specs") or row.get("technical_specs") or []
 
     article_id = resolve_burkert_id(

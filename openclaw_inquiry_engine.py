@@ -271,16 +271,9 @@ def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source="",
 
 
 def infer_brand_from_part(part_no):
-    part_norm = normalize_part(part_no)
+    from brand_inference import infer_brand_from_part as _infer
 
-    # Safe family inference for common automation brands.
-    if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("E2E") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y") or part_norm.startswith("H3J") or part_norm.startswith("H3CR") or part_norm.startswith("E5CC") or part_norm.startswith("E5CN"):
-        return "OMRON"
-
-    if part_norm.startswith("150C") or part_norm.startswith("150-C"):
-        return "ALLEN-BRADLEY"
-
-    return "UNKNOWN"
+    return _infer(part_no)
 
 
 PART_REF_PATTERN = re.compile(
