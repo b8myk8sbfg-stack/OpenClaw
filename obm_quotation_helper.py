@@ -29,7 +29,14 @@ DEFAULT_STATUS = "W"
 DEFAULT_VALID_DAYS = 30
 
 SKIP_MISSING_ITEMS = True
+NEW_STOCK_PID = "NEW"
 MANAGER_EMAIL = "stephen@robomatics.sg"
+
+KNOWN_BRANDS_FOR_NEW_PID = {
+    "OMRON", "SMC", "BURKERT", "BÜRKERT", "LEGRIS", "PANASONIC", "PISCO",
+    "THK", "LOCTITE", "KEYENCE", "FESTO", "SICK", "IFM", "PARKER", "ABB", "SIEMENS",
+    "ALLEN BRADLEY", "NITTO KOHKI", "CKD", "KOGANEI", "AIRTAC", "YASKAWA",
+}
 
 
 def now_iso():
@@ -267,6 +274,44 @@ def find_pid(part):
     return None
 
 
+def extract_brand_from_item(item, customer_part=None):
+    brand = str(item.get("brand") or "").strip().upper().replace("BÜRKERT", "BURKERT")
+    if brand and brand != "UNKNOWN":
+        return brand
+
+    desc = str(item.get("desc") or item.get("description") or "").strip().upper()
+    for known in KNOWN_BRANDS_FOR_NEW_PID:
+        known_norm = known.replace("BÜRKERT", "BURKERT")
+        if desc.startswith(f"{known_norm} "):
+            return known_norm
+
+    return ""
+
+
+def should_use_new_stock_pid(item, customer_part=None):
+    """Use OBM placeholder stock NEW for valid known-brand parts not in warehouse."""
+    brand = extract_brand_from_item(item, customer_part)
+    return brand in {b.replace("BÜRKERT", "BURKERT") for b in KNOWN_BRANDS_FOR_NEW_PID}
+
+
+def new_stock_pid_available():
+    return any(row.get("n_pid") == "NEW" or row.get("pid") == NEW_STOCK_PID for row in STOCK)
+
+
+def resolve_stock_pid(part, item=None):
+    pid = find_pid(part)
+    if pid:
+        return pid
+
+    if item and should_use_new_stock_pid(item, part) and new_stock_pid_available():
+        print(
+            f"   ✅ Using {NEW_STOCK_PID} stock code for known-brand part not in warehouse: {part}"
+        )
+        return NEW_STOCK_PID
+
+    return None
+
+
 def parse_price(value):
     if value in [None, "", "[TBC]"]:
         return 0.0
@@ -290,11 +335,16 @@ def clean_item_for_obm(item):
 
     price = parse_price(item.get("price"))
 
+    brand = str(item.get("brand") or "").strip().upper().replace("BÜRKERT", "BURKERT")
+    if not brand or brand == "UNKNOWN":
+        brand = extract_brand_from_item(item, customer_part)
+
     return {
         "desc": desc,
         "qty": qty,
         "customer_part": str(customer_part).strip(),
         "price": price,
+        "brand": brand,
         "raw": item
     }
 
@@ -313,7 +363,7 @@ def build_payload(cust_no, items):
         customer_part = clean["customer_part"]
         price = clean["price"]
 
-        pid = find_pid(customer_part)
+        pid = resolve_stock_pid(customer_part, item)
 
         if not pid:
             skipped_items.append({
@@ -359,7 +409,11 @@ def build_payload(cust_no, items):
         "valid_date": valid_date(),
         "currency_code": DEFAULT_CURRENCY,
         "status": DEFAULT_STATUS,
-        "remarks": "Created by AutoClaw automation. Unresolved stock ID items were skipped.",
+        "remarks": (
+            "Created by AutoClaw automation. "
+            "Known-brand parts not in warehouse use stock code NEW; "
+            "other unresolved stock IDs were skipped."
+        ),
         "items": lines
     }
 
