@@ -10,7 +10,7 @@ import re
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
-VERSION = "v1.02-UNIFIED-ANALYZE-FALLBACK"
+VERSION = "v1.03-LOCAL-OCR-COPILOT"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -45,6 +45,21 @@ _RFQ_SYSTEM_INSTRUCTION = (
     "Do not include markdown, backticks, or conversational text. "
     'Example: [{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}, '
     '{"part_no": "P36203010#1", "qty": 1, "brand": "SMC", "product_type": "CYLINDER"}]'
+)
+
+_RFQ_OCR_SYSTEM_INSTRUCTION = (
+    "You are an industrial automation data extraction assistant. "
+    "The customer sent a product photo, but you receive ONLY local OCR text (JSON) plus the caption — "
+    "not the image itself. Parse the OCR lines carefully; read model/order codes character-by-character. "
+    "OMRON proximity sensors use E2E-. OMRON temperature controllers use E5CC-/E5CN-. "
+    "OMRON programmable controllers use CPM1A-. "
+    "Extract EVERY distinct manufacturer part number present in the OCR output. "
+    "Use customer caption for quantity hints. "
+    "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
+    "product_type is the product description visible in OCR (example: PROGRAMMABLE CONTROLLER). "
+    "Quantity must be a positive integer. Do not guess missing part numbers. "
+    "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
+    "Do not include markdown, backticks, or conversational text."
 )
 
 
@@ -146,6 +161,36 @@ def _build_rfq_user_content(raw_email_body: str, image_path: str = None):
     ]
 
 
+def _build_ocr_copilot_user_content(raw_email_body: str, ocr_payload: dict) -> str:
+    from local_ocr import ocr_payload_to_json
+
+    return (
+        "The customer sent a product label/nameplate photo. "
+        "Local OCR extracted the printed text below as JSON. "
+        "Use ONLY this OCR output and the customer caption — do not invent part numbers.\n\n"
+        f"Customer caption/text:\n{raw_email_body or '(none)'}\n\n"
+        f"OCR result (JSON):\n{ocr_payload_to_json(ocr_payload)}"
+    )
+
+
+def _call_copilot_rfq(
+    client: OpenAI,
+    system_instruction: str,
+    user_content,
+    parse_image_path: str = None,
+) -> list:
+    response = client.chat.completions.create(
+        model=COPILOT_MODEL,
+        messages=[
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_content},
+        ],
+    )
+    raw_content = (response.choices[0].message.content or "").strip()
+    print(f"[COPILOT RAW] {raw_content}")
+    return _parse_rfq_json_array(raw_content, image_path=parse_image_path)
+
+
 def _normalize_part_key(part_no: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
 
@@ -198,12 +243,17 @@ def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -
     return result.get("items") or []
 
 
-def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = None) -> list:
-    """Copilot-only extraction path used by unified_analyze."""
+def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = None) -> dict:
+    """
+    Copilot-only extraction. Image inquiries prefer local OCR → Copilot text
+    to save vision tokens; falls back to Copilot vision when OCR is empty.
+    """
     if not str(raw_email_body or "").strip() and not image_path:
-        return []
+        return {"items": [], "route": "none", "ocr_used": False}
 
-    print("[API READ] Sending raw data payload to local Copilot server...")
+    from local_ocr import extract_text_from_image, has_usable_ocr_text, ocr_enabled
+
+    print("[API READ] Sending payload to local Copilot server...")
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
         api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
@@ -212,16 +262,34 @@ def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = N
     )
 
     try:
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
-                {"role": "system", "content": _RFQ_SYSTEM_INSTRUCTION},
-                {"role": "user", "content": _build_rfq_user_content(raw_email_body, image_path)},
-            ],
+        if image_path and ocr_enabled():
+            ocr_payload = extract_text_from_image(image_path)
+            if has_usable_ocr_text(ocr_payload):
+                print(
+                    f"[OCR] Extracted {len(ocr_payload.get('lines') or [])} line(s) "
+                    f"from {image_path} — routing text-only to Copilot"
+                )
+                items = _call_copilot_rfq(
+                    client,
+                    _RFQ_OCR_SYSTEM_INSTRUCTION,
+                    _build_ocr_copilot_user_content(raw_email_body, ocr_payload),
+                    parse_image_path=None,
+                )
+                if items:
+                    return {"items": items, "route": "ocr_copilot", "ocr_used": True}
+                print("[OCR] Copilot found no parts from OCR text — retrying with Copilot vision...")
+            else:
+                reason = ocr_payload.get("error") or "no_text_detected"
+                print(f"[OCR] Skipping OCR route ({reason}) — using Copilot vision")
+
+        route = "copilot_visual" if image_path else "copilot_text"
+        items = _call_copilot_rfq(
+            client,
+            _RFQ_SYSTEM_INSTRUCTION,
+            _build_rfq_user_content(raw_email_body, image_path),
+            parse_image_path=image_path,
         )
-        raw_content = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT RAW] {raw_content}")
-        return _parse_rfq_json_array(raw_content, image_path=image_path)
+        return {"items": items, "route": route, "ocr_used": False}
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[ERROR] Copilot returned invalid JSON data: {exc}")
         raise
@@ -275,21 +343,17 @@ def _extract_rfq_with_openai(raw_email_body: str = "", image_path: str = None) -
 
 def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
     """
-    Unified RFQ extraction: Copilot first, OpenAI fallback when the proxy is down.
-
-    Returns:
-        {
-            "items": [...],
-            "source": "copilot" | "openai" | "none",
-            "copilot_failed": bool,
-            "fallback_used": bool,
-            "error": None | {"status": int, "type": str, "message": str},
-        }
+    Unified RFQ extraction:
+      1. Image → local OCR → Copilot text (primary, saves tokens)
+      2. Copilot vision/text if OCR empty
+      3. OpenAI vision/text only when Copilot fails (secondary fallback)
     """
     if not str(raw_email_body or "").strip() and not image_path:
         return {
             "items": [],
             "source": "none",
+            "route": "none",
+            "ocr_used": False,
             "copilot_failed": False,
             "fallback_used": False,
             "error": None,
@@ -297,11 +361,18 @@ def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
 
     copilot_error = None
     copilot_exc = None
+    copilot_route = "none"
+    ocr_used = False
     try:
-        items = _extract_rfq_with_copilot_only(raw_email_body, image_path=image_path)
+        copilot_result = _extract_rfq_with_copilot_only(raw_email_body, image_path=image_path)
+        items = copilot_result.get("items") or []
+        copilot_route = copilot_result.get("route") or "copilot"
+        ocr_used = bool(copilot_result.get("ocr_used"))
         return {
             "items": items,
             "source": "copilot" if items else "none",
+            "route": copilot_route,
+            "ocr_used": ocr_used,
             "copilot_failed": False,
             "fallback_used": False,
             "error": None,
@@ -318,6 +389,8 @@ def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
         return {
             "items": [],
             "source": "none",
+            "route": copilot_route,
+            "ocr_used": ocr_used,
             "copilot_failed": True,
             "fallback_used": False,
             "error": copilot_error,
@@ -328,6 +401,8 @@ def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
         return {
             "items": items,
             "source": "openai" if items else "none",
+            "route": "openai_vision" if image_path else "openai_text",
+            "ocr_used": ocr_used,
             "copilot_failed": True,
             "fallback_used": True,
             "error": copilot_error,
@@ -337,6 +412,8 @@ def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
         return {
             "items": [],
             "source": "none",
+            "route": "openai_failed",
+            "ocr_used": ocr_used,
             "copilot_failed": True,
             "fallback_used": True,
             "error": copilot_error,

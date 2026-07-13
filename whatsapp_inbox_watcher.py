@@ -44,7 +44,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.38-COPILOT-OPENAI-FALLBACK"
+VERSION = "v3.39-LOCAL-OCR-COPILOT"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -2972,6 +2972,11 @@ def run_unified_analyze(
             f"   ✅ OpenAI fallback extracted {len(result['items'])} item(s) "
             "after Copilot failure"
         )
+    elif result.get("ocr_used"):
+        print(
+            f"   📄 Local OCR → Copilot text route ({result.get('route')}) "
+            f"extracted {len(result.get('items') or [])} item(s)"
+        )
     return result
 
 
@@ -2988,6 +2993,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
     latest_message = ""
     image_path = None
     image_analysis = None
+    analysis_route = "copilot_visual"
     media_info = None
     enrichment = {}
     processed_voice = False
@@ -3045,8 +3051,9 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             items = analysis_result.get("items") or []
             if items:
                 copilot_items = items
+                analysis_route = analysis_result.get("route") or "copilot"
                 source = analysis_result.get("source") or "copilot"
-                print(f"   👁️ Image step: {source} extracted {len(items)} item(s)")
+                print(f"   👁️ Image step: {source}/{analysis_route} extracted {len(items)} item(s)")
             elif image_path:
                 print("   ⚠️ Image step: photo captured but extraction found no parts yet.")
 
@@ -3160,7 +3167,7 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             "items": copilot_items,
             "inquiry_text": latest_message,
             "notes": "Sequential image then caption processing.",
-            "source": "copilot_visual",
+            "source": analysis_route,
             "image_path": image_path,
         }
         if media_info is None:

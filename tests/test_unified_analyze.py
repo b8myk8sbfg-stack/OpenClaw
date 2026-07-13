@@ -16,11 +16,17 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         with patch.object(
             openclaw_main,
             "_extract_rfq_with_copilot_only",
-            return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 2, "brand": "OMRON"}],
+            return_value={
+                "items": [{"part_no": "CPM1A-30CDR-D-V1", "qty": 2, "brand": "OMRON"}],
+                "route": "ocr_copilot",
+                "ocr_used": True,
+            },
         ):
             result = openclaw_main.unified_analyze("报价，我要两个", image_path="/tmp/label.png")
 
         self.assertEqual(result["source"], "copilot")
+        self.assertEqual(result["route"], "ocr_copilot")
+        self.assertTrue(result["ocr_used"])
         self.assertFalse(result["copilot_failed"])
         self.assertEqual(len(result["items"]), 1)
 
@@ -46,6 +52,7 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         self.assertTrue(result["copilot_failed"])
         self.assertTrue(result["fallback_used"])
         self.assertEqual(result["source"], "openai")
+        self.assertEqual(result["route"], "openai_vision")
         self.assertEqual(result["error"]["status"], 503)
         self.assertEqual(result["error"]["type"], "clearance_required")
 
@@ -79,6 +86,62 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         self.assertIn("Customer: Robomatics Stephen", alert)
         self.assertIn("HTTP status: 503", alert)
         self.assertIn("报价，我要两个", alert)
+
+    def test_image_routes_through_ocr_before_copilot_vision(self):
+        ocr_payload = {
+            "engine": "tesseract",
+            "full_text": "CPM1A-30CDR-D-V1\nOMRON",
+            "lines": [{"text": "CPM1A-30CDR-D-V1", "confidence": 95.0}],
+            "error": None,
+        }
+        with patch.dict(os.environ, {"OPENCLAW_OCR_ENABLED": "1"}):
+            with patch("local_ocr.extract_text_from_image", return_value=ocr_payload):
+                with patch.object(
+                    openclaw_main,
+                    "_call_copilot_rfq",
+                    return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 2, "brand": "OMRON"}],
+                ) as copilot_mock:
+                    result = openclaw_main._extract_rfq_with_copilot_only(
+                        "quote 2 pcs",
+                        image_path="/tmp/label.png",
+                    )
+
+        self.assertEqual(result["route"], "ocr_copilot")
+        self.assertTrue(result["ocr_used"])
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(copilot_mock.call_count, 1)
+        user_content = copilot_mock.call_args[0][2]
+        self.assertIn("OCR result (JSON)", user_content)
+        self.assertIn("CPM1A-30CDR-D-V1", user_content)
+
+    def test_empty_ocr_falls_back_to_copilot_vision(self):
+        ocr_payload = {
+            "engine": "tesseract",
+            "full_text": "",
+            "lines": [],
+            "error": "no_text_detected",
+        }
+        with patch.dict(os.environ, {"OPENCLAW_OCR_ENABLED": "1"}):
+            with patch("local_ocr.extract_text_from_image", return_value=ocr_payload):
+                with patch.object(
+                    openclaw_main,
+                    "_build_rfq_user_content",
+                    return_value=[{"type": "text", "text": "vision-fallback"}],
+                ):
+                    with patch.object(
+                        openclaw_main,
+                        "_call_copilot_rfq",
+                        return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 1, "brand": "OMRON"}],
+                    ) as copilot_mock:
+                        result = openclaw_main._extract_rfq_with_copilot_only(
+                            "quote 1 pc",
+                            image_path="/tmp/label.png",
+                        )
+
+        self.assertEqual(result["route"], "copilot_visual")
+        self.assertFalse(result["ocr_used"])
+        self.assertEqual(copilot_mock.call_count, 1)
+        self.assertIsInstance(copilot_mock.call_args[0][2], list)
 
 
 if __name__ == "__main__":
