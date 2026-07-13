@@ -14,12 +14,12 @@ from O365 import Account
 
 from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
-from inquiry_extraction_helper import extract_clean_items_from_text
-from openclaw_main import extract_rfq_with_copilot
+from inquiry_extraction_helper import extract_clean_items_from_text, is_plausible_part_no
+from openclaw_main import unified_analyze
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
-VERSION = "v1.14-EMAIL-FIFO-ONE"
+VERSION = "v1.15-EMAIL-COPILOT-PRIMARY"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -136,6 +136,67 @@ def clean_email_body(raw_body):
     body_clean = re.sub(r'&[a-z0-9#]+;', ' ', body_clean, flags=re.I)
     body_clean = re.sub(r'\s+', ' ', body_clean)
     return body_clean.strip()
+
+
+IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _first_email_image_path(attachment_paths):
+    for path in attachment_paths or []:
+        if str(path or "").lower().endswith(IMAGE_ATTACHMENT_EXTENSIONS):
+            return path
+    return None
+
+
+def _merge_unified_items_into_quote(unified_items, quote_items, missing_layer2_items, detected_parts_norm):
+    """Apply unified_analyze items to email quote rows (same role as WhatsApp Copilot primary)."""
+    known_norms = set(detected_parts_norm)
+    known_norms.update(
+        normalize_part(item.get("part_no", ""))
+        for item in missing_layer2_items
+    )
+
+    for item in unified_items:
+        part_no = str(item.get("part_no") or "").strip().upper()
+        brand = str(item.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
+        try:
+            qty = int(item.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        part_norm = normalize_part(part_no)
+        if not part_norm or part_norm in known_norms:
+            continue
+        if not is_plausible_part_no(part_no):
+            print(f"   ⚠️ Rejected implausible unified part: {part_no!r}")
+            continue
+
+        stock_match = next(
+            (
+                stock_item for stock_item in STOCK_DB
+                if normalize_part(stock_item.get("api_pid", "")) == part_norm
+            ),
+            None,
+        )
+
+        if stock_match:
+            quote_items.append({
+                "data": stock_match,
+                "qty": qty,
+                "matched_text": part_no,
+                "extractor_source": "UNIFIED_ANALYZE",
+            })
+            detected_parts_norm.add(part_norm)
+            print(f"   ✅ Unified stock match | Brand: {brand} | Part: {part_no} | Qty: {qty}")
+        else:
+            missing_layer2_items.append({
+                "brand": brand,
+                "part_no": part_no,
+                "qty": qty,
+                "norm": part_norm,
+                "source": "UNIFIED_ANALYZE",
+            })
+            print(f"   🧩 Unified non-standard item | Brand: {brand} | Part: {part_no} | Qty: {qty}")
+        known_norms.add(part_norm)
 
 
 def is_inquiry_like(subject, body_clean):
@@ -274,6 +335,9 @@ def extract_structured_rfq_items(body_upper):
         if not norm or len(norm) < 4:
             return
 
+        if not is_plausible_part_no(part_no):
+            return
+
         if norm in existing_norms:
             return
 
@@ -316,6 +380,20 @@ def extract_structured_rfq_items(body_upper):
 
     for brand, part_no, qty in pattern_with_brand.findall(body_upper):
         add_item(brand, part_no, qty, "LAYER2_WITH_BRAND")
+
+    # Format:
+    # MXY12-150
+    # Brand : SMC
+    # Qty : 2pcs
+    pattern_part_brand_qty = re.compile(
+        r'\b((?=[A-Z0-9\-_/]*\d)[A-Z0-9][A-Z0-9\-_/]{2,40})\b\s+'
+        r'BRAND\s*:\s*([A-Z0-9\s\-/]+?)\s+'
+        r'(?:QTY|QUANTITY)\s*:\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|UNITS|NOS)?',
+        re.I | re.S
+    )
+
+    for part_no, brand, qty in pattern_part_brand_qty.findall(body_upper):
+        add_item(brand, part_no, qty, "LAYER2_PART_BRAND_QTY")
 
     # Format:
     # PANASONIC SENSOR
@@ -1059,214 +1137,190 @@ def process_latest_inquiry():
             print(f"📊 Database Pattern Count: {len(STOCK_DB)}")
 
             # =========================================================
-            # CLEAN EXTRACTION HELPER FIRST
-            # Handles messy customer wording such as:
-            # - Omron H3Y-4-C 110VAC 10sec timer – Qty ; 2 Unit
-            # - Omron MY4N-GS/MY4N-GS-R 110VAC Relay – Qty : 4 Unit
+            # COPILOT PRIMARY (same as WhatsApp unified_analyze)
+            # Regex layers only when unified_analyze returns no items.
             # =========================================================
             quote_items = []
             missing_layer2_items = []
             has_partial = False
             detected_parts_norm = set()
 
-            clean_items = []
+            email_image_path = _first_email_image_path(attachment_paths)
+            unified_result = unified_analyze(body_clean, image_path=email_image_path)
+            unified_items = unified_result.get("items") or []
 
-            try:
-                clean_items = extract_clean_items_from_text(body_clean)
-            except Exception as e:
-                print(f"⚠️ Clean extractor failed, falling back to AutoClaw original extraction: {e}")
+            if unified_items:
+                route = unified_result.get("route") or unified_result.get("source") or "copilot"
+                print(
+                    f"🤖 unified_analyze primary ({route}): "
+                    f"{len(unified_items)} item(s) — skipping regex extraction"
+                )
+                _merge_unified_items_into_quote(
+                    unified_items,
+                    quote_items,
+                    missing_layer2_items,
+                    detected_parts_norm,
+                )
+            else:
+                print("ℹ️ unified_analyze found no items — falling back to regex extraction.")
+
                 clean_items = []
 
-            if clean_items:
-                print(f"🧠 Clean extractor returned {len(clean_items)} item(s). Using clean extraction path.")
+                try:
+                    clean_items = extract_clean_items_from_text(body_clean)
+                except Exception as e:
+                    print(f"⚠️ Clean extractor failed, falling back to AutoClaw original extraction: {e}")
+                    clean_items = []
 
-                for ci in clean_items:
-                    brand = ci.get("brand") or "UNKNOWN"
-                    part_no = ci.get("part_no") or ci.get("search_text") or ""
-                    qty = int(ci.get("qty") or 1)
+                if clean_items:
+                    print(f"🧠 Clean extractor returned {len(clean_items)} item(s). Using clean extraction path.")
 
-                    if ci.get("matched") and ci.get("matched_stock_id"):
-                        api_pid = ci.get("matched_stock_id")
+                    for ci in clean_items:
+                        brand = ci.get("brand") or "UNKNOWN"
+                        part_no = ci.get("part_no") or ci.get("search_text") or ""
+                        qty = int(ci.get("qty") or 1)
 
-                        quote_items.append({
-                            "data": {
-                                "api_pid": api_pid,
-                                "regex": "",
-                                "len": len(api_pid),
-                                "is_partial": False,
-                                "norm": normalize_part(api_pid),
-                            },
-                            "qty": qty,
-                            "matched_text": ci.get("matched_stock_name") or part_no,
-                            "extractor_source": ci.get("source"),
-                            "extractor_confidence": ci.get("confidence"),
-                        })
+                        if not is_plausible_part_no(part_no):
+                            print(f"   ⚠️ Rejected implausible regex part: {part_no!r}")
+                            continue
 
-                        detected_parts_norm.add(normalize_part(api_pid))
-                        detected_parts_norm.add(normalize_part(part_no))
+                        if ci.get("matched") and ci.get("matched_stock_id"):
+                            api_pid = ci.get("matched_stock_id")
 
-                        print(
-                            f"   ✅ Clean extracted match | "
-                            f"Brand: {brand} | Part: {part_no} | "
-                            f"Stock ID: {api_pid} | Qty: {qty} | "
-                            f"Confidence: {ci.get('confidence')}"
-                        )
+                            quote_items.append({
+                                "data": {
+                                    "api_pid": api_pid,
+                                    "regex": "",
+                                    "len": len(api_pid),
+                                    "is_partial": False,
+                                    "norm": normalize_part(api_pid),
+                                },
+                                "qty": qty,
+                                "matched_text": ci.get("matched_stock_name") or part_no,
+                                "extractor_source": ci.get("source"),
+                                "extractor_confidence": ci.get("confidence"),
+                            })
 
-                    else:
-                        missing_layer2_items.append({
-                            "brand": brand,
-                            "part_no": part_no,
-                            "qty": qty,
-                            "norm": normalize_part(part_no),
-                            "source": ci.get("source") or "CLEAN_EXTRACTOR_NOT_FOUND",
-                        })
+                            detected_parts_norm.add(normalize_part(api_pid))
+                            detected_parts_norm.add(normalize_part(part_no))
 
-                        print(
-                            f"   🧩 Clean extracted non-standard item | "
-                            f"Brand: {brand} | Part: {part_no} | Qty: {qty}"
-                        )
-
-            else:
-                print("ℹ️ Clean extractor found no item. Using AutoClaw original extraction path.")
-
-                matches = []
-
-                for item in STOCK_DB:
-                    for m in re.finditer(item['regex'], body_upper):
-                        matches.append({
-                            "start": m.start(1),
-                            "end": m.end(1),
-                            "matched_text": m.group(1),
-                            "item": item
-                        })
-
-                matches.sort(key=lambda x: x['start'])
-
-                final_list = []
-                last_end = -1
-                has_partial = False
-
-                for m in matches:
-                    if m['start'] >= last_end:
-                        final_list.append(m)
-                        last_end = m['end']
-
-                        if m['item']['is_partial']:
-                            has_partial = True
-
-                        print(
-                            f"   🔎 Layer 1 Stock Match Found | "
-                            f"API PID: {m['item']['api_pid']} | "
-                            f"Matched Text: {m['matched_text']} | "
-                            f"{'Partial' if m['item']['is_partial'] else 'Exact/Normal'}"
-                        )
-
-                detected_parts_norm = set()
-
-                for m in final_list:
-                    detected_parts_norm.add(normalize_part(m['item']['api_pid']))
-                    detected_parts_norm.add(normalize_part(m['matched_text']))
-
-                    q_match = re.search(
-                        r'(?:QTY|QUANTITY)\s*:?\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|NOS)?',
-                        body_upper[m['end']: m['end'] + 80]
-                    )
-
-                    qty = int(q_match.group(1)) if q_match else 1
-
-                    quote_items.append({
-                        "data": m['item'],
-                        "qty": qty,
-                        "matched_text": m.get("matched_text", "")
-                    })
-
-                    print(f"      Qty Detected: {qty}")
-
-                structured_items = extract_structured_rfq_items(body_upper)
-
-                if structured_items:
-                    print(f"🧩 Layer 2 Structured RFQ Extraction Found: {len(structured_items)} item(s)")
-
-                if structured_items:
-                    structured_norms = {x["norm"] for x in structured_items}
-                    filtered_quote_items = []
-
-                    for qi in quote_items:
-                        qi_api_norm = normalize_part(qi.get("data", {}).get("api_pid", ""))
-                        qi_match_norm = normalize_part(qi.get("matched_text", ""))
-
-                        if qi_api_norm in structured_norms or qi_match_norm in structured_norms:
-                            filtered_quote_items.append(qi)
-                        else:
                             print(
-                                f"   ⚠️ Ignoring broad Layer 1 match because explicit P/N/Model was detected | "
-                                f"API PID: {qi.get('data', {}).get('api_pid', '')} | "
-                                f"Matched Text: {qi.get('matched_text', '')}"
+                                f"   ✅ Clean extracted match | "
+                                f"Brand: {brand} | Part: {part_no} | "
+                                f"Stock ID: {api_pid} | Qty: {qty} | "
+                                f"Confidence: {ci.get('confidence')}"
                             )
 
-                    quote_items = filtered_quote_items
+                        else:
+                            missing_layer2_items.append({
+                                "brand": brand,
+                                "part_no": part_no,
+                                "qty": qty,
+                                "norm": normalize_part(part_no),
+                                "source": ci.get("source") or "CLEAN_EXTRACTOR_NOT_FOUND",
+                            })
 
-                for rfq in structured_items:
-                    if rfq["norm"] not in detected_parts_norm:
-                        print(
-                            f"   🆕 Layer 2 Missing Part Detected | "
-                            f"Brand: {rfq['brand']} | "
-                            f"Part No: {rfq['part_no']} | "
-                            f"Qty: {rfq['qty']} | "
-                            f"Source: {rfq['source']}"
+                            print(
+                                f"   🧩 Clean extracted non-standard item | "
+                                f"Brand: {brand} | Part: {part_no} | Qty: {qty}"
+                            )
+
+                else:
+                    print("ℹ️ Clean extractor found no item. Using AutoClaw original extraction path.")
+
+                    matches = []
+
+                    for item in STOCK_DB:
+                        for m in re.finditer(item['regex'], body_upper):
+                            matches.append({
+                                "start": m.start(1),
+                                "end": m.end(1),
+                                "matched_text": m.group(1),
+                                "item": item
+                            })
+
+                    matches.sort(key=lambda x: x['start'])
+
+                    final_list = []
+                    last_end = -1
+                    has_partial = False
+
+                    for m in matches:
+                        if m['start'] >= last_end:
+                            final_list.append(m)
+                            last_end = m['end']
+
+                            if m['item']['is_partial']:
+                                has_partial = True
+
+                            print(
+                                f"   🔎 Layer 1 Stock Match Found | "
+                                f"API PID: {m['item']['api_pid']} | "
+                                f"Matched Text: {m['matched_text']} | "
+                                f"{'Partial' if m['item']['is_partial'] else 'Exact/Normal'}"
+                            )
+
+                    detected_parts_norm = set()
+
+                    for m in final_list:
+                        if not is_plausible_part_no(m.get("matched_text")):
+                            continue
+                        detected_parts_norm.add(normalize_part(m['item']['api_pid']))
+                        detected_parts_norm.add(normalize_part(m['matched_text']))
+
+                        q_match = re.search(
+                            r'(?:QTY|QUANTITY)\s*:?\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|NOS)?',
+                            body_upper[m['end']: m['end'] + 80]
                         )
 
-                        if rfq["brand"] == "UNKNOWN":
-                            print("      ⚠️ Customer did not specify brand. Routing will use DEFAULT.")
+                        qty = int(q_match.group(1)) if q_match else 1
 
-                        missing_layer2_items.append(rfq)
+                        quote_items.append({
+                            "data": m['item'],
+                            "qty": qty,
+                            "matched_text": m.get("matched_text", "")
+                        })
 
-            # Copilot is an additional extraction layer. It fills gaps left by the
-            # deterministic extractors without replacing their trusted results.
-            copilot_items = extract_rfq_with_copilot(body_clean)
-            if copilot_items:
-                print(f"🤖 Copilot RFQ extraction found {len(copilot_items)} item(s).")
+                        print(f"      Qty Detected: {qty}")
 
-            known_norms = set(detected_parts_norm)
-            known_norms.update(
-                normalize_part(item.get("part_no", ""))
-                for item in missing_layer2_items
-            )
+                    structured_items = extract_structured_rfq_items(body_upper)
 
-            for copilot_item in copilot_items:
-                part_no = copilot_item["part_no"]
-                qty = copilot_item["qty"]
-                part_norm = normalize_part(part_no)
-                if not part_norm or part_norm in known_norms:
-                    continue
+                    if structured_items:
+                        print(f"🧩 Layer 2 Structured RFQ Extraction Found: {len(structured_items)} item(s)")
 
-                stock_match = next(
-                    (
-                        stock_item for stock_item in STOCK_DB
-                        if normalize_part(stock_item.get("api_pid", "")) == part_norm
-                    ),
-                    None,
-                )
+                    if structured_items:
+                        structured_norms = {x["norm"] for x in structured_items}
+                        filtered_quote_items = []
 
-                if stock_match:
-                    quote_items.append({
-                        "data": stock_match,
-                        "qty": qty,
-                        "matched_text": part_no,
-                        "extractor_source": "COPILOT_LOCAL",
-                    })
-                    detected_parts_norm.add(part_norm)
-                    print(f"   ✅ Copilot stock match | Part: {part_no} | Qty: {qty}")
-                else:
-                    missing_layer2_items.append({
-                        "brand": "UNKNOWN",
-                        "part_no": part_no,
-                        "qty": qty,
-                        "norm": part_norm,
-                        "source": "COPILOT_LOCAL",
-                    })
-                    print(f"   🧩 Copilot non-standard item | Part: {part_no} | Qty: {qty}")
-                known_norms.add(part_norm)
+                        for qi in quote_items:
+                            qi_api_norm = normalize_part(qi.get("data", {}).get("api_pid", ""))
+                            qi_match_norm = normalize_part(qi.get("matched_text", ""))
+
+                            if qi_api_norm in structured_norms or qi_match_norm in structured_norms:
+                                filtered_quote_items.append(qi)
+                            else:
+                                print(
+                                    f"   ⚠️ Ignoring broad Layer 1 match because explicit P/N/Model was detected | "
+                                    f"API PID: {qi.get('data', {}).get('api_pid', '')} | "
+                                    f"Matched Text: {qi.get('matched_text', '')}"
+                                )
+
+                        quote_items = filtered_quote_items
+
+                    for rfq in structured_items:
+                        if rfq["norm"] not in detected_parts_norm:
+                            print(
+                                f"   🆕 Layer 2 Missing Part Detected | "
+                                f"Brand: {rfq['brand']} | "
+                                f"Part No: {rfq['part_no']} | "
+                                f"Qty: {rfq['qty']} | "
+                                f"Source: {rfq['source']}"
+                            )
+
+                            if rfq["brand"] == "UNKNOWN":
+                                print("      ⚠️ Customer did not specify brand. Routing will use DEFAULT.")
+
+                            missing_layer2_items.append(rfq)
 
             if not quote_items and not missing_layer2_items:
                 print("ℹ️ No parts detected in this email. No reply sent.")

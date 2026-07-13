@@ -5,9 +5,34 @@ import json
 from typing import Dict, List, Optional
 
 
-VERSION = "v1.08-INQUIRY-EXTRACTION-HELPER-PARTIAL-STOCK-FAMILY"
+VERSION = "v1.09-PART-BEFORE-BRAND-QTY-FIX"
 
 WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
+
+KNOWN_BRANDS_RE = (
+    r"OMRON|SMC|BURKERT|BÜRKERT|PANASONIC|THK|LOCTITE|KEYENCE|FESTO|SICK|IFM|PARKER|PISCO|ABB|SIEMENS"
+)
+
+INVALID_PART_WORDS = {
+    "THANK", "THANKS", "THANKYOU", "PLEASE", "REGARDS", "HELLO", "QUOTE", "PRICE",
+    "CYLINDER", "SENSOR", "VALVE", "RELAY", "ITEM", "NEW", "UNIT", "UNITS", "PCS",
+    "PC", "PCE", "YOU", "YOUR", "ENQUIRY", "INQUIRY", "KINDLY", "DEAR", "REGARD",
+    "BEST", "MORNING", "AFTERNOON", "FOLLOWING", "ATTACHED", "BELOW", "ABOVE",
+    "MODEL", "BRAND", "TYPE", "PART", "NUMBER", "QTY", "QUANTITY",
+}
+
+
+def is_plausible_part_no(part_no: str) -> bool:
+    """Reject salutations and prose mistaken for catalog part numbers."""
+    part_no = str(part_no or "").strip().upper()
+    norm = normalize_part(part_no)
+    if len(norm) < 4:
+        return False
+    if norm in INVALID_PART_WORDS:
+        return False
+    if not re.search(r"\d", norm):
+        return False
+    return True
 
 
 # ==================================================
@@ -48,6 +73,10 @@ def preprocess_body(text: str) -> str:
         body,
         flags=re.I
     )
+
+    # Strip email closings so "2pcs Thank you" is not parsed as qty + part THANK.
+    body = re.sub(r"\bTHANK\s+YOU\b.*$", "", body, flags=re.I | re.S)
+    body = re.sub(r"\bBEST\s+REGARDS\b.*$", "", body, flags=re.I | re.S)
 
     # Put newlines before common sign-off words to stop regex from eating signature.
     body = re.sub(
@@ -404,6 +433,27 @@ def extract_clean_items_from_text(text: str) -> List[Dict]:
 
     extracted = []
 
+    # Email format: MXY12-150 / Brand : SMC / Qty : 2pcs
+    part_brand_qty_pattern = re.compile(
+        rf"\b((?=[A-Z0-9\-_/]*\d)[A-Z0-9][A-Z0-9\-_/]{{2,40}})\b\s+"
+        rf"BRAND\s*:\s*({KNOWN_BRANDS_RE})\s+"
+        r"(?:QTY|QUANTITY)\s*:\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|UNITS|NOS|SET)?",
+        re.I | re.S,
+    )
+
+    for part_no, brand, qty in part_brand_qty_pattern.findall(body):
+        part_no = clean_line(part_no).upper()
+        if not is_plausible_part_no(part_no):
+            continue
+        extracted.append(build_extracted_item(
+            brand=brand.upper().replace("BÜRKERT", "BURKERT"),
+            raw_text=f"{part_no} Brand: {brand}",
+            part_no=part_no,
+            search_text=part_no,
+            qty=int(qty),
+            source="PART_BRAND_QTY",
+        ))
+
     # Explicit format:
     # Brand: Pisco Model: VKMH12S-S618S2E-B04 Qty: 5 pcs
     # Pisco Model: VKMH12S-S618S2E-B04 Qty: 5 pcs
@@ -516,6 +566,8 @@ def extract_clean_items_from_text(text: str) -> List[Dict]:
     seen = set()
 
     for item in extracted:
+        if not is_plausible_part_no(item.get("part_no")):
+            continue
         if normalize_part(item.get("part_no")) in {"MODEL", "BRAND", "ITEM", "TYPE"}:
             continue
         key = (normalize_part(item["part_no"]), item["qty"])
