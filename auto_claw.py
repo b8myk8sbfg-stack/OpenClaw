@@ -14,7 +14,12 @@ from O365 import Account
 
 from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
-from inquiry_extraction_helper import extract_clean_items_from_text, is_plausible_part_no
+from inquiry_extraction_helper import (
+    extract_clean_items_from_text,
+    is_plausible_part_no,
+    normalize_inquiry_item,
+    format_inquiry_description,
+)
 from openclaw_main import unified_analyze
 from openclaw_inquiry_engine import (
     resolve_warehouse_match,
@@ -25,7 +30,7 @@ from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 from openclaw_email_config import get_monitored_mailboxes, get_primary_mailbox
 
-VERSION = "v1.19-MULTI-MAILBOX-EMAIL"
+VERSION = "v1.20-BRAND-PREFIX-NORMALIZE"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -165,6 +170,7 @@ def _merge_unified_items_into_quote(unified_items, quote_items, missing_layer2_i
     for item in unified_items:
         part_no = str(item.get("part_no") or "").strip().upper()
         brand = str(item.get("brand") or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
+        brand, part_no = normalize_inquiry_item(brand, part_no)
         try:
             qty = int(item.get("qty") or 1)
         except (TypeError, ValueError):
@@ -336,13 +342,11 @@ def extract_structured_rfq_items(body_upper):
     BRAND_WORDS = (
         "OMRON|SMC|BURKERT|BÜRKERT|KEYENCE|FESTO|SICK|IFM|PARKER|ABB|SIEMENS|"
         "PANASONIC|THK|LOCTITE|MITSUBISHI|SCHNEIDER|CKD|AIRTAC|LEGRIS|PISCO|"
-        "YASKAWA|DELTA|FUJI|IDEC|PATLITE|HONEYWELL|EMERSON|DANFOSS|EATON"
+        "YASKAWA|DELTA|FUJI|IDEC|PATLITE|HONEYWELL|EMERSON|DANFOSS|EATON|KOGANEI|CPC"
     )
 
     def add_item(brand, part_no, qty, source):
-        brand = str(brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
-        part_no = str(part_no or "").strip().upper()
-        part_no = re.sub(r"\s+", " ", part_no)
+        brand, part_no = normalize_inquiry_item(brand, part_no)
         qty = int(qty or 1)
         norm = normalize_part(part_no)
 
@@ -478,6 +482,20 @@ def extract_structured_rfq_items(body_upper):
 
     for part_no, qty in line_qty_pattern.findall(body_upper):
         add_item("UNKNOWN", part_no, qty, "LAYER2_LINE_QTY_FORMAT")
+
+    # Format: 1 ). SMC-AS2201F-01-04SA   (Qty :  2 pcs.)
+    # Also: 1). SMC-... or 1. SMC-...
+    numbered_brand_part_qty = re.compile(
+        r"^\s*\d+\s*[\.\)]\s*\.?\s*"
+        r"([A-Z0-9][A-Z0-9\-_/]{2,60})\s*"
+        r"(?::[^\n(]*)?"
+        r"\(?(?:QTY|QUANTITY)\s*:\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|UNITS)?",
+        re.I | re.M,
+    )
+
+    for token, qty in numbered_brand_part_qty.findall(body_upper):
+        brand, part_no = normalize_inquiry_item("UNKNOWN", token)
+        add_item(brand, part_no, qty, "LAYER2_NUMBERED_BRAND_PART_QTY")
 
     return rfq_items
 
@@ -1615,11 +1633,10 @@ def process_latest_inquiry():
                 for missing in missing_layer2_items:
                     brand = str(missing.get("brand") or "UNKNOWN").strip().upper()
                     part_no = missing["part_no"]
-    
-                    if brand == "UNKNOWN":
-                        desc = f"UNKNOWN BRAND {part_no}"
-                    else:
-                        desc = f"{brand} {part_no}"
+                    brand, part_no = normalize_inquiry_item(brand, part_no)
+                    missing["brand"] = brand
+                    missing["part_no"] = part_no
+                    desc = format_inquiry_description(brand, part_no)
     
                     smc_row = None
                     if brand == "SMC":

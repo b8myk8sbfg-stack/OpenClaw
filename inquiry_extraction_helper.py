@@ -11,6 +11,16 @@ WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
 
 KNOWN_BRANDS_RE = (
     r"OMRON|SMC|BURKERT|BÜRKERT|PANASONIC|THK|LOCTITE|KEYENCE|FESTO|SICK|IFM|PARKER|PISCO|ABB|SIEMENS"
+    r"|KOGANEI|CKD|AIRTAC|LEGRIS|MITSUBISHI|CPC|YASKAWA|DELTA|FUJI|IDEC"
+)
+
+KNOWN_BRAND_PREFIXES = tuple(
+    brand.replace("BÜRKERT", "BURKERT")
+    for brand in (
+        "OMRON", "SMC", "BURKERT", "BÜRKERT", "PANASONIC", "THK", "LOCTITE", "KEYENCE", "FESTO",
+        "SICK", "IFM", "PARKER", "PISCO", "ABB", "SIEMENS", "KOGANEI", "CKD", "AIRTAC", "LEGRIS",
+        "MITSUBISHI", "CPC", "YASKAWA", "DELTA", "FUJI", "IDEC", "SCHNEIDER", "CAMOZZI", "PIAB",
+    )
 )
 
 INVALID_PART_WORDS = {
@@ -41,6 +51,79 @@ def is_plausible_part_no(part_no: str) -> bool:
 
 def normalize_part(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _canonical_brand(brand: str) -> str:
+    return str(brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT") or "UNKNOWN"
+
+
+def strip_leading_brand_from_part(brand: str, part_no: str) -> str:
+    """Remove duplicated brand prefix from part number (SMC + SMC-AS2201F → AS2201F)."""
+    brand_u = _canonical_brand(brand)
+    part_u = str(part_no or "").strip().upper()
+    if brand_u == "UNKNOWN" or not part_u:
+        return part_u
+
+    for sep in ("-", " ", "/"):
+        prefix = f"{brand_u}{sep}"
+        if part_u.startswith(prefix):
+            stripped = part_u[len(prefix):].strip()
+            if stripped and is_plausible_part_no(stripped):
+                return stripped
+    if part_u.startswith(brand_u) and len(part_u) > len(brand_u):
+        # Rare glued form without separator — only when remainder looks like a part.
+        remainder = part_u[len(brand_u):].lstrip("-/ ")
+        if remainder and is_plausible_part_no(remainder):
+            return remainder
+    return part_u
+
+
+def parse_brand_prefixed_part(token: str) -> tuple[str, str]:
+    """
+  Split customer tokens like SMC-AS2201F-01-04SA into (SMC, AS2201F-01-04SA).
+  """
+    token = str(token or "").strip().upper()
+    token = re.sub(r"\s+", " ", token)
+    if not token:
+        return "UNKNOWN", ""
+
+    for brand in sorted(set(KNOWN_BRAND_PREFIXES), key=len, reverse=True):
+        for sep in ("-", " ", "/"):
+            prefix = f"{brand}{sep}"
+            if token.startswith(prefix):
+                part = token[len(prefix):].strip().strip(":")
+                if part and is_plausible_part_no(part):
+                    return brand, part
+    return "UNKNOWN", token
+
+
+def normalize_inquiry_item(brand: str, part_no: str) -> tuple[str, str]:
+    """
+    Normalize brand + part from customer text.
+
+    Handles BRAND-PARTNUMBER lines (e.g. SMC-AS2201F-01-04SA) and prevents
+    duplicated descriptions like 'SMC SMC-AS2201F-01-04SA'.
+    """
+    brand_u = _canonical_brand(brand)
+    part_u = str(part_no or "").strip().upper()
+    part_u = re.sub(r"\s+", " ", part_u).strip(" :")
+
+    parsed_brand, parsed_part = parse_brand_prefixed_part(part_u)
+    if parsed_brand != "UNKNOWN":
+        if brand_u in ("UNKNOWN", "", parsed_brand):
+            brand_u = parsed_brand
+        part_u = parsed_part
+    elif brand_u != "UNKNOWN":
+        part_u = strip_leading_brand_from_part(brand_u, part_u)
+
+    return brand_u, part_u
+
+
+def format_inquiry_description(brand: str, part_no: str) -> str:
+    brand_u, part_u = normalize_inquiry_item(brand, part_no)
+    if brand_u == "UNKNOWN":
+        return f"UNKNOWN BRAND {part_u}"
+    return f"{brand_u} {part_u}"
 
 
 def clean_line(value: str) -> str:
@@ -367,6 +450,7 @@ def build_extracted_item(brand: str, raw_text: str, part_no: str, search_text: s
     part_no = clean_line(part_no).upper()
     search_text = clean_line(search_text).upper()
     brand = str(brand or "UNKNOWN").upper()
+    brand, part_no = normalize_inquiry_item(brand, part_no)
 
     candidates = build_candidates(part_no, search_text)
 

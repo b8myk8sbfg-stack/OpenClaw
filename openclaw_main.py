@@ -51,12 +51,16 @@ _RFQ_SYSTEM_INSTRUCTION = (
     "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
     "a single visible part with '2 pcs' means qty 2. "
     "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
+    "part_no must be the catalog part number ONLY — never repeat the brand (e.g. AS2201F-01-04SA, FU-35TZ). "
     "product_type is the visible product description on the label (example: PROXIMITY SENSOR, LIMIT SWITCH). "
     "Quantity must be a positive integer. Do not guess missing part numbers. "
     "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
+    "Brand-prefixed lines: SMC-AS2201F-01-04SA → brand=SMC, part_no=AS2201F-01-04SA; "
+    "KEYENCE-FU-35TZ → brand=KEYENCE, part_no=FU-35TZ; CPC-MR12WNSS → brand=CPC, part_no=MR12WNSS. "
+    "Never return part_no with a duplicated brand prefix when brand is already set. "
     "Do not include markdown, backticks, or conversational text. "
     'Example: [{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}, '
-    '{"part_no": "P36203010#1", "qty": 1, "brand": "SMC", "product_type": "CYLINDER"}]'
+    '{"part_no": "AS2201F-01-04SA", "qty": 2, "brand": "SMC", "product_type": "SPEED CONTROLLER"}]'
 )
 
 _RFQ_OCR_SYSTEM_INSTRUCTION = (
@@ -68,9 +72,11 @@ _RFQ_OCR_SYSTEM_INSTRUCTION = (
     "Extract EVERY distinct manufacturer part number present in the OCR output. "
     "Use customer caption for quantity hints. "
     "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
+    "part_no must be the catalog part number ONLY — never repeat the brand. "
     "product_type is the product description visible in OCR (example: PROGRAMMABLE CONTROLLER). "
     "Quantity must be a positive integer. Do not guess missing part numbers. "
     "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
+    "Strip leading brand prefixes from part_no when brand is known (SMC-AS2201F-01-04SA → brand=SMC, part_no=AS2201F-01-04SA). "
     "Do not include markdown, backticks, or conversational text."
 )
 
@@ -123,6 +129,18 @@ def _should_fallback_to_openai(exc: Exception) -> bool:
     return isinstance(exc, (APIConnectionError, APITimeoutError))
 
 
+def _normalize_rfq_extracted_item(part_no: str, brand: str, qty: int) -> dict:
+    """Strip duplicated brand prefixes from Copilot/OpenAI RFQ rows."""
+    try:
+        from inquiry_extraction_helper import normalize_inquiry_item
+
+        brand, part_no = normalize_inquiry_item(brand, part_no)
+    except Exception:
+        brand = str(brand or "UNKNOWN").strip().upper()
+        part_no = str(part_no or "").strip().upper()
+    return {"part_no": part_no, "qty": int(qty), "brand": brand}
+
+
 def _parse_rfq_json_array(raw_content: str, image_path: str = None) -> list:
     raw_content = str(raw_content or "").strip()
     if raw_content.startswith("```"):
@@ -152,7 +170,7 @@ def _parse_rfq_json_array(raw_content: str, image_path: str = None) -> list:
                 continue
             if image_path and not _visual_part_consistent(part_no, brand, product_type):
                 continue
-            extracted_items.append({"part_no": part_no, "qty": qty, "brand": brand})
+            extracted_items.append(_normalize_rfq_extracted_item(part_no, brand, qty))
     return extracted_items
 
 
@@ -376,11 +394,8 @@ def _extract_rfq_with_openai_vision(raw_email_body: str, image_path: str) -> lis
         except (TypeError, ValueError):
             qty = 1
         if part_no and qty > 0:
-            items.append({
-                "part_no": part_no,
-                "qty": qty,
-                "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
-            })
+            brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+            items.append(_normalize_rfq_extracted_item(part_no, brand, qty))
     return items
 
 
