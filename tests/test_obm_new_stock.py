@@ -46,6 +46,28 @@ class ObmNewStockTests(unittest.TestCase):
         finally:
             helper.STOCK = original_stock
 
+    def test_build_payload_uses_quotation_counter_two(self):
+        import obm_quotation_helper as helper
+
+        original_stock = helper.STOCK
+        helper.STOCK = [
+            {"pid": "NEW", "n_pid": "NEW", "n_stock": "NEW", "n_model": "NEW"},
+        ]
+        try:
+            payload, _ = helper.build_payload(
+                "A00043",
+                [{
+                    "desc": "SMC MXY12-150",
+                    "qty": 2,
+                    "price": "28.82",
+                    "pid": "MXY12-150",
+                    "brand": "SMC",
+                }],
+            )
+            self.assertEqual(payload.get("s_counter"), "2")
+        finally:
+            helper.STOCK = original_stock
+
 
 if __name__ == "__main__":
     unittest.main()

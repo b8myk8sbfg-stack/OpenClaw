@@ -27,6 +27,7 @@ DEFAULT_TAX_RATE = 0
 DEFAULT_CURRENCY = "RM"
 DEFAULT_STATUS = "W"
 DEFAULT_VALID_DAYS = 30
+DEFAULT_QUOTATION_COUNTER = os.getenv("OBM_QUOTATION_COUNTER", "2").strip() or "2"
 
 SKIP_MISSING_ITEMS = True
 NEW_STOCK_PID = "NEW"
@@ -442,6 +443,7 @@ def build_payload(cust_no, items):
 
     payload = {
         "s_custno": cust_no,
+        "s_counter": DEFAULT_QUOTATION_COUNTER,
         "s_date": today(),
         "valid_date": valid_date(),
         "currency_code": DEFAULT_CURRENCY,
