@@ -10,6 +10,10 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from scripts.runtime_deps import require_modules
+
+require_modules("pandas", "openpyxl")
+
 import pandas as pd
 
 DEFAULT_PATH = os.path.join(
