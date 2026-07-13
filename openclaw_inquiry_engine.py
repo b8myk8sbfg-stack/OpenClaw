@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.10-SMC-EXACT-PORTAL-QUOTE"
+VERSION = "v1.11-BURKERT-PRICELIST-NO-RFQ"
 
 WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
 
@@ -734,6 +734,76 @@ def build_rows_from_api(api_id, qty, customer_part=None):
     return rows, supplier_item
 
 
+def _try_burkert_price_list_row(
+    part_no,
+    qty,
+    desc=None,
+    brand="",
+    search_context="",
+    burkert_id="",
+    technical_specs=None,
+):
+    """Fill price and lead time from the Burkert offline price list when available."""
+    brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand_u != "BURKERT":
+        return None
+
+    try:
+        from burkert_price_list import (
+            format_burkert_id_display,
+            lookup_burkert_quote,
+            resolve_burkert_id,
+        )
+    except ImportError:
+        print("   ⚠️ [ENGINE] burkert_price_list not available — Burkert price list skipped.")
+        return None
+
+    resolved_id = resolve_burkert_id(
+        burkert_id=burkert_id,
+        technical_specs=technical_specs,
+        search_context=search_context,
+    )
+
+    quote = lookup_burkert_quote(
+        part_no,
+        qty=qty,
+        markup_divisor=MARKUP_DIVISOR,
+        search_context=search_context,
+        burkert_id=resolved_id,
+        technical_specs=technical_specs,
+    )
+    if not quote:
+        return None
+
+    label = resolved_id or part_no
+    moq_note = ""
+    if quote.get("moq_applied"):
+        moq_note = f" | MOQ applied ({quote.get('requested_qty')} → {quote.get('qty')})"
+    elif int(quote.get("moq") or 0) > 1:
+        moq_note = f" | MOQ {quote.get('moq')}"
+    print(
+        f"   ✅ [BURKERT] Price list match for {label}: "
+        f"RM {quote.get('price')} | LT {quote.get('lt')}{moq_note}"
+    )
+
+    customer_part = str(part_no or "").strip().upper()
+    return {
+        "desc": quote.get("desc") or desc or f"BURKERT {customer_part}",
+        "qty": int(quote.get("qty") or qty),
+        "requested_qty": int(quote.get("requested_qty") or qty),
+        "moq": int(quote.get("moq") or 0),
+        "moq_applied": bool(quote.get("moq_applied")),
+        "price": quote.get("price", "[TBC]"),
+        "lt": quote.get("lt", "[TBC]"),
+        "pid": customer_part,
+        "burkert_id": quote.get("burkert_id_display") or format_burkert_id_display(resolved_id),
+        "brand": "BURKERT",
+        "source": quote.get("source", "BURKERT_PRICE_LIST"),
+        "customer_part": customer_part,
+        "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+    }
+
+
 def _try_smc_portal_row(part_no, qty, desc=None, brand="", search_context=""):
     """Fill price and lead time from the SMC distributor web portal when available."""
     brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
@@ -836,6 +906,29 @@ def process_structured_items(structured_items):
                     print(f"   📡 [ENGINE] SMC portal partial — supplier RFQ for balance: {desc} | Qty: {qty}")
                 else:
                     print(f"   ✅ [ENGINE] SMC portal quote: {smc_row.get('desc')} | Qty: {qty}")
+                continue
+
+            burkert_row = _try_burkert_price_list_row(
+                part_no,
+                qty,
+                desc=desc,
+                brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
+                search_context=search_context,
+                burkert_id=item.get("burkert_id") or "",
+                technical_specs=item.get("technical_specs") or [],
+            )
+            if burkert_row:
+                formatted_rows.append(burkert_row)
+                if burkert_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
+                    tbc_by_brand.setdefault(inferred_brand, []).append({
+                        "desc": burkert_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": inferred_brand,
+                    })
+                    print(f"   📡 [ENGINE] Burkert price list partial — supplier RFQ: {desc} | Qty: {qty}")
+                else:
+                    print(f"   ✅ [ENGINE] Burkert price list quote: {burkert_row.get('desc')} | Qty: {qty}")
                 continue
 
             formatted_rows.append({

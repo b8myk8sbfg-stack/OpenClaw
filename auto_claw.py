@@ -16,11 +16,15 @@ from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
 from inquiry_extraction_helper import extract_clean_items_from_text, is_plausible_part_no
 from openclaw_main import unified_analyze
-from openclaw_inquiry_engine import resolve_warehouse_match, _try_smc_portal_row
+from openclaw_inquiry_engine import (
+    resolve_warehouse_match,
+    _try_smc_portal_row,
+    _try_burkert_price_list_row,
+)
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
-VERSION = "v1.17-SMC-EXACT-PORTAL-QUOTE"
+VERSION = "v1.18-BURKERT-PRICELIST-NO-RFQ"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -622,6 +626,63 @@ def _append_smc_portal_quote_row(formatted_initial_rows, tbc_by_brand, part_no, 
         print("   📡 SMC portal partial — supplier RFQ still required.")
     else:
         print("   ✅ SMC portal quote filled price/LT — no manual verification RFQ.")
+    return True
+
+
+def _is_burkert_brand(brand):
+    return str(brand or "").upper().replace("BÜRKERT", "BURKERT") == "BURKERT"
+
+
+def _append_burkert_price_list_quote_row(
+    formatted_initial_rows,
+    tbc_by_brand,
+    part_no,
+    qty,
+    search_context="",
+    burkert_id="",
+    technical_specs=None,
+):
+    """
+    Quote Burkert from offline price list after OBM has no stock.
+    Skips manual verification RFQ when price and lead time are filled.
+    """
+    part_no = str(part_no or "").strip().upper()
+    if not part_no:
+        return False
+
+    desc = f"BURKERT {part_no}"
+    print(f"   🔎 [BURKERT] Price list lookup for {part_no} (qty {qty})...")
+    burkert_row = _try_burkert_price_list_row(
+        part_no,
+        qty,
+        desc=desc,
+        brand="BURKERT",
+        search_context=search_context,
+        burkert_id=burkert_id,
+        technical_specs=technical_specs,
+    )
+    if not burkert_row:
+        return False
+
+    formatted_initial_rows.append({
+        "desc": burkert_row.get("desc") or desc,
+        "qty": burkert_row.get("qty", qty),
+        "price": burkert_row.get("price", "[TBC]"),
+        "lt": burkert_row.get("lt", "[TBC]"),
+        "pid": part_no,
+        "brand": "BURKERT",
+    })
+    if burkert_row.get("needs_supplier"):
+        append_supplier_rfq_item(
+            tbc_by_brand=tbc_by_brand,
+            brand="BURKERT",
+            desc=burkert_row.get("desc") or desc,
+            qty=burkert_row.get("qty", qty),
+            pid=part_no,
+        )
+        print("   📡 Burkert price list partial — supplier RFQ still required.")
+    else:
+        print("   ✅ Burkert price list filled price/LT — no manual verification RFQ.")
     return True
 
 
@@ -1509,6 +1570,13 @@ def process_latest_inquiry():
                             ):
                                 continue
 
+                        if _is_burkert_brand(brand):
+                            portal_part = customer_part or str(pn or api_id).strip().upper()
+                            if _append_burkert_price_list_quote_row(
+                                formatted_initial_rows, tbc_by_brand, portal_part, requested_qty
+                            ):
+                                continue
+
                         formatted_initial_rows.append({
                             'desc': full_desc,
                             'qty': requested_qty,
@@ -1543,6 +1611,18 @@ def process_latest_inquiry():
                 if brand == "SMC":
                     if _append_smc_portal_quote_row(
                         formatted_initial_rows, tbc_by_brand, part_no, missing["qty"]
+                    ):
+                        continue
+
+                if _is_burkert_brand(brand):
+                    if _append_burkert_price_list_quote_row(
+                        formatted_initial_rows,
+                        tbc_by_brand,
+                        part_no,
+                        missing["qty"],
+                        search_context=missing.get("search_context") or "",
+                        burkert_id=missing.get("burkert_id") or "",
+                        technical_specs=missing.get("technical_specs") or [],
                     ):
                         continue
 
