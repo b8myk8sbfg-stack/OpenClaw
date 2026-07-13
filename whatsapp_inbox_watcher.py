@@ -44,7 +44,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.39-LOCAL-OCR-COPILOT"
+VERSION = "v3.40-WHATSAPP-TEXT-BURST-FIFO"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -2855,6 +2855,9 @@ def plan_sequential_units(units, contact_name: str = ""):
     When customer sends photo then 'Quote 2 pcs' as separate messages,
     process image bubble first, then text bubble — one at a time.
     Only returns NEW unprocessed units (never the whole lookback window).
+
+    When several text-only messages arrive in one unread burst (e.g. RFQ then
+    signature), combine them FIFO instead of processing only the last bubble.
     """
     units = filter_processable_units(units, contact_name)
     if not units:
@@ -2909,9 +2912,22 @@ def plan_sequential_units(units, contact_name: str = ""):
         print("📨 Sequential plan: single document message")
         return [newest]
 
+    # Multiple consecutive text-only messages (e.g. quote request then signature):
+    # process oldest→newest in one cycle and combine for inquiry extraction.
+    if len(working) >= 2 and all(u["kind"] == "text" for u in working):
+        print(
+            f"📨 Sequential plan: {len(working)}-message text burst "
+            f"(FIFO combine, not last-message-only)"
+        )
+        return working
+
     if newest["kind"] == "text" and not prev:
         print("📨 Sequential plan: single text message")
         return [newest]
+
+    if newest["kind"] == "text" and prev and prev["kind"] == "text":
+        print("📨 Sequential plan: FIFO oldest of consecutive text messages")
+        return [working[0]]
 
     print(f"📨 Sequential plan: single {newest['kind']} message")
     return [newest]
@@ -3147,15 +3163,18 @@ def process_units_sequentially(driver, contact_name, plan, customer_contact):
             if is_trivial_ack(unit_text) and (copilot_items or image_path or document_items):
                 print(f"   📝 Text step: skipping ack {unit_text!r} — keeping photo/document extraction")
                 continue
-            latest_message = unit_text
-            media_info = detect_bubble_media(container, caption_text=unit_text)
+            if latest_message and unit_text:
+                latest_message = f"{latest_message}\n\n{unit_text}"
+            else:
+                latest_message = unit_text or latest_message
+            media_info = detect_bubble_media(container, caption_text=latest_message)
             if not copilot_items and not document_items:
                 analysis_result = run_unified_analyze(
                     driver,
                     contact_name,
-                    unit_text,
+                    latest_message,
                     image_path=None,
-                    original_message=unit_text,
+                    original_message=latest_message,
                 )
                 items = analysis_result.get("items") or []
                 if items:
@@ -4832,7 +4851,6 @@ def process_watched_contacts(driver, max_contacts: int = 1):
 
         print(f"   🆕 {contact_name}: new incoming detected — processing now")
         process_open_chat(driver)
-        mark_watch_contact_processed(contact_name, fingerprint)
         processed_any = True
         print("↩️ Returning to WhatsApp chat list after watch contact...")
         ensure_on_chat_list(driver)
@@ -4954,13 +4972,6 @@ def watch_unread_with_existing_driver(driver):
         return
 
     process_open_chat(driver)
-
-    try:
-        contact_name = get_contact_name_from_open_chat(driver)
-        units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
-        mark_watch_contact_processed(contact_name, build_process_fingerprint(units, contact_name))
-    except Exception:
-        pass
 
     print("↩️ Returning to WhatsApp chat list after completed chat...")
     ensure_on_chat_list(driver)
