@@ -2972,10 +2972,16 @@ def run_unified_analyze(
             f"   ✅ OpenAI fallback extracted {len(result['items'])} item(s) "
             "after Copilot failure"
         )
-    elif result.get("ocr_used"):
+    elif result.get("ocr_used") and result.get("source") == "copilot":
         print(
             f"   📄 Local OCR → Copilot text route ({result.get('route')}) "
             f"extracted {len(result.get('items') or [])} item(s)"
+        )
+    elif result.get("route") == "openai_vision_ocr_fallback":
+        print(
+            f"   🖼️ OpenAI vision used after OCR fallback "
+            f"({result.get('error', {}).get('message', 'ocr_unavailable')}) — "
+            f"{len(result.get('items') or [])} item(s)"
         )
     return result
 

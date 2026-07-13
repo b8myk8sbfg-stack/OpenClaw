@@ -87,7 +87,7 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         self.assertIn("HTTP status: 503", alert)
         self.assertIn("报价，我要两个", alert)
 
-    def test_image_routes_through_ocr_before_copilot_vision(self):
+    def test_image_routes_through_ocr_to_copilot_text(self):
         ocr_payload = {
             "engine": "tesseract",
             "full_text": "CPM1A-30CDR-D-V1\nOMRON",
@@ -114,34 +114,50 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         self.assertIn("OCR result (JSON)", user_content)
         self.assertIn("CPM1A-30CDR-D-V1", user_content)
 
-    def test_empty_ocr_falls_back_to_copilot_vision(self):
+    def test_empty_ocr_goes_to_openai_vision(self):
         ocr_payload = {
             "engine": "tesseract",
             "full_text": "",
             "lines": [],
-            "error": "no_text_detected",
+            "error": "tesseract_not_installed",
         }
-        with patch.dict(os.environ, {"OPENCLAW_OCR_ENABLED": "1"}):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENCLAW_OCR_ENABLED": "1"}):
             with patch("local_ocr.extract_text_from_image", return_value=ocr_payload):
                 with patch.object(
                     openclaw_main,
-                    "_build_rfq_user_content",
-                    return_value=[{"type": "text", "text": "vision-fallback"}],
-                ):
-                    with patch.object(
-                        openclaw_main,
-                        "_call_copilot_rfq",
-                        return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 1, "brand": "OMRON"}],
-                    ) as copilot_mock:
-                        result = openclaw_main._extract_rfq_with_copilot_only(
-                            "quote 1 pc",
-                            image_path="/tmp/label.png",
-                        )
+                    "_extract_rfq_with_openai",
+                    return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 1, "brand": "OMRON"}],
+                ) as openai_mock:
+                    result = openclaw_main.unified_analyze(
+                        "quote 1 pc",
+                        image_path="/tmp/label.png",
+                    )
 
-        self.assertEqual(result["route"], "copilot_visual")
-        self.assertFalse(result["ocr_used"])
-        self.assertEqual(copilot_mock.call_count, 1)
-        self.assertIsInstance(copilot_mock.call_args[0][2], list)
+        openai_mock.assert_called_once()
+        self.assertEqual(result["source"], "openai")
+        self.assertEqual(result["route"], "openai_vision_ocr_fallback")
+        self.assertFalse(result["copilot_failed"])
+        self.assertTrue(result["fallback_used"])
+
+    def test_empty_ocr_without_openai_key_returns_empty(self):
+        ocr_payload = {
+            "engine": "tesseract",
+            "full_text": "",
+            "lines": [],
+            "error": "tesseract_not_installed",
+        }
+        env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        with patch.dict(os.environ, {**env, "OPENCLAW_OCR_ENABLED": "1"}, clear=True):
+            with patch("local_ocr.extract_text_from_image", return_value=ocr_payload):
+                with patch.object(openclaw_main, "_extract_rfq_with_openai") as openai_mock:
+                    result = openclaw_main.unified_analyze(
+                        "quote 1 pc",
+                        image_path="/tmp/label.png",
+                    )
+
+        openai_mock.assert_not_called()
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["route"], "ocr_openai_skipped")
 
 
 if __name__ == "__main__":
