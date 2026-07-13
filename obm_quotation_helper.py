@@ -322,6 +322,42 @@ def parse_price(value):
         return 0.0
 
 
+def enrich_smc_item_from_portal(clean_item: dict) -> dict:
+    """Fill SMC sell price from dealer portal when email path left price at zero."""
+    brand = str(clean_item.get("brand") or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand != "SMC":
+        return clean_item
+
+    if float(clean_item.get("price") or 0) > 0:
+        return clean_item
+
+    part_no = str(clean_item.get("customer_part") or "").strip()
+    if not part_no:
+        return clean_item
+
+    try:
+        from smc_portal_lookup import lookup_smc_quote
+    except ImportError:
+        print("   ⚠️ [OBM] smc_portal_lookup unavailable — SMC portal enrich skipped.")
+        return clean_item
+
+    print(f"   🔎 [OBM] SMC portal enrich for {part_no} (qty {clean_item.get('qty', 1)})...")
+    quote = lookup_smc_quote(part_no, qty=int(clean_item.get("qty") or 1))
+    if not quote:
+        return clean_item
+
+    portal_price = parse_price(quote.get("price"))
+    if portal_price > 0:
+        clean_item["price"] = portal_price
+        if quote.get("desc"):
+            clean_item["desc"] = quote["desc"]
+        print(f"   ✅ [OBM] SMC portal enrich: {part_no} → RM {portal_price:,.2f}")
+    else:
+        print(f"   ⚠️ [OBM] SMC portal enrich: {part_no} still has no price")
+
+    return clean_item
+
+
 def clean_item_for_obm(item):
     desc = str(item.get("desc") or item.get("description") or "").strip()
     qty = int(item.get("qty") or 1)
@@ -357,6 +393,7 @@ def build_payload(cust_no, items):
 
     for item in items:
         clean = clean_item_for_obm(item)
+        clean = enrich_smc_item_from_portal(clean)
 
         desc = clean["desc"]
         qty = clean["qty"]

@@ -846,6 +846,7 @@ def _try_smc_portal_row(part_no, qty, desc=None, brand="", search_context=""):
         "source": quote.get("source", "SMC_PORTAL"),
         "customer_part": customer_part,
         "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+        "smc_portal_hit": True,
     }
 
 
@@ -896,14 +897,11 @@ def process_structured_items(structured_items):
             )
             if smc_row:
                 formatted_rows.append(smc_row)
-                if smc_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
-                    tbc_by_brand.setdefault(inferred_brand, []).append({
-                        "desc": smc_row.get("desc") or desc,
-                        "qty": qty,
-                        "pid": part_no,
-                        "brand": inferred_brand,
-                    })
-                    print(f"   📡 [ENGINE] SMC portal partial — supplier RFQ for balance: {desc} | Qty: {qty}")
+                if smc_row.get("needs_supplier"):
+                    print(
+                        f"   ⚠️ [ENGINE] SMC portal partial for {desc} | Qty: {qty} "
+                        "(no internal manual RFQ — portal is source)"
+                    )
                 else:
                     print(f"   ✅ [ENGINE] SMC portal quote: {smc_row.get('desc')} | Qty: {qty}")
                 continue

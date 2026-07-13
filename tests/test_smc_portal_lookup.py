@@ -75,6 +75,16 @@ class SmcLeadTimeTests(unittest.TestCase):
     def test_parse_money_myr(self):
         self.assertEqual(parse_money("MYR 285.28"), 285.28)
 
+    def test_pick_best_price_row_prefers_priced_row(self):
+        from smc_portal_lookup import pick_best_price_row
+
+        rows = [
+            {"whs": "JH", "avail": "0", "pnt1": "0", "pnt2": "0", "net_price_text": ""},
+            {"whs": "JH", "avail": "0", "pnt1": "0", "pnt2": "0", "net_price_text": "MYR 16.32"},
+        ]
+        best = pick_best_price_row(rows)
+        self.assertEqual(best["net_price_text"], "MYR 16.32")
+
 
 if __name__ == "__main__":
     unittest.main()

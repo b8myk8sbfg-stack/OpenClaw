@@ -633,16 +633,13 @@ def _append_smc_portal_quote_row(formatted_initial_rows, tbc_by_brand, part_no, 
         "lt": smc_row.get("lt", "[TBC]"),
         "pid": part_no,
         "brand": "SMC",
+        "smc_portal_hit": True,
     })
     if smc_row.get("needs_supplier"):
-        append_supplier_rfq_item(
-            tbc_by_brand=tbc_by_brand,
-            brand="SMC",
-            desc=smc_row.get("desc") or desc,
-            qty=smc_row.get("qty", qty),
-            pid=part_no,
+        print(
+            "   ⚠️ SMC portal returned part info but price/LT incomplete — "
+            "skipping internal manual verification RFQ (SMC portal is source)."
         )
-        print("   📡 SMC portal partial — supplier RFQ still required.")
     else:
         print("   ✅ SMC portal quote filled price/LT — no manual verification RFQ.")
     return True
@@ -1644,7 +1641,7 @@ def process_latest_inquiry():
                             formatted_initial_rows, tbc_by_brand, part_no, missing["qty"]
                         ):
                             continue
-    
+
                     if _is_burkert_brand(brand):
                         if _append_burkert_price_list_quote_row(
                             formatted_initial_rows,
@@ -1666,8 +1663,9 @@ def process_latest_inquiry():
                         'brand': brand,
                     })
     
-                    # Known brand but exact stock not found -> supplier RFQ (SMC portal tried above).
-                    if brand != "UNKNOWN":
+                    # Known brand but exact stock not found -> supplier RFQ.
+                    # SMC portal is tried above; do not RFQ SMC when portal already returned a row.
+                    if brand != "UNKNOWN" and brand != "SMC":
                         if brand not in tbc_by_brand:
                             tbc_by_brand[brand] = []
     

@@ -296,15 +296,27 @@ def pick_best_price_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not rows:
         return None
 
+    priced_rows = [
+        row for row in rows
+        if parse_money(str(row.get("net_price_text") or "")) is not None
+    ]
+    candidates = priced_rows or rows
+
     def sort_key(row: dict[str, Any]) -> tuple:
         whs = str(row.get("whs") or "").upper()
         in_peninsula = whs in PENINSULA_WAREHOUSES
         avail = parse_qty(row.get("avail"))
         pnt = parse_qty(row.get("pnt1")) + parse_qty(row.get("pnt2"))
-        price = parse_money(str(row.get("net_price_text") or "")) or 999999999.0
-        return (0 if in_peninsula and (avail > 0 or pnt > 0) else 1, price)
+        parsed_price = parse_money(str(row.get("net_price_text") or ""))
+        price = parsed_price if parsed_price is not None else 999999999.0
+        has_price = 0 if parsed_price is not None else 1
+        return (
+            has_price,
+            0 if in_peninsula and (avail > 0 or pnt > 0) else 1,
+            price,
+        )
 
-    return sorted(rows, key=sort_key)[0]
+    return sorted(candidates, key=sort_key)[0]
 
 
 def build_stock_note(rows: list[dict[str, Any]]) -> str:
@@ -756,6 +768,33 @@ def _scrape_item_list(driver) -> list[dict[str, Any]]:
     return []
 
 
+def _rows_have_price(rows: list[dict[str, Any]]) -> bool:
+    return any(parse_money(str(row.get("net_price_text") or "")) is not None for row in rows)
+
+
+def _scroll_item_grid(driver) -> None:
+    try:
+        driver.execute_script(
+            "document.querySelectorAll('.k-grid-content, .k-virtual-scrollable-wrap')"
+            ".forEach(el => { try { el.scrollLeft = el.scrollWidth; } catch (e) {} });"
+        )
+    except Exception:
+        pass
+
+
+def _wait_for_item_grid(driver, timeout: float = 15.0) -> list[dict[str, Any]]:
+    end = time.time() + timeout
+    rows: list[dict[str, Any]] = []
+    while time.time() < end:
+        rows = _scrape_item_list(driver)
+        if rows and _rows_have_price(rows):
+            return rows
+        if rows:
+            return rows
+        time.sleep(0.5)
+    return rows
+
+
 def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
     if not _navigate_item_enquiry(driver):
         print("⚠️ [SMC] Could not open Item Enquiry page.")
@@ -786,8 +825,15 @@ def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
         return []
 
     enquire.click()
-    time.sleep(3)
-    return _scrape_item_list(driver)
+    rows = _wait_for_item_grid(driver, timeout=15.0)
+    if rows and not _rows_have_price(rows):
+        time.sleep(2)
+        _scroll_item_grid(driver)
+        time.sleep(1)
+        rescraped = _scrape_item_list(driver)
+        if rescraped:
+            rows = rescraped
+    return rows
 
 
 def search_portal_part(driver, part_no: str, _depth: int = 0) -> dict[str, Any] | None:
@@ -874,34 +920,7 @@ def _cache_put(part_no: str, data: dict[str, Any]) -> None:
     _save_cache(cache)
 
 
-def lookup_smc_quote(
-    part_no: str,
-    qty: int = 1,
-    markup_divisor: float = 0.72,
-    search_context: str = "",
-) -> dict[str, Any] | None:
-    if not smc_portal_enabled():
-        return None
-
-    part_no = str(part_no or "").strip()
-    if not part_no:
-        return None
-
-    cached = _cache_get(part_no)
-    if cached:
-        print(f"   ♻️ [SMC] Cache hit for {part_no!r}")
-        return dict(cached)
-
-    try:
-        driver = get_driver()
-        hit = search_portal_part(driver, part_no)
-    except Exception as exc:
-        print(f"❌ [SMC] Portal lookup failed for {part_no!r}: {exc}")
-        return None
-
-    if not hit:
-        return None
-
+def _build_quote_from_hit(hit: dict[str, Any], part_no: str, qty: int, markup_divisor: float) -> dict[str, Any]:
     net_price = hit.get("net_price")
     lead_time = str(hit.get("lead_time") or LT_INDENT)
     requested_qty = max(1, int(qty))
@@ -916,7 +935,7 @@ def lookup_smc_quote(
     if not desc.upper().startswith("SMC"):
         desc = f"SMC {desc}"
 
-    quote = {
+    return {
         "desc": desc,
         "qty": requested_qty,
         "requested_qty": requested_qty,
@@ -930,6 +949,57 @@ def lookup_smc_quote(
         "source": "SMC_PORTAL",
         "replaced_obsolete_part": hit.get("replaced_obsolete_part"),
     }
-    _cache_put(part_no, quote)
+
+
+def lookup_smc_quote(
+    part_no: str,
+    qty: int = 1,
+    markup_divisor: float = 0.72,
+    search_context: str = "",
+    allow_cache: bool = True,
+) -> dict[str, Any] | None:
+    if not smc_portal_enabled():
+        return None
+
+    part_no = str(part_no or "").strip()
+    if not part_no:
+        return None
+
+    if allow_cache:
+        cached = _cache_get(part_no)
+        if cached and str(cached.get("price") or "") not in ("", "[TBC]"):
+            print(f"   ♻️ [SMC] Cache hit for {part_no!r}")
+            return dict(cached)
+        if cached and str(cached.get("price") or "") == "[TBC]":
+            print(f"   ♻️ [SMC] Ignoring cached TBC quote for {part_no!r} — re-querying portal")
+
+    try:
+        driver = get_driver()
+        hit = search_portal_part(driver, part_no)
+        if hit and hit.get("net_price") is None:
+            print(f"   🔁 [SMC] Price missing on first scrape for {part_no!r} — retrying")
+            time.sleep(2)
+            _scroll_item_grid(driver)
+            time.sleep(1)
+            retry_hit = search_portal_part(driver, part_no)
+            if retry_hit and retry_hit.get("net_price") is not None:
+                hit = retry_hit
+    except Exception as exc:
+        print(f"❌ [SMC] Portal lookup failed for {part_no!r}: {exc}")
+        return None
+
+    if not hit:
+        return None
+
+    quote = _build_quote_from_hit(hit, part_no, qty, markup_divisor)
+    lead_time = quote["lt"]
+    price_display = quote["price"]
+    matched_part = quote["smc_part"]
+
+    if quote.get("net_price") is not None:
+        _cache_put(part_no, quote)
+    else:
+        print(f"   ⚠️ [SMC] {matched_part}: description found but N/Price empty — not caching")
+
     print(f"   ✅ [SMC] {matched_part}: RM {price_display} | LT {lead_time}")
     return quote
