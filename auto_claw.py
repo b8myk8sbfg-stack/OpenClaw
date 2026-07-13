@@ -16,10 +16,11 @@ from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
 from inquiry_extraction_helper import extract_clean_items_from_text, is_plausible_part_no
 from openclaw_main import unified_analyze
+from openclaw_inquiry_engine import resolve_warehouse_match, _try_smc_portal_row
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
-VERSION = "v1.15-EMAIL-COPILOT-PRIMARY"
+VERSION = "v1.16-SMC-PORTAL-NEW-STOCK"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -170,23 +171,31 @@ def _merge_unified_items_into_quote(unified_items, quote_items, missing_layer2_i
             print(f"   ⚠️ Rejected implausible unified part: {part_no!r}")
             continue
 
-        stock_match = next(
-            (
-                stock_item for stock_item in STOCK_DB
-                if normalize_part(stock_item.get("api_pid", "")) == part_norm
-            ),
-            None,
+        stock_match = resolve_warehouse_match(
+            part_no,
+            declared_brand=brand,
+            qty=qty,
+            source=item.get("source") or "UNIFIED_ANALYZE",
         )
 
         if stock_match:
             quote_items.append({
-                "data": stock_match,
+                "data": {
+                    "api_pid": stock_match["api_id"],
+                    "regex": "",
+                    "len": len(stock_match["api_id"]),
+                    "is_partial": False,
+                    "norm": part_norm,
+                },
                 "qty": qty,
                 "matched_text": part_no,
                 "extractor_source": "UNIFIED_ANALYZE",
             })
             detected_parts_norm.add(part_norm)
-            print(f"   ✅ Unified stock match | Brand: {brand} | Part: {part_no} | Qty: {qty}")
+            print(
+                f"   ✅ Unified warehouse match | Brand: {brand} | Part: {part_no} | "
+                f"Stock ID: {stock_match['api_id']} | Qty: {qty}"
+            )
         else:
             missing_layer2_items.append({
                 "brand": brand,
@@ -1455,12 +1464,44 @@ def process_latest_inquiry():
                 else:
                     desc = f"{brand} {part_no}"
 
+                smc_row = None
+                if brand == "SMC":
+                    print(f"   🔎 [SMC] Portal lookup for {part_no} (qty {missing['qty']})...")
+                    smc_row = _try_smc_portal_row(
+                        part_no,
+                        missing["qty"],
+                        desc=desc,
+                        brand=brand,
+                    )
+
+                if smc_row:
+                    formatted_initial_rows.append({
+                        "desc": smc_row.get("desc") or desc,
+                        "qty": smc_row.get("qty", missing["qty"]),
+                        "price": smc_row.get("price", "[TBC]"),
+                        "lt": smc_row.get("lt", "[TBC]"),
+                        "pid": smc_row.get("pid") or part_no,
+                        "brand": "SMC",
+                    })
+                    if smc_row.get("needs_supplier"):
+                        if brand not in tbc_by_brand:
+                            tbc_by_brand[brand] = []
+                        tbc_by_brand[brand].append({
+                            "desc": smc_row.get("desc") or desc,
+                            "qty": smc_row.get("qty", missing["qty"]),
+                        })
+                        print(f"   📡 SMC portal partial — supplier RFQ still required.")
+                    else:
+                        print(f"   ✅ SMC portal quote filled price/LT — no supplier RFQ needed.")
+                    continue
+
                 formatted_initial_rows.append({
                     'desc': desc,
                     'qty': missing['qty'],
                     'price': "[TBC]",
                     'lt': "[TBC]",
-                    'pid': part_no
+                    'pid': part_no,
+                    'brand': brand,
                 })
 
                 # IMPORTANT RULE v1.11:
