@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.08-STORE-QTY-SPLIT-BALANCE"
+VERSION = "v1.09-SMC-PORTAL-NEW-STOCK"
 
 WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
 
@@ -18,6 +18,9 @@ OBM_API_URL = os.getenv("OBM_API_URL", "").rstrip("/")
 OBM_API_KEY = os.getenv("OBM_API_KEY")
 OBM_API_SECRET = os.getenv("OBM_API_SECRET")
 OBM_AUTH = HTTPBasicAuth(OBM_API_KEY, OBM_API_SECRET)
+
+# Customer sell price = purchase cost / MARKUP_DIVISOR (0.72 → ~38.9% markup on cost).
+MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
 
 KNOWN_BRANDS = {
     "OMRON", "SMC", "BURKERT", "BÜRKERT", "LEGRIS", "PANASONIC", "PISCO",
@@ -722,6 +725,44 @@ def build_rows_from_api(api_id, qty, customer_part=None):
     return rows, supplier_item
 
 
+def _try_smc_portal_row(part_no, qty, desc=None, brand="", search_context=""):
+    """Fill price and lead time from the SMC distributor web portal when available."""
+    brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand_u != "SMC":
+        return None
+
+    try:
+        from smc_portal_lookup import lookup_smc_quote
+    except ImportError:
+        print("   ⚠️ [ENGINE] smc_portal_lookup not available — SMC portal search skipped.")
+        return None
+
+    quote = lookup_smc_quote(
+        part_no,
+        qty=qty,
+        markup_divisor=MARKUP_DIVISOR,
+        search_context=search_context,
+    )
+    if not quote:
+        return None
+
+    return {
+        "desc": quote.get("desc") or desc or part_no,
+        "qty": int(quote.get("qty") or qty),
+        "requested_qty": int(quote.get("requested_qty") or qty),
+        "moq": int(quote.get("moq") or 0),
+        "moq_applied": bool(quote.get("moq_applied")),
+        "price": quote.get("price", "[TBC]"),
+        "lt": quote.get("lt", "[TBC]"),
+        "pid": quote.get("smc_part") or part_no,
+        "smc_part": quote.get("smc_part") or part_no,
+        "brand": "SMC",
+        "source": quote.get("source", "SMC_PORTAL"),
+        "customer_part": part_no,
+        "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+    }
+
+
 # Backward-compatible wrapper for any old caller.
 def build_row_from_api(api_id, qty, customer_part=None):
     rows, supplier_item = build_rows_from_api(api_id, qty, customer_part)
@@ -758,6 +799,28 @@ def process_structured_items(structured_items):
         else:
             inferred_brand = declared_brand if declared_brand != "UNKNOWN" else infer_brand_from_part(part_no)
             desc = item.get("desc") or (f"{inferred_brand} {part_no}" if inferred_brand != "UNKNOWN" else part_no)
+            search_context = item.get("search_context") or ""
+
+            smc_row = _try_smc_portal_row(
+                part_no,
+                qty,
+                desc=desc,
+                brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
+                search_context=search_context,
+            )
+            if smc_row:
+                formatted_rows.append(smc_row)
+                if smc_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
+                    tbc_by_brand.setdefault(inferred_brand, []).append({
+                        "desc": smc_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": inferred_brand,
+                    })
+                    print(f"   📡 [ENGINE] SMC portal partial — supplier RFQ for balance: {desc} | Qty: {qty}")
+                else:
+                    print(f"   ✅ [ENGINE] SMC portal quote: {smc_row.get('desc')} | Qty: {qty}")
+                continue
 
             formatted_rows.append({
                 "desc": desc,
