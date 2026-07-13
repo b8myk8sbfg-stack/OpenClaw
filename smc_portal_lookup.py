@@ -380,7 +380,7 @@ def resolve_hit_from_rows(
                 hit["replacement_part"] = rec
             return hit
 
-    # Accessory variants (e.g. -M9B) listed but no exact row — use closest prefix match
+    # Accessory variants (e.g. -M9B) at top when exact row is lower in the grid.
     compact = compact_part(searched_part)
     prefix_rows = [
         r for r in rows
@@ -389,7 +389,14 @@ def resolve_hit_from_rows(
     if prefix_rows:
         best = pick_best_price_row(prefix_rows)
         if best:
-            return row_to_hit(best, searched_part, prefix_rows)
+            hit = row_to_hit(best, searched_part, prefix_rows)
+            matched_pn = str(hit.get("part_no") or "")
+            if not parts_equal(matched_pn, searched_part):
+                print(
+                    f"   ⚠️ [SMC] Prefix variant {matched_pn!r} used — "
+                    f"exact {searched_part!r} not in scraped rows"
+                )
+            return hit
 
     return None
 
@@ -758,6 +765,127 @@ def _navigate_item_enquiry(driver) -> bool:
     return False
 
 
+def _row_merge_key(row: dict[str, Any]) -> str:
+    return f"{compact_part(str(row.get('pn') or ''))}|{str(row.get('whs') or '').upper()}"
+
+
+def _merge_grid_rows(
+    existing: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen = {_row_merge_key(row) for row in existing}
+    merged = list(existing)
+    for row in new_rows:
+        key = _row_merge_key(row)
+        if not compact_part(str(row.get("pn") or "")):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged
+
+
+def _scroll_grid_to_top(driver) -> None:
+    try:
+        driver.execute_script(
+            "const c = document.querySelector('.k-grid-content') "
+            "|| document.querySelector('.k-virtual-scrollable-wrap'); "
+            "if (c) c.scrollTop = 0;"
+        )
+    except Exception:
+        pass
+
+
+def _scroll_grid_down(driver, pixels: int = 280) -> dict[str, Any]:
+    try:
+        info = driver.execute_script(
+            "const step = arguments[0]; "
+            "const c = document.querySelector('.k-grid-content') "
+            "|| document.querySelector('.k-virtual-scrollable-wrap'); "
+            "if (!c) return {atEnd: true, scrollTop: 0, scrollHeight: 0, clientHeight: 0}; "
+            "c.scrollTop = Math.min(c.scrollTop + step, c.scrollHeight); "
+            "return {"
+            "  scrollTop: c.scrollTop,"
+            "  scrollHeight: c.scrollHeight,"
+            "  clientHeight: c.clientHeight,"
+            "  atEnd: c.scrollTop + c.clientHeight >= c.scrollHeight - 2"
+            "};",
+            pixels,
+        )
+        return info if isinstance(info, dict) else {"atEnd": True}
+    except Exception:
+        return {"atEnd": True}
+
+
+def _exact_rows_with_price(
+    rows: list[dict[str, Any]],
+    searched_part: str,
+) -> list[dict[str, Any]]:
+    exact = pick_exact_part_rows(rows, searched_part)
+    return [
+        row for row in exact
+        if parse_money(str(row.get("net_price_text") or "")) is not None
+    ]
+
+
+def _scrape_item_list_full(
+    driver,
+    searched_part: str = "",
+    max_rounds: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    SMC Item Enquiry uses a Kendo virtual grid — exact P/N rows are often at the
+    bottom while accessory variants fill the top. Scroll vertically and merge rows.
+    """
+    _scroll_grid_to_top(driver)
+    time.sleep(0.3)
+
+    all_rows: list[dict[str, Any]] = []
+    stagnant_rounds = 0
+    prev_count = 0
+
+    for round_idx in range(max_rounds):
+        _scroll_item_grid(driver)
+        batch = _scrape_item_list(driver)
+        all_rows = _merge_grid_rows(all_rows, batch)
+
+        if searched_part and _exact_rows_with_price(all_rows, searched_part):
+            print(
+                f"   ✅ [SMC] Exact {searched_part!r} with price found "
+                f"after vertical scroll (round {round_idx + 1}, {len(all_rows)} row(s))"
+            )
+            break
+
+        scroll_info = _scroll_grid_down(driver, 280)
+        time.sleep(0.25)
+
+        if len(all_rows) == prev_count:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+        prev_count = len(all_rows)
+
+        if scroll_info.get("atEnd"):
+            _scroll_item_grid(driver)
+            batch = _scrape_item_list(driver)
+            all_rows = _merge_grid_rows(all_rows, batch)
+            break
+
+        if stagnant_rounds >= 4 and scroll_info.get("atEnd"):
+            break
+
+    if searched_part and not pick_exact_part_rows(all_rows, searched_part):
+        print(
+            f"   ⚠️ [SMC] Exact {searched_part!r} not seen after full grid scroll "
+            f"({len(all_rows)} row(s) collected)"
+        )
+    elif len(all_rows) > 15:
+        print(f"   📜 [SMC] Full grid scrape collected {len(all_rows)} unique row(s)")
+
+    return all_rows
+
+
 def _scrape_item_list(driver) -> list[dict[str, Any]]:
     try:
         rows = driver.execute_script(SCRAPE_ITEM_LIST_JS, [])
@@ -780,19 +908,6 @@ def _scroll_item_grid(driver) -> None:
         )
     except Exception:
         pass
-
-
-def _wait_for_item_grid(driver, timeout: float = 15.0) -> list[dict[str, Any]]:
-    end = time.time() + timeout
-    rows: list[dict[str, Any]] = []
-    while time.time() < end:
-        rows = _scrape_item_list(driver)
-        if rows and _rows_have_price(rows):
-            return rows
-        if rows:
-            return rows
-        time.sleep(0.5)
-    return rows
 
 
 def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
@@ -825,14 +940,18 @@ def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
         return []
 
     enquire.click()
-    rows = _wait_for_item_grid(driver, timeout=15.0)
+
+    # Wait until the grid renders at least one row.
+    end = time.time() + 15.0
+    while time.time() < end:
+        if _scrape_item_list(driver):
+            break
+        time.sleep(0.5)
+
+    rows = _scrape_item_list_full(driver, searched_part=part_no)
     if rows and not _rows_have_price(rows):
         time.sleep(2)
-        _scroll_item_grid(driver)
-        time.sleep(1)
-        rescraped = _scrape_item_list(driver)
-        if rescraped:
-            rows = rescraped
+        rows = _scrape_item_list_full(driver, searched_part=part_no)
     return rows
 
 

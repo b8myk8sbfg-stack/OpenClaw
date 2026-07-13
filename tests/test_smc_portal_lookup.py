@@ -85,6 +85,45 @@ class SmcLeadTimeTests(unittest.TestCase):
         best = pick_best_price_row(rows)
         self.assertEqual(best["net_price_text"], "MYR 16.32")
 
+    def test_resolve_hit_prefers_exact_row_at_bottom(self):
+        from smc_portal_lookup import resolve_hit_from_rows
+
+        rows = [
+            {
+                "pn": "AS1002F-04A",
+                "whs": "JH",
+                "avail": "0",
+                "pnt1": "0",
+                "pnt2": "0",
+                "net_price_text": "",
+                "description": "SMC SPEED CONTROLLER VARIANT",
+            },
+            {
+                "pn": "AS1002F-04",
+                "whs": "SJ",
+                "avail": "2681",
+                "pnt1": "0",
+                "pnt2": "0",
+                "net_price_text": "MYR 20.75",
+                "description": "SMC SPEED CONTROLLER",
+            },
+        ]
+        hit = resolve_hit_from_rows(rows, "AS1002F-04")
+        self.assertEqual(hit["part_no"], "AS1002F-04")
+        self.assertEqual(hit["net_price"], 20.75)
+        self.assertEqual(hit["lead_time"], "1 week")
+
+    def test_merge_grid_rows_deduplicates_warehouse_rows(self):
+        from smc_portal_lookup import _merge_grid_rows
+
+        first = [{"pn": "AS1002F-04", "whs": "SJ", "net_price_text": "MYR 20.75"}]
+        second = [
+            {"pn": "AS1002F-04", "whs": "SJ", "net_price_text": "MYR 20.75"},
+            {"pn": "AS1002F-04", "whs": "JH", "net_price_text": "MYR 18.00"},
+        ]
+        merged = _merge_grid_rows(first, second)
+        self.assertEqual(len(merged), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
