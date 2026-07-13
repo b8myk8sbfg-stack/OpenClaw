@@ -20,7 +20,7 @@ from openclaw_inquiry_engine import resolve_warehouse_match, _try_smc_portal_row
 from email_message_classifier import classify_email, log_email_classification
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
-VERSION = "v1.16-SMC-PORTAL-NEW-STOCK"
+VERSION = "v1.17-SMC-EXACT-PORTAL-QUOTE"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -571,6 +571,58 @@ def append_supplier_rfq_item(tbc_by_brand, brand, desc, qty, pid=None):
         item["pid"] = pid
 
     tbc_by_brand[brand].append(item)
+
+
+def _customer_part_matches_obm_product(customer_part, obm_product, api_id):
+    """True when OBM product is the exact part the customer requested."""
+    customer_norm = normalize_part(customer_part)
+    if not customer_norm:
+        return True
+    for field in (
+        obm_product.get("product_name"),
+        obm_product.get("model"),
+        api_id,
+    ):
+        if normalize_part(field) == customer_norm:
+            return True
+    return False
+
+
+def _append_smc_portal_quote_row(formatted_initial_rows, tbc_by_brand, part_no, qty):
+    """
+    Quote SMC via distributor portal after OBM has no exact stock.
+    Skips manual verification RFQ when portal returns price and lead time.
+    """
+    part_no = str(part_no or "").strip().upper()
+    if not part_no:
+        return False
+
+    desc = f"SMC {part_no}"
+    print(f"   🔎 [SMC] Portal lookup for {part_no} (qty {qty})...")
+    smc_row = _try_smc_portal_row(part_no, qty, desc=desc, brand="SMC")
+    if not smc_row:
+        return False
+
+    formatted_initial_rows.append({
+        "desc": smc_row.get("desc") or desc,
+        "qty": smc_row.get("qty", qty),
+        "price": smc_row.get("price", "[TBC]"),
+        "lt": smc_row.get("lt", "[TBC]"),
+        "pid": part_no,
+        "brand": "SMC",
+    })
+    if smc_row.get("needs_supplier"):
+        append_supplier_rfq_item(
+            tbc_by_brand=tbc_by_brand,
+            brand="SMC",
+            desc=smc_row.get("desc") or desc,
+            qty=smc_row.get("qty", qty),
+            pid=part_no,
+        )
+        print("   📡 SMC portal partial — supplier RFQ still required.")
+    else:
+        print("   ✅ SMC portal quote filled price/LT — no manual verification RFQ.")
+    return True
 
 
 def alert_manager_for_overdue_pending(mailbox):
@@ -1389,13 +1441,29 @@ def process_latest_inquiry():
                     store_qty = get_store_qty_from_product(obm)
                     usable_store_qty = int(store_qty) if store_qty > 0 else 0
                     requested_qty = int(itm['qty'])
+                    customer_part = str(itm.get('matched_text') or '').strip().upper()
 
                     print(f"   API Product: {full_desc}")
                     print(f"   Brand: {brand}")
+                    print(f"   Customer Part: {customer_part or '(not specified)'}")
                     print(f"   Total Stock Qty from OBM: {total_stock_qty}")
                     print(f"   STORE Qty Used by Bot: {usable_store_qty}")
                     print(f"   Cost: RM {cost}")
                     print(f"   Customer Qty: {requested_qty}")
+
+                    if (
+                        brand == "SMC"
+                        and customer_part
+                        and not _customer_part_matches_obm_product(customer_part, obm, api_id)
+                    ):
+                        print(
+                            f"   ⚠️ SMC SKU mismatch: customer asked {customer_part} "
+                            f"but warehouse row is {pn or api_id} — using SMC portal"
+                        )
+                        if _append_smc_portal_quote_row(
+                            formatted_initial_rows, tbc_by_brand, customer_part, requested_qty
+                        ):
+                            continue
 
                     if usable_store_qty > 0 and cost > 0:
                         quoted_qty = min(requested_qty, usable_store_qty)
@@ -1434,6 +1502,13 @@ def process_latest_inquiry():
                             print(f"   ⚠️ Requested Qty exceeds STORE stock. Balance Qty {balance_qty} added to supplier RFQ.")
 
                     else:
+                        if brand == "SMC":
+                            portal_part = customer_part or str(pn or api_id).strip().upper()
+                            if _append_smc_portal_quote_row(
+                                formatted_initial_rows, tbc_by_brand, portal_part, requested_qty
+                            ):
+                                continue
+
                         formatted_initial_rows.append({
                             'desc': full_desc,
                             'qty': requested_qty,
@@ -1466,34 +1541,10 @@ def process_latest_inquiry():
 
                 smc_row = None
                 if brand == "SMC":
-                    print(f"   🔎 [SMC] Portal lookup for {part_no} (qty {missing['qty']})...")
-                    smc_row = _try_smc_portal_row(
-                        part_no,
-                        missing["qty"],
-                        desc=desc,
-                        brand=brand,
-                    )
-
-                if smc_row:
-                    formatted_initial_rows.append({
-                        "desc": smc_row.get("desc") or desc,
-                        "qty": smc_row.get("qty", missing["qty"]),
-                        "price": smc_row.get("price", "[TBC]"),
-                        "lt": smc_row.get("lt", "[TBC]"),
-                        "pid": smc_row.get("pid") or part_no,
-                        "brand": "SMC",
-                    })
-                    if smc_row.get("needs_supplier"):
-                        if brand not in tbc_by_brand:
-                            tbc_by_brand[brand] = []
-                        tbc_by_brand[brand].append({
-                            "desc": smc_row.get("desc") or desc,
-                            "qty": smc_row.get("qty", missing["qty"]),
-                        })
-                        print(f"   📡 SMC portal partial — supplier RFQ still required.")
-                    else:
-                        print(f"   ✅ SMC portal quote filled price/LT — no supplier RFQ needed.")
-                    continue
+                    if _append_smc_portal_quote_row(
+                        formatted_initial_rows, tbc_by_brand, part_no, missing["qty"]
+                    ):
+                        continue
 
                 formatted_initial_rows.append({
                     'desc': desc,
@@ -1504,10 +1555,7 @@ def process_latest_inquiry():
                     'brand': brand,
                 })
 
-                # IMPORTANT RULE v1.11:
-                # - Known brand but exact stock not found -> send to supplier/manual RFQ.
-                # - Unknown brand -> technical non-standard sourcing.
-                # This prevents known-brand items from going to SerpAPI/support unnecessarily.
+                # Known brand but exact stock not found -> supplier RFQ (SMC portal tried above).
                 if brand != "UNKNOWN":
                     if brand not in tbc_by_brand:
                         tbc_by_brand[brand] = []

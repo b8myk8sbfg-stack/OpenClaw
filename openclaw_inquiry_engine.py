@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
 
-VERSION = "v1.09-SMC-PORTAL-NEW-STOCK"
+VERSION = "v1.10-SMC-EXACT-PORTAL-QUOTE"
 
 WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
 
@@ -198,10 +198,19 @@ def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source="")
     """Resolve warehouse stock for a part, with stricter rules for visual extraction."""
     part_no = str(part_no or "").strip().upper()
     source = str(source or "").upper()
+    declared_brand = str(declared_brand or "UNKNOWN").strip().upper().replace("BÜRKERT", "BURKERT")
 
     exact = EXACT_LOOKUP.get(normalize_part(part_no))
     if exact:
         return exact
+
+    # SMC: never remap to accessory/variant SKUs (e.g. MXY12-150 → MXY12-150-M9BL).
+    if declared_brand == "SMC":
+        print(
+            f"   ℹ️ [ENGINE] SMC exact-part only: {part_no} not in warehouse — "
+            f"SMC portal path (no variant remap)"
+        )
+        return None
 
     if source == "COPILOT_VISUAL":
         partial = find_best_warehouse_match(part_no, declared_brand=declared_brand, qty=qty)
@@ -746,19 +755,26 @@ def _try_smc_portal_row(part_no, qty, desc=None, brand="", search_context=""):
     if not quote:
         return None
 
+    customer_part = str(part_no or "").strip().upper()
+    portal_desc = str(quote.get("desc") or "").strip()
+    if portal_desc and customer_part and customer_part not in portal_desc.upper():
+        portal_desc = f"SMC {customer_part}"
+    elif not portal_desc:
+        portal_desc = f"SMC {customer_part}"
+
     return {
-        "desc": quote.get("desc") or desc or part_no,
+        "desc": portal_desc,
         "qty": int(quote.get("qty") or qty),
         "requested_qty": int(quote.get("requested_qty") or qty),
         "moq": int(quote.get("moq") or 0),
         "moq_applied": bool(quote.get("moq_applied")),
         "price": quote.get("price", "[TBC]"),
         "lt": quote.get("lt", "[TBC]"),
-        "pid": quote.get("smc_part") or part_no,
-        "smc_part": quote.get("smc_part") or part_no,
+        "pid": customer_part,
+        "smc_part": quote.get("smc_part") or customer_part,
         "brand": "SMC",
         "source": quote.get("source", "SMC_PORTAL"),
-        "customer_part": part_no,
+        "customer_part": customer_part,
         "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
     }
 
