@@ -75,7 +75,14 @@ _RFQ_OCR_SYSTEM_INSTRUCTION = (
 
 def _ai_fallback_enabled() -> bool:
     """Return True when OpenAI fallback is configured and allowed."""
-    if not os.getenv("OPENAI_API_KEY"):
+    api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return False
+    if api_key.lower() in ("local-bypass", "local-copilot-proxy", "sk-local", "changeme"):
+        print(
+            "[WARN] OPENAI_API_KEY looks like a Copilot placeholder "
+            f"({api_key!r}) — set a real OpenAI key in .env for fallback."
+        )
         return False
     mode = os.getenv("OPENCLAW_AI_FALLBACK", "openai").strip().lower()
     return mode not in ("0", "false", "no", "off", "none")

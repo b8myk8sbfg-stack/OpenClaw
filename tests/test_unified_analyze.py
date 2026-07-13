@@ -186,5 +186,6 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         self.assertEqual(result["route"], "ocr_openai_skipped")
 
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_placeholder_openai_key_disables_fallback(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "local-bypass", "OPENCLAW_OCR_ENABLED": "1"}):
+            self.assertFalse(openclaw_main._ai_fallback_enabled())
