@@ -35,7 +35,6 @@ from smc_portal_lookup import (  # noqa: E402
     lookup_smc_quote,
     portal_base_url,
     portal_home_url,
-    search_portal_part,
 )
 
 
@@ -100,8 +99,6 @@ def main() -> int:
 
     if part:
         print(f"\n=== Live lookup test: {part} ===")
-        hit = search_portal_part(driver, part)
-        print(json.dumps(hit, indent=2, default=str))
         quote = lookup_smc_quote(part, qty=1)
         print("\nQuote dict:")
         print(json.dumps(quote, indent=2, default=str))

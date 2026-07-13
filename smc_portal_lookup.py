@@ -910,6 +910,38 @@ def _scroll_item_grid(driver) -> None:
         pass
 
 
+def _wait_for_enquiry_grid_settled(driver, timeout: float = 20.0) -> None:
+    """
+    SMC Item Enquiry loads result rows asynchronously into a Kendo virtual grid.
+    Wait until the visible row count stops growing before full vertical scrape.
+    """
+    end = time.time() + timeout
+    stable_passes = 0
+    last_count = -1
+
+    while time.time() < end:
+        _scroll_grid_to_top(driver)
+        time.sleep(0.35)
+        _scroll_item_grid(driver)
+        # Nudge virtual grid to render trailing rows before measuring.
+        _scroll_grid_down(driver, 2000)
+        time.sleep(0.45)
+        _scroll_grid_to_top(driver)
+        time.sleep(0.35)
+        _scroll_item_grid(driver)
+        count = len(_scrape_item_list(driver))
+
+        if count > 0 and count == last_count:
+            stable_passes += 1
+            if stable_passes >= 2:
+                print(f"   ⏳ [SMC] Grid settled (~{count} row(s) in viewport)")
+                return
+        else:
+            stable_passes = 0
+        last_count = count
+        time.sleep(0.5)
+
+
 def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
     if not _navigate_item_enquiry(driver):
         print("⚠️ [SMC] Could not open Item Enquiry page.")
@@ -941,15 +973,21 @@ def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
 
     enquire.click()
 
-    # Wait until the grid renders at least one row.
+    # Wait until async grid finishes loading (avoids partial 24-row first pass).
     end = time.time() + 15.0
     while time.time() < end:
         if _scrape_item_list(driver):
             break
         time.sleep(0.5)
+    _wait_for_enquiry_grid_settled(driver)
 
     rows = _scrape_item_list_full(driver, searched_part=part_no)
-    if rows and not _rows_have_price(rows):
+    if not pick_exact_part_rows(rows, part_no):
+        print(f"   🔁 [SMC] Exact {part_no!r} missing after first scrape — waiting for grid")
+        time.sleep(2.5)
+        _wait_for_enquiry_grid_settled(driver, timeout=12.0)
+        rows = _scrape_item_list_full(driver, searched_part=part_no)
+    elif rows and not _rows_have_price(rows):
         time.sleep(2)
         rows = _scrape_item_list_full(driver, searched_part=part_no)
     return rows
@@ -1095,6 +1133,10 @@ def lookup_smc_quote(
     try:
         driver = get_driver()
         hit = search_portal_part(driver, part_no)
+        if not hit:
+            print(f"   🔁 [SMC] No portal match on first pass for {part_no!r} — retrying enquiry")
+            time.sleep(3)
+            hit = search_portal_part(driver, part_no)
         if hit and hit.get("net_price") is None:
             print(f"   🔁 [SMC] Price missing on first scrape for {part_no!r} — retrying")
             time.sleep(2)
