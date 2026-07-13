@@ -8,11 +8,13 @@ import mimetypes
 import signal
 import re
 
+from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
-VERSION = "v1.05-OCR-DEBUG-OPENAI-TEXT-FALLBACK"
+VERSION = "v1.06-ENV-LOAD-FIX"
 
 BASE_DIR = "/Users/evon/OpenClaw"
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 EMAIL_SCRIPT = os.path.join(BASE_DIR, "auto_claw.py")
 WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "whatsapp_inbox_watcher.py")
