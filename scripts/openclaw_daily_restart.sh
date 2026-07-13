@@ -15,6 +15,14 @@ RESTART_LOG="$LOG_DIR/daily_restart.log"
 
 mkdir -p "$LOG_DIR"
 
+ENV_FILE="$BASE_DIR/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
