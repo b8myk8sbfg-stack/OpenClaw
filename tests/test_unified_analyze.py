@@ -114,6 +114,32 @@ class UnifiedAnalyzeTests(unittest.TestCase):
         self.assertIn("OCR result (JSON)", user_content)
         self.assertIn("CPM1A-30CDR-D-V1", user_content)
 
+    def test_copilot_ocr_fail_tries_openai_text_before_vision(self):
+        ocr_payload = {
+            "engine": "tesseract",
+            "full_text": "CPM1A-30CDR-D-V1\nOMRON",
+            "lines": [{"text": "CPM1A-30CDR-D-V1", "confidence": 95.0}],
+            "error": None,
+        }
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENCLAW_OCR_ENABLED": "1"}):
+            with patch("local_ocr.extract_text_from_image", return_value=ocr_payload):
+                with patch.object(openclaw_main, "_call_copilot_rfq", return_value=[]):
+                    with patch.object(
+                        openclaw_main,
+                        "_extract_rfq_with_openai_from_ocr",
+                        return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 1, "brand": "OMRON"}],
+                    ) as openai_text_mock:
+                        with patch.object(openclaw_main, "_extract_rfq_with_openai_vision") as vision_mock:
+                            result = openclaw_main.unified_analyze(
+                                "Quote me 1 unit",
+                                image_path="/tmp/label.png",
+                            )
+
+        openai_text_mock.assert_called_once()
+        vision_mock.assert_not_called()
+        self.assertEqual(result["route"], "openai_text_ocr_fallback")
+        self.assertEqual(len(result["items"]), 1)
+
     def test_empty_ocr_goes_to_openai_vision(self):
         ocr_payload = {
             "engine": "tesseract",
@@ -125,7 +151,7 @@ class UnifiedAnalyzeTests(unittest.TestCase):
             with patch("local_ocr.extract_text_from_image", return_value=ocr_payload):
                 with patch.object(
                     openclaw_main,
-                    "_extract_rfq_with_openai",
+                    "_extract_rfq_with_openai_vision",
                     return_value=[{"part_no": "CPM1A-30CDR-D-V1", "qty": 1, "brand": "OMRON"}],
                 ) as openai_mock:
                     result = openclaw_main.unified_analyze(

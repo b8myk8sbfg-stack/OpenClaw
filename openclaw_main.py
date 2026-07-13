@@ -10,7 +10,7 @@ import re
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
-VERSION = "v1.04-OCR-OPENAI-NO-COPILOT-VISION"
+VERSION = "v1.05-OCR-DEBUG-OPENAI-TEXT-FALLBACK"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 
@@ -23,12 +23,13 @@ OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o")
 
 
 class OcrFallbackRequired(Exception):
-    """Image inquiry cannot use Copilot vision — route to OpenAI vision instead."""
+    """Image inquiry cannot use Copilot vision — route to OpenAI instead."""
 
-    def __init__(self, reason: str, ocr_used: bool = False):
+    def __init__(self, reason: str, ocr_used: bool = False, ocr_payload: dict = None):
         super().__init__(reason)
         self.reason = reason
         self.ocr_used = ocr_used
+        self.ocr_payload = ocr_payload or {}
 
 _RFQ_SYSTEM_INSTRUCTION = (
     "You are an industrial automation data extraction assistant. "
@@ -200,6 +201,15 @@ def _call_copilot_rfq(
     return _parse_rfq_json_array(raw_content, image_path=parse_image_path)
 
 
+def _log_ocr_payload(ocr_payload: dict):
+    full_text = str(ocr_payload.get("full_text") or "").strip()
+    lines = ocr_payload.get("lines") or []
+    print(f"[OCR] Detected {len(lines)} line(s), {len(full_text)} chars")
+    if full_text:
+        preview = full_text if len(full_text) <= 500 else full_text[:500] + "..."
+        print(f"[OCR] full_text:\n{preview}")
+
+
 def _normalize_part_key(part_no: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
 
@@ -276,10 +286,11 @@ def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = N
                 raise OcrFallbackRequired("ocr_disabled")
 
             ocr_payload = extract_text_from_image(image_path)
+            _log_ocr_payload(ocr_payload)
             if not has_usable_ocr_text(ocr_payload):
                 reason = str(ocr_payload.get("error") or "no_text_detected")
-                print(f"[OCR] Cannot use Copilot for image ({reason}) — will use OpenAI vision")
-                raise OcrFallbackRequired(reason)
+                print(f"[OCR] Cannot use Copilot for image ({reason}) — will use OpenAI")
+                raise OcrFallbackRequired(reason, ocr_payload=ocr_payload)
 
             print(
                 f"[OCR] Extracted {len(ocr_payload.get('lines') or [])} line(s) "
@@ -294,8 +305,12 @@ def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = N
             if items:
                 return {"items": items, "route": "ocr_copilot", "ocr_used": True}
 
-            print("[OCR] Copilot found no parts from OCR text — will use OpenAI vision")
-            raise OcrFallbackRequired("copilot_no_parts_from_ocr", ocr_used=True)
+            print("[OCR] Copilot found no parts from OCR text — will try OpenAI")
+            raise OcrFallbackRequired(
+                "copilot_no_parts_from_ocr",
+                ocr_used=True,
+                ocr_payload=ocr_payload,
+            )
 
         items = _call_copilot_rfq(
             client,
@@ -314,30 +329,59 @@ def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = N
         raise
 
 
+def _extract_rfq_with_openai_from_ocr(raw_email_body: str, ocr_payload: dict) -> list:
+    """Parse OCR JSON with OpenAI text when Copilot could not."""
+    from local_ocr import has_usable_ocr_text
+
+    if not _ai_fallback_enabled() or not has_usable_ocr_text(ocr_payload):
+        return []
+
+    print("[FALLBACK] Trying OpenAI text on OCR output...")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=45.0, max_retries=1)
+    response = client.chat.completions.create(
+        model=OPENAI_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": _RFQ_OCR_SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": _build_ocr_copilot_user_content(raw_email_body, ocr_payload),
+            },
+        ],
+        temperature=0.1,
+    )
+    raw_content = (response.choices[0].message.content or "").strip()
+    print(f"[OPENAI OCR RAW] {raw_content}")
+    return _parse_rfq_json_array(raw_content, image_path=None)
+
+
+def _extract_rfq_with_openai_vision(raw_email_body: str, image_path: str) -> list:
+    from image_inquiry_analyzer import analyze_inquiry_image
+
+    print("[FALLBACK] Trying OpenAI vision on image...")
+    analysis = analyze_inquiry_image(image_path, caption_text=raw_email_body or "")
+    items = []
+    for item in analysis.get("items") or []:
+        part_no = str(item.get("part_no") or "").strip().upper()
+        try:
+            qty = int(item.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        if part_no and qty > 0:
+            items.append({
+                "part_no": part_no,
+                "qty": qty,
+                "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
+            })
+    return items
+
+
 def _extract_rfq_with_openai(raw_email_body: str = "", image_path: str = None) -> list:
-    """OpenAI fallback for RFQ extraction when the Copilot proxy is unavailable."""
+    """OpenAI fallback when Copilot proxy is unavailable."""
     if not _ai_fallback_enabled():
         return []
 
     if image_path:
-        from image_inquiry_analyzer import analyze_inquiry_image
-
-        print("[FALLBACK] Local OCR unavailable or produced no parts — trying OpenAI vision...")
-        analysis = analyze_inquiry_image(image_path, caption_text=raw_email_body or "")
-        items = []
-        for item in analysis.get("items") or []:
-            part_no = str(item.get("part_no") or "").strip().upper()
-            try:
-                qty = int(item.get("qty") or 1)
-            except (TypeError, ValueError):
-                qty = 1
-            if part_no and qty > 0:
-                items.append({
-                    "part_no": part_no,
-                    "qty": qty,
-                    "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
-                })
-        return items
+        return _extract_rfq_with_openai_vision(raw_email_body, image_path)
 
     if not str(raw_email_body or "").strip():
         return []
@@ -396,7 +440,8 @@ def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
         }
     except OcrFallbackRequired as ocr_exc:
         ocr_used = bool(ocr_exc.ocr_used)
-        print(f"[OCR] Routing image inquiry to OpenAI vision ({ocr_exc.reason})")
+        ocr_payload = ocr_exc.ocr_payload or {}
+        print(f"[OCR] Routing image inquiry to OpenAI ({ocr_exc.reason})")
         if not _ai_fallback_enabled():
             return {
                 "items": [],
@@ -408,13 +453,24 @@ def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
                 "error": {"type": "ocr_fallback", "message": ocr_exc.reason, "status": 0},
             }
         try:
-            items = _extract_rfq_with_openai(raw_email_body, image_path=image_path)
+            from local_ocr import has_usable_ocr_text
+
+            items = []
+            route = "openai_failed"
+            if has_usable_ocr_text(ocr_payload):
+                items = _extract_rfq_with_openai_from_ocr(raw_email_body, ocr_payload)
+                if items:
+                    route = "openai_text_ocr_fallback"
+            if not items and image_path:
+                items = _extract_rfq_with_openai_vision(raw_email_body, image_path)
+                if items:
+                    route = "openai_vision_ocr_fallback"
             return {
                 "items": items,
                 "source": "openai" if items else "none",
-                "route": "openai_vision_ocr_fallback",
+                "route": route,
                 "ocr_used": ocr_used,
-                "copilot_failed": False,
+                "copilot_failed": ocr_exc.reason == "copilot_no_parts_from_ocr",
                 "fallback_used": True,
                 "error": {"type": "ocr_fallback", "message": ocr_exc.reason, "status": 0},
             }

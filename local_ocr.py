@@ -7,13 +7,15 @@ Uses Tesseract (via pytesseract). Install on macOS:
 
 import json
 import os
+import re
 import shutil
 from typing import Any, Dict, List, Optional
 
-VERSION = "v1.00-LOCAL-TESSERACT-OCR"
+VERSION = "v1.01-OCR-MULTI-PSM"
 
 DEFAULT_LANG = os.getenv("OPENCLAW_OCR_LANG", "eng+chi_sim")
-MIN_LINE_CONFIDENCE = float(os.getenv("OPENCLAW_OCR_MIN_CONFIDENCE", "40"))
+MIN_LINE_CONFIDENCE = float(os.getenv("OPENCLAW_OCR_MIN_CONFIDENCE", "25"))
+MIN_UPSCALE_WIDTH = int(os.getenv("OPENCLAW_OCR_MIN_WIDTH", "1400"))
 
 
 def ocr_enabled() -> bool:
@@ -30,13 +32,45 @@ def _resolve_tesseract_cmd() -> Optional[str]:
 
 
 def _preprocess_image(image_path: str):
-    from PIL import Image, ImageEnhance, ImageOps
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
     image = Image.open(image_path)
     image = ImageOps.exif_transpose(image)
+    if image.width < MIN_UPSCALE_WIDTH:
+        scale = MIN_UPSCALE_WIDTH / max(image.width, 1)
+        new_size = (int(image.width * scale), int(image.height * scale))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
     image = image.convert("L")
-    image = ImageEnhance.Contrast(image).enhance(1.6)
+    image = ImageEnhance.Contrast(image).enhance(1.8)
+    image = image.filter(ImageFilter.SHARPEN)
     return image
+
+
+def _ocr_lines_from_image(image, psm: int) -> List[Dict[str, Any]]:
+    import pytesseract
+
+    config = f"--psm {psm} --oem 3"
+    data = pytesseract.image_to_data(
+        image,
+        lang=DEFAULT_LANG,
+        config=config,
+        output_type=pytesseract.Output.DICT,
+    )
+    return _lines_from_tesseract_data(data)
+
+
+def _merge_ocr_lines(line_groups: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    merged = []
+    seen = set()
+    for group in line_groups:
+        for line in group:
+            text = str(line.get("text") or "").strip()
+            key = re.sub(r"\s+", " ", text).upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(line)
+    return merged
 
 
 def _lines_from_tesseract_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -128,14 +162,18 @@ def extract_text_from_image(image_path: str) -> Dict[str, Any]:
 
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
         image = _preprocess_image(image_path)
-        data = pytesseract.image_to_data(
-            image,
-            lang=DEFAULT_LANG,
-            output_type=pytesseract.Output.DICT,
-        )
-        lines = _lines_from_tesseract_data(data)
+        psm_modes = [int(x) for x in os.getenv("OPENCLAW_OCR_PSM", "6,11,3").split(",") if x.strip()]
+        line_groups = []
+        for psm in psm_modes:
+            try:
+                line_groups.append(_ocr_lines_from_image(image, psm))
+            except Exception as exc:
+                print(f"[OCR] PSM {psm} failed: {exc}")
+        lines = _merge_ocr_lines(line_groups)
         payload["lines"] = lines
         payload["full_text"] = "\n".join(line["text"] for line in lines).strip()
+        if payload["full_text"]:
+            print(f"[OCR] Merged {len(lines)} line(s) from PSM modes {psm_modes}")
         if not payload["full_text"]:
             payload["error"] = "no_text_detected"
         return payload
