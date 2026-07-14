@@ -27,7 +27,7 @@ EMAIL_CLASSIFICATION_LOG = os.path.join(BASE_DIR, "email_message_classifications
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
 
-VERSION = "v1.00-EMAIL-CLASSIFIER"
+VERSION = "v1.01-EMAIL-PO-SKIP-INQUIRY"
 
 INTENT_TYPES = (
     "rfq_inquiry",
@@ -45,7 +45,20 @@ INTENT_TYPES = (
     "unknown",
 )
 
-SKIP_INTENTS = {"junk_ad", "newsletter"}
+# Never run RFQ / OBM quote extraction for these intents.
+SKIP_INTENTS = {"junk_ad", "newsletter", "internal"}
+
+# Business mail that is not a price inquiry — classify, log, leave to humans.
+NON_INQUIRY_INTENTS = {
+    "purchase_order",
+    "technical_support",
+    "delivery_tracking",
+    "payment_invoice",
+    "order_confirmation",
+    "complaint",
+    "general_chat",
+    "supplier_reply",
+}
 
 LOG_FIELDS = [
     "timestamp",
@@ -147,11 +160,55 @@ def _handler_for_intent(intent: str) -> str:
         return "skip"
     if intent == "supplier_reply":
         return "supplier_reply"
-    if intent == "internal":
-        return "skip"
-    if intent in ("rfq_inquiry", "purchase_order", "technical_support"):
-        return "process"
+    if intent == "purchase_order":
+        return "purchase_order"
+    if intent == "rfq_inquiry":
+        return "rfq_inquiry"
+    if intent in NON_INQUIRY_INTENTS:
+        return intent
     return "process"
+
+
+def is_email_rfq_inquiry(result: EmailClassificationResult) -> bool:
+    """True only when the mailbox loop should run quote extraction."""
+    intent = str(getattr(result, "intent", "") or "").strip().lower()
+    handler = str(getattr(result, "handler", "") or "").strip().lower()
+    if getattr(result, "should_skip", False):
+        return False
+    if intent in SKIP_INTENTS or intent in NON_INQUIRY_INTENTS:
+        return False
+    return intent == "rfq_inquiry" or handler in ("rfq_inquiry", "process")
+
+
+def _looks_like_purchase_order(subject: str, body: str) -> bool:
+    subject_u = str(subject or "").upper()
+    body_u = str(body or "").upper()
+    combined = f"{subject_u}\n{body_u}"
+
+    if re.search(
+        r"\b(?:AMENDED\s+)?P\.?\s*O\.?\b|\bPURCHASE\s+ORDER\b|\bPURCHASE\s+REQUISITION\b",
+        combined,
+        re.I,
+    ):
+        return True
+
+    po_markers = (
+        "PURCHASE ORDER",
+        "PURCHASE REQUISITION",
+        "AMENDED PO",
+        "P/O",
+        "P.O.",
+        " PO ",
+        "PO#",
+        "PO:",
+        "PO NO",
+        "PO NUMBER",
+        "PO TO:",
+        "ACKNOWLEDGE RECEIVING OF THIS PO",
+        "STATUS OF THIS PO",
+        "DELIVERY OF GOODS ABOVE",
+    )
+    return any(m in combined for m in po_markers)
 
 
 def _heuristic_classify(sender: str, subject: str, body: str) -> Optional[EmailClassificationResult]:
@@ -203,7 +260,7 @@ def _heuristic_classify(sender: str, subject: str, body: str) -> Optional[EmailC
                 intent="rfq_inquiry",
                 confidence=0.8,
                 reasoning="Internal inquiry-like email.",
-                handler="process",
+                handler="rfq_inquiry",
             )
         return EmailClassificationResult(
             intent="internal",
@@ -213,13 +270,13 @@ def _heuristic_classify(sender: str, subject: str, body: str) -> Optional[EmailC
             should_skip=True,
         )
 
-    po_markers = ("PURCHASE ORDER", "P/O", "P.O.", " PO ", "PO#", "PURCHASE REQUISITION")
-    if any(m in combined for m in po_markers):
+    if _looks_like_purchase_order(subject_u, body_u):
         return EmailClassificationResult(
             intent="purchase_order",
-            confidence=0.88,
-            reasoning="Purchase order keywords detected.",
-            handler="process",
+            confidence=0.94,
+            reasoning="Purchase order / amended PO keywords detected — not an RFQ inquiry.",
+            handler="purchase_order",
+            should_skip=False,
         )
 
     support_markers = (
@@ -231,7 +288,7 @@ def _heuristic_classify(sender: str, subject: str, body: str) -> Optional[EmailC
             intent="technical_support",
             confidence=0.82,
             reasoning="Technical support keywords detected.",
-            handler="process",
+            handler="technical_support",
         )
 
     inquiry_markers = (
@@ -243,7 +300,7 @@ def _heuristic_classify(sender: str, subject: str, body: str) -> Optional[EmailC
             intent="rfq_inquiry",
             confidence=0.78,
             reasoning="RFQ/inquiry keywords detected.",
-            handler="process",
+            handler="rfq_inquiry",
         )
 
     return None
@@ -265,10 +322,11 @@ Return STRICT JSON only:
 Important:
 - junk_ad: marketing, ads, cold sales, unrelated promotions
 - newsletter: subscribed newsletters, digests, webinar invites
-- rfq_inquiry: customer asking quote/price/availability
-- purchase_order: PO documents or formal orders
+- rfq_inquiry: customer asking quote/price/availability ONLY
+- purchase_order: PO documents, amended PO, formal orders, acknowledge PO status — NEVER rfq_inquiry
 - supplier_reply: replies with REQ- reference codes
 - internal: company internal non-inquiry mail
+- Subjects like "AMENDED PO: M177514" or body "AMENDED PO TO:" are purchase_order, not inquiries.
 
 Learned examples:
 {examples_block}
@@ -327,10 +385,11 @@ def classify_email(sender: str, subject: str, body: str, use_ai: bool = True) ->
             confidence=0.99,
             reasoning="Matched manual correction rule.",
             handler=handler,
-            should_skip=corrected in SKIP_INTENTS,
+            should_skip=corrected in SKIP_INTENTS or handler == "skip",
         )
 
     heuristic = _heuristic_classify(sender, subject, body)
+    # Strong PO / junk heuristics win without waiting for Copilot.
     if heuristic and heuristic.confidence >= 0.88:
         record_classification_example(
             preview, "text", heuristic.intent, heuristic.confidence, channel="email"
@@ -351,6 +410,13 @@ def classify_email(sender: str, subject: str, body: str, use_ai: bool = True) ->
             reasoning="No strong email signals.",
             handler="process",
         )
+
+    # Never let AI remount a clear purchase_order as rfq_inquiry.
+    if heuristic and heuristic.intent == "purchase_order" and final.intent == "rfq_inquiry":
+        final = heuristic
+
+    final.handler = _handler_for_intent(final.intent)
+    final.should_skip = final.intent in SKIP_INTENTS or final.handler == "skip"
 
     record_classification_example(preview, "text", final.intent, final.confidence, channel="email")
     return final

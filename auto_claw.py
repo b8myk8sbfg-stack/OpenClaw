@@ -16,7 +16,7 @@ from obm_quotation_helper import create_obm_quotation_from_inquiry
 from non_standard_inquiry_handler import handle_non_standard_items
 from inquiry_extraction_helper import extract_clean_items_from_text
 from openclaw_main import extract_rfq_with_copilot
-from email_message_classifier import classify_email, log_email_classification
+from email_message_classifier import classify_email, log_email_classification, is_email_rfq_inquiry
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 
 VERSION = "v1.14-EMAIL-FIFO-ONE"
@@ -1003,6 +1003,22 @@ def process_latest_inquiry():
                 log_email_classification(
                     msg.sender.address, msg.subject or "", body_clean, email_class,
                     status=f"SKIPPED_{email_class.intent.upper()}",
+                )
+                continue
+
+            # WhatsApp-style gate: only RFQ inquiries enter quote extraction.
+            if not is_email_rfq_inquiry(email_class):
+                print(
+                    f"📎 Non-inquiry email classified as '{email_class.intent}' "
+                    f"(handler={email_class.handler}) — not treating as RFQ."
+                )
+                print(f"   From: {msg.sender.address}")
+                print(f"   Subject: {msg.subject}")
+                print(f"   Reason: {email_class.reasoning}")
+                msg.mark_as_read()
+                log_email_classification(
+                    msg.sender.address, msg.subject or "", body_clean, email_class,
+                    status=f"SKIPPED_NON_INQUIRY_{email_class.intent.upper()}",
                 )
                 continue
 
