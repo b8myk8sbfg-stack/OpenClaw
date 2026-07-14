@@ -26,11 +26,11 @@ from openclaw_inquiry_engine import (
     _try_smc_portal_row,
     _try_burkert_price_list_row,
 )
-from email_message_classifier import classify_email, log_email_classification
+from email_message_classifier import classify_email, log_email_classification, is_email_rfq_inquiry
 from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
 from openclaw_email_config import get_monitored_mailboxes, get_primary_mailbox
 
-VERSION = "v1.20-BRAND-PREFIX-NORMALIZE"
+VERSION = "v1.21-EMAIL-PO-SKIP-INQUIRY"
 
 urllib3.disable_warnings(InsecureRequestWarning)
 load_dotenv()
@@ -1234,7 +1234,23 @@ def process_latest_inquiry():
                         status=f"SKIPPED_{email_class.intent.upper()}",
                     )
                     continue
-    
+
+                # WhatsApp-style gate: only RFQ inquiries enter quote extraction.
+                if not is_email_rfq_inquiry(email_class):
+                    print(
+                        f"📎 Non-inquiry email classified as '{email_class.intent}' "
+                        f"(handler={email_class.handler}) — not treating as RFQ."
+                    )
+                    print(f"   From: {msg.sender.address}")
+                    print(f"   Subject: {msg.subject}")
+                    print(f"   Reason: {email_class.reasoning}")
+                    msg.mark_as_read()
+                    log_email_classification(
+                        msg.sender.address, msg.subject or "", body_clean, email_class,
+                        status=f"SKIPPED_NON_INQUIRY_{email_class.intent.upper()}",
+                    )
+                    continue
+
                 # Any unread email containing REQ ref is supplier/human reply only.
                 # process_supplier_replies() runs before this customer-inquiry loop.
                 # If still here, do NOT treat it as a new inquiry.
