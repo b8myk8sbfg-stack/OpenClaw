@@ -14,7 +14,7 @@ LOG_DIR="$BASE_DIR/logs"
 WATCHDOG_LOG="$LOG_DIR/copilot_watchdog.log"
 STATE_FILE="$LOG_DIR/copilot_watchdog_state"
 RECOVERY_SCRIPT="$SCRIPT_DIR/openclaw_copilot_recovery.sh"
-FAIL_THRESHOLD="${COPILOT_WATCHDOG_FAIL_THRESHOLD:-2}"
+FAIL_THRESHOLD="${COPILOT_WATCHDOG_FAIL_THRESHOLD:-3}"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -32,31 +32,37 @@ write_fail_count() {
     echo "$1" > "$STATE_FILE"
 }
 
-{
-    if copilot_is_healthy; then
-        write_fail_count 0
-        exit 0
+run_watchdog() {
+    if copilot_recovery_in_cooldown; then
+        log "Recovery cooldown active; skipping watchdog check"
+        return 0
     fi
 
-    local fail_count
+    if copilot_server_reachable; then
+        write_fail_count 0
+        return 0
+    fi
+
     fail_count="$(read_fail_count)"
     fail_count=$((fail_count + 1))
     write_fail_count "$fail_count"
 
-    if copilot_models_reachable; then
-        log "Copilot unhealthy: chat probe failed ($fail_count/$FAIL_THRESHOLD)"
-    elif copilot_port_listening || copilot_process_running; then
-        log "Copilot unhealthy: server up but /v1/models unreachable ($fail_count/$FAIL_THRESHOLD)"
+    if copilot_port_listening || copilot_process_running; then
+        log "Copilot unhealthy: port/process up but /v1/models unreachable ($fail_count/$FAIL_THRESHOLD)"
     else
         log "Copilot unhealthy: server not running ($fail_count/$FAIL_THRESHOLD)"
     fi
 
     if [[ "$fail_count" -lt "$FAIL_THRESHOLD" ]]; then
         log "Waiting for another failed check before recovery"
-        exit 0
+        return 0
     fi
 
     log "Triggering OpenClaw + Copilot recovery..."
     write_fail_count 0
     bash "$RECOVERY_SCRIPT"
+}
+
+{
+    run_watchdog
 } >> "$WATCHDOG_LOG" 2>&1

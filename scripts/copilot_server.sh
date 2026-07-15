@@ -10,8 +10,10 @@ COPILOT_PORT="${COPILOT_PORT:-8000}"
 COPILOT_BASE_URL="${COPILOT_BASE_URL:-http://${COPILOT_HOST}:${COPILOT_PORT}}"
 COPILOT_LOG="${COPILOT_LOG:-$LOG_DIR/copilot_server.log}"
 COPILOT_PID_FILE="${COPILOT_PID_FILE:-$LOG_DIR/copilot_server.pid}"
-COPILOT_HEALTH_ATTEMPTS="${COPILOT_HEALTH_ATTEMPTS:-60}"
+COPILOT_HEALTH_ATTEMPTS="${COPILOT_HEALTH_ATTEMPTS:-24}"
 COPILOT_HEALTH_INTERVAL="${COPILOT_HEALTH_INTERVAL:-5}"
+COPILOT_RECOVERY_COOLDOWN="${COPILOT_RECOVERY_COOLDOWN:-900}"
+COPILOT_LAST_RECOVERY_FILE="${COPILOT_LAST_RECOVERY_FILE:-$LOG_DIR/copilot_last_recovery.ts}"
 
 resolve_copilot_python() {
     local candidate
@@ -34,10 +36,16 @@ resolve_copilot_python() {
 }
 
 copilot_process_running() {
+    if [[ -f "$COPILOT_PID_FILE" ]]; then
+        local pid
+        pid="$(tr -d '[:space:]' < "$COPILOT_PID_FILE" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
     pgrep -f "$COPILOT_DIR/main.py" >/dev/null 2>&1 \
         || pgrep -f "Windows-Copilot-API/main.py" >/dev/null 2>&1 \
-        || pgrep -f "Windows-Copilot-API.*main.py" >/dev/null 2>&1 \
-        || pgrep -f "[Pp]ython.*main.py" >/dev/null 2>&1
+        || pgrep -f "Windows-Copilot-API.*main.py" >/dev/null 2>&1
 }
 
 copilot_port_listening() {
@@ -48,8 +56,13 @@ copilot_models_reachable() {
     curl -sf --max-time 5 "${COPILOT_BASE_URL}/v1/models" >/dev/null 2>&1
 }
 
+# Lightweight check for the watchdog — avoids chat probes that compete with OpenClaw.
+copilot_server_reachable() {
+    copilot_models_reachable
+}
+
 copilot_chat_status() {
-    curl -sS --max-time 45 -o /dev/null -w '%{http_code}' \
+    curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
         -X POST "${COPILOT_BASE_URL}/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         -d '{"model":"copilot","messages":[{"role":"user","content":"Reply with exactly: ok"}],"max_tokens":8}' \
@@ -61,11 +74,24 @@ copilot_chat_ok() {
 }
 
 copilot_server_up() {
-    copilot_process_running && copilot_port_listening && copilot_models_reachable
+    copilot_port_listening && copilot_models_reachable
 }
 
 copilot_is_healthy() {
-    copilot_models_reachable && copilot_chat_ok
+    copilot_server_reachable
+}
+
+copilot_recovery_in_cooldown() {
+    local now last elapsed
+    [[ -f "$COPILOT_LAST_RECOVERY_FILE" ]] || return 1
+    now="$(date +%s)"
+    last="$(tr -d '[:space:]' < "$COPILOT_LAST_RECOVERY_FILE" 2>/dev/null || echo 0)"
+    elapsed=$((now - last))
+    [[ "$elapsed" -lt "$COPILOT_RECOVERY_COOLDOWN" ]]
+}
+
+copilot_mark_recovery() {
+    date +%s > "$COPILOT_LAST_RECOVERY_FILE"
 }
 
 copilot_stop_server() {
@@ -125,6 +151,11 @@ copilot_start_server() {
         return 1
     fi
 
+    if copilot_server_reachable; then
+        log "Copilot server already reachable on ${COPILOT_BASE_URL}; skipping start"
+        return 0
+    fi
+
     mkdir -p "$LOG_DIR"
     log "Starting Copilot server with: $python_bin"
     cd "$COPILOT_DIR"
@@ -133,19 +164,22 @@ copilot_start_server() {
     echo "$pid" > "$COPILOT_PID_FILE"
     log "Copilot launcher PID $pid (log: $COPILOT_LOG)"
 
-    sleep 3
-    if ! ps -p "$pid" >/dev/null 2>&1; then
-        log "ERROR: Copilot process exited immediately after start"
-        if [[ -f "$COPILOT_LOG" ]]; then
-            tail -8 "$COPILOT_LOG" | while IFS= read -r line; do
-                log "  $line"
-            done
+    local i
+    for ((i = 1; i <= 6; i++)); do
+        sleep 1
+        if copilot_port_listening; then
+            return 0
         fi
-        rm -f "$COPILOT_PID_FILE"
-        return 1
-    fi
+    done
 
-    return 0
+    log "ERROR: Copilot did not bind to port $COPILOT_PORT within 6s"
+    if [[ -f "$COPILOT_LOG" ]]; then
+        tail -8 "$COPILOT_LOG" | while IFS= read -r line; do
+            log "  $line"
+        done
+    fi
+    rm -f "$COPILOT_PID_FILE"
+    return 1
 }
 
 copilot_wait_until_healthy() {
@@ -155,7 +189,7 @@ copilot_wait_until_healthy() {
     local i
 
     for ((i = 1; i <= attempts; i++)); do
-        if copilot_models_reachable; then
+        if copilot_server_reachable; then
             if copilot_chat_ok; then
                 log "Copilot healthy after ${i} check(s)"
                 return 0
@@ -166,9 +200,9 @@ copilot_wait_until_healthy() {
             chat_fail_streak=$((chat_fail_streak + 1))
             log "Copilot reachable but chat probe failed with HTTP $chat_status (attempt $i/$attempts, streak=$chat_fail_streak)"
 
-            if [[ "$chat_status" == "503" || "$chat_status" == "502" ]] && [[ "$chat_fail_streak" -ge 6 ]]; then
+            if [[ "$chat_status" == "503" || "$chat_status" == "502" ]] && [[ "$chat_fail_streak" -ge 3 ]]; then
                 log "WARN: Copilot server is up but upstream chat is failing ($chat_status)."
-                log "WARN: This usually means Cloudflare clearance expired — run: cd ${COPILOT_DIR} && ./venv/bin/python -m copilot login"
+                log "WARN: Run: cd ${COPILOT_DIR} && ./venv/bin/python -m copilot login"
                 log "WARN: Continuing anyway so OpenClaw can start (may fall back to OpenAI)."
                 return 0
             fi
@@ -186,8 +220,8 @@ copilot_wait_until_healthy() {
         sleep "$interval"
     done
 
-    if copilot_server_up; then
-        log "WARN: Copilot server is reachable but chat never returned 200."
+    if copilot_server_reachable; then
+        log "WARN: Copilot /v1/models is reachable but chat never returned 200."
         log "WARN: Continuing anyway so OpenClaw can start."
         return 0
     fi
@@ -197,6 +231,10 @@ copilot_wait_until_healthy() {
 }
 
 copilot_restart_and_wait() {
+    if copilot_server_reachable; then
+        log "Copilot already reachable; skipping restart"
+        return 0
+    fi
     copilot_stop_server || true
     sleep 2
     if ! copilot_start_server; then

@@ -1,7 +1,6 @@
 #!/bin/bash
 # Full recovery when the local Copilot server is down:
-# 1) stop OpenClaw, 2) restart Copilot and wait until healthy,
-# 3) start OpenClaw again.
+# 1) stop OpenClaw, 2) restart Copilot if needed, 3) start OpenClaw again.
 
 set -uo pipefail
 
@@ -45,13 +44,12 @@ fi
 acquire_lock
 trap release_lock EXIT
 
-{
+run_recovery() {
     log "=========================================="
     log "OpenClaw + Copilot recovery starting"
     log "PATH=$PATH"
     log "=========================================="
 
-    local before_count
     before_count="$(openclaw_count_main)"
     if [[ "$before_count" -gt 0 ]]; then
         log "Found $before_count openclaw_main.py process(es) before stop"
@@ -62,17 +60,22 @@ trap release_lock EXIT
 
     if ! copilot_restart_and_wait; then
         log "ERROR: Copilot restart failed. OpenClaw left stopped."
-        exit 1
+        return 1
     fi
 
     sleep 2
 
     if ! openclaw_start; then
         log "ERROR: OpenClaw failed to start after Copilot recovery."
-        exit 1
+        return 1
     fi
 
+    copilot_mark_recovery
     log "Recovery complete."
+}
+
+{
+    run_recovery
 } >> "$RECOVERY_LOG" 2>&1
 
 tail -15 "$RECOVERY_LOG"
