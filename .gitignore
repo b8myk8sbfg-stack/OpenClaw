@@ -23,7 +23,17 @@ o365_token.txt
 # Browser session profiles (WhatsApp Web)
 chrome_whatsapp_profile/
 chrome_whatsapp_profile_backup_*/
+chrome_smc_profile/
 wa_profile_019/
+
+# Runtime state and caches
+.openclaw_smc_portal_cache.json
+openclaw_channel_turn.flag
+whatsapp_last_processed.json
+*.openclaw_burkert_cache.pkl
+
+# Local price lists / spreadsheets
+*.xlsm
 
 # Nested git metadata (Windows-Copilot-API tracked as plain files)
 Windows-Copilot-API/.git/
