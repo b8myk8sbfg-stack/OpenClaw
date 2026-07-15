@@ -734,6 +734,46 @@ def build_rows_from_api(api_id, qty, customer_part=None):
     return rows, supplier_item
 
 
+def _is_burkert_brand(brand):
+    return str(brand or "").upper().replace("BÜRKERT", "BURKERT") == "BURKERT"
+
+
+def _try_burkert_price_list_after_no_stock(
+    part_no,
+    qty,
+    rows,
+    *,
+    declared_brand="",
+    match=None,
+    item=None,
+    search_context="",
+):
+    """Quote Burkert from the offline price list when OBM/warehouse has no STORE stock."""
+    brand = str(
+        declared_brand
+        or ((rows[0] if rows else {}).get("brand"))
+        or ((match or {}).get("brand"))
+        or "UNKNOWN"
+    )
+    if not _is_burkert_brand(brand):
+        return None
+    if not rows or not all(str(row.get("price")) == "[TBC]" for row in rows):
+        return None
+
+    item = item or {}
+    match = match or {}
+    desc = (rows[0] if rows else {}).get("desc") or item.get("desc") or part_no
+    return _try_burkert_price_list_row(
+        part_no,
+        qty,
+        desc=desc,
+        brand="BURKERT",
+        search_context=search_context or desc,
+        burkert_id=item.get("burkert_id") or match.get("api_id") or part_no,
+        technical_specs=item.get("technical_specs") or [],
+    )
+
+
 def _try_burkert_price_list_row(
     part_no,
     qty,
@@ -868,6 +908,7 @@ def process_structured_items(structured_items):
         part_no = item["part_no"]
         qty = item["qty"]
         declared_brand = item.get("brand") or "UNKNOWN"
+        search_context = item.get("search_context") or item.get("desc") or ""
 
         match = resolve_warehouse_match(
             part_no,
@@ -878,6 +919,27 @@ def process_structured_items(structured_items):
 
         if match:
             rows, supplier_item = build_rows_from_api(match["api_id"], qty, customer_part=part_no)
+            burkert_row = _try_burkert_price_list_after_no_stock(
+                part_no,
+                qty,
+                rows,
+                declared_brand=declared_brand,
+                match=match,
+                item=item,
+                search_context=search_context,
+            )
+            if burkert_row and burkert_row.get("price") != "[TBC]":
+                formatted_rows.append(burkert_row)
+                if burkert_row.get("needs_supplier"):
+                    brand = burkert_row.get("brand") or declared_brand or "BURKERT"
+                    tbc_by_brand.setdefault(brand, []).append({
+                        "desc": burkert_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": brand,
+                    })
+                continue
+
             formatted_rows.extend(rows)
 
             if supplier_item:
@@ -886,7 +948,6 @@ def process_structured_items(structured_items):
         else:
             inferred_brand = declared_brand if declared_brand != "UNKNOWN" else infer_brand_from_part(part_no)
             desc = item.get("desc") or (f"{inferred_brand} {part_no}" if inferred_brand != "UNKNOWN" else part_no)
-            search_context = item.get("search_context") or ""
 
             smc_row = _try_smc_portal_row(
                 part_no,

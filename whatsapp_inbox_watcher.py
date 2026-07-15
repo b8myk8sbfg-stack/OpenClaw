@@ -3989,10 +3989,13 @@ def process_customer_inquiry(
             structured_items.append({
                 "brand": str(item.get("brand") or "UNKNOWN").strip().upper(),
                 "part_no": part_no,
-                "desc": part_no,
+                "desc": str(item.get("desc") or part_no).strip(),
                 "qty": int(item["qty"]),
                 "norm": part_norm,
                 "source": source_label,
+                "burkert_id": str(item.get("burkert_id") or "").strip(),
+                "technical_specs": item.get("technical_specs") or [],
+                "search_context": str(item.get("search_context") or item.get("desc") or part_no).strip(),
             })
             existing_norms.add(part_norm)
             print(f"   👁️ Extraction identified | Part: {part_no} | Qty: {item['qty']}")
