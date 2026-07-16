@@ -25,7 +25,9 @@ openclaw_stop_processes() {
         "$BASE_DIR/auto_claw.py" \
         "auto_claw.py" \
         "$BASE_DIR/whatsapp_inbox_watcher.py" \
-        "whatsapp_inbox_watcher.py"; do
+        "whatsapp_inbox_watcher.py" \
+        "$BASE_DIR/purchasing_whatsapp_watcher.py" \
+        "purchasing_whatsapp_watcher.py"; do
         pkill -f "$pattern" 2>/dev/null || true
     done
 }
@@ -49,6 +51,7 @@ openclaw_count_main() {
 
 openclaw_stop_chrome() {
     pkill -f "chrome_whatsapp_profile" 2>/dev/null || true
+    pkill -f "chrome_purchasing_whatsapp_profile" 2>/dev/null || true
     pkill -f "chromedriver" 2>/dev/null || true
 }
 

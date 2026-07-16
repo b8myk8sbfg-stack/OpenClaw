@@ -24,6 +24,10 @@ from openclaw_inquiry_engine import (
     process_structured_items,
 )
 from channel_router import send_supplier_rfq
+from supplier_rfq_pricing import (
+    build_customer_update_from_supplier,
+    parse_supplier_reply_items,
+)
 from non_standard_inquiry_handler import (
     gather_supplier_suggestions,
     format_suggestions_plain,
@@ -72,6 +76,7 @@ WHATSAPP_CUSTOMER_REGISTRY_FILE = "/Users/evon/OpenClaw/whatsapp_customer_regist
 IMAGE_CAPTURE_DIR = "/Users/evon/OpenClaw/logs/wa_image_capture"
 WA_IMAGE_DIR = "/Users/evon/OpenClaw/WA_Image"
 MIN_VIEWER_NATURAL_PX = 400
+_CAPTURE_FINGERPRINT_CACHE: list[tuple[str, tuple[int, str]]] = []
 CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.txt"
 
 MAX_UNREAD_CHATS_PER_RUN = 1
@@ -3963,6 +3968,39 @@ def capture_image_via_media_viewer(driver, bubble, image_path):
     return None
 
 
+def _capture_fingerprint(image_path: str) -> tuple[int, str]:
+    import hashlib
+
+    size = os.path.getsize(image_path)
+    digest = hashlib.md5()
+    with open(image_path, "rb") as handle:
+        digest.update(handle.read(65536))
+    return size, digest.hexdigest()
+
+
+def _is_duplicate_capture(image_path: str, message_data_id: str) -> bool:
+    """Detect when WhatsApp returns the same thumb bytes for a different message."""
+    global _CAPTURE_FINGERPRINT_CACHE
+    data_id = str(message_data_id or "").strip()
+    if not data_id or not image_path or not os.path.isfile(image_path):
+        return False
+    try:
+        fingerprint = _capture_fingerprint(image_path)
+    except OSError:
+        return False
+    for prev_id, prev_fp in _CAPTURE_FINGERPRINT_CACHE:
+        if prev_id != data_id and prev_fp == fingerprint:
+            print(
+                f"⚠️ Duplicate image capture detected for data_id={data_id[:24]!r} "
+                f"(same bytes as {prev_id[:24]!r}) — will retry full-resolution capture"
+            )
+            return True
+    _CAPTURE_FINGERPRINT_CACHE.append((data_id, fingerprint))
+    if len(_CAPTURE_FINGERPRINT_CACHE) > 40:
+        _CAPTURE_FINGERPRINT_CACHE.pop(0)
+    return False
+
+
 def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     bubble = resolve_message_container(bubble)
     if bubble is None:
@@ -3979,14 +4017,34 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
     )
 
     store_path = _capture_image_via_whatsapp_store(driver, message_data_id, image_path)
-    if store_path:
+    if store_path and not _is_duplicate_capture(store_path, message_data_id):
         _archive_image_copy(store_path, contact_name, message_data_id)
         return store_path
+    if store_path and os.path.isfile(store_path):
+        try:
+            os.remove(store_path)
+        except OSError:
+            pass
 
     viewer_path = capture_image_via_media_viewer(driver, bubble, image_path)
-    if viewer_path:
+    if viewer_path and not _is_duplicate_capture(viewer_path, message_data_id):
         _archive_image_copy(viewer_path, contact_name, message_data_id)
         return viewer_path
+    if viewer_path and os.path.isfile(viewer_path):
+        try:
+            os.remove(viewer_path)
+        except OSError:
+            pass
+
+    if message_data_id:
+        relocated = relocate_message_container(driver, message_data_id)
+        if relocated is not None:
+            bubble = relocated
+            print("   🔁 Retrying media viewer after relocating bubble...")
+            viewer_path = capture_image_via_media_viewer(driver, bubble, image_path)
+            if viewer_path and not _is_duplicate_capture(viewer_path, message_data_id):
+                _archive_image_copy(viewer_path, contact_name, message_data_id)
+                return viewer_path
 
     if message_data_id:
         relocated = relocate_message_container(driver, message_data_id)
@@ -4002,13 +4060,18 @@ def capture_bubble_image(driver, bubble, contact_name, message_data_id=""):
             )
             wait_for_media_image_ready(driver, media)
             if _save_image_from_element_blob(driver, media, image_path):
-                _log_saved_image_dimensions(image_path, method="bubble blob")
+                if _is_duplicate_capture(image_path, message_data_id):
+                    print("   ⚠️ Bubble blob duplicate — refusing low-trust thumb capture")
+                else:
+                    _log_saved_image_dimensions(image_path, method="bubble blob")
+                    _archive_image_copy(image_path, contact_name, message_data_id)
+                    return image_path
+            media.screenshot(image_path)
+            if not _is_duplicate_capture(image_path, message_data_id):
+                print(f"🖼️ Saved incoming WhatsApp image (thumb screenshot): {image_path}")
                 _archive_image_copy(image_path, contact_name, message_data_id)
                 return image_path
-            media.screenshot(image_path)
-            print(f"🖼️ Saved incoming WhatsApp image (thumb screenshot): {image_path}")
-            _archive_image_copy(image_path, contact_name, message_data_id)
-            return image_path
+            print("   ⚠️ Thumb screenshot duplicate — capture rejected")
         except Exception as e:
             print(f"❌ Failed to capture WhatsApp image thumb: {e}")
 
@@ -4502,71 +4565,6 @@ def extract_supplier_sections(message):
     return sections
 
 
-def parse_supplier_reply_items(section):
-    items = []
-
-    block_pattern = re.compile(
-        r"(\d+)\)\s*(.*?)\n"
-        r"\s*Qty\s*:\s*(\d+)\s*\n"
-        r"\s*Price\s*:\s*([^\n]*)\n"
-        r"\s*Lead\s*Time\s*:\s*([^\n]*)",
-        re.I | re.S
-    )
-
-    for idx, desc, qty, supplier_price_raw, lead_time in block_pattern.findall(section):
-        desc = re.sub(r"\s+", " ", desc).strip()
-        qty = int(qty)
-        supplier_price_raw = supplier_price_raw.strip()
-        lead_time = lead_time.strip()
-
-        if not supplier_price_raw or not lead_time:
-            continue
-
-        if "SAMPLE ITEM" in desc.upper():
-            continue
-
-        supplier_cost = parse_money(supplier_price_raw)
-
-        if supplier_cost is None:
-            continue
-
-        customer_unit_price = supplier_cost / MARKUP_DIVISOR
-        customer_subtotal = customer_unit_price * qty
-
-        items.append({
-            "idx": int(idx),
-            "desc": desc,
-            "qty": qty,
-            "supplier_cost_raw": supplier_price_raw,
-            "supplier_cost": supplier_cost,
-            "customer_unit_price": customer_unit_price,
-            "customer_subtotal": customer_subtotal,
-            "lead_time": lead_time
-        })
-
-    return items
-
-
-def build_customer_update_from_supplier(ref, brand, parsed_items):
-    msg = f"Hi, we have received supplier update for your inquiry.\n\nRef: {ref}\nBrand: {brand}\n\n"
-
-    total = 0.0
-
-    for item in parsed_items:
-        total += item["customer_subtotal"]
-
-        msg += f"{item['idx']}) {item['desc']}\n"
-        msg += f"Qty: {item['qty']}\n"
-        msg += f"Unit Price: RM {format_money(item['customer_unit_price'])}\n"
-        msg += f"Lead Time: {item['lead_time']}\n"
-        msg += f"Subtotal: RM {format_money(item['customer_subtotal'])}\n\n"
-
-    msg += f"Total: RM {format_money(total)}\n\n"
-    msg += "Thank you."
-
-    return msg
-
-
 def process_supplier_reply(driver, contact_name, latest_message):
     print("📬 Detected WhatsApp supplier reply / RFQ reference message.")
 
@@ -4601,7 +4599,7 @@ def process_supplier_reply(driver, contact_name, latest_message):
             append_log(contact_name, section, [], [], f"SUPPLIER_REF_NOT_FOUND_{ref}")
             continue
 
-        parsed_items = parse_supplier_reply_items(section)
+        parsed_items = parse_supplier_reply_items(section, brand=pending.get("brand") or "")
 
         if not parsed_items:
             print("⚠️ Ref found, but Price / Lead Time not filled.")

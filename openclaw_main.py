@@ -13,7 +13,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from openclaw_log import enable_timestamped_logging
 
-VERSION = "v1.07-QUOTATION-VISION-ROUTE"
+VERSION = "v1.08-PURCHASING-WHATSAPP-MODULE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
 load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
@@ -21,6 +21,7 @@ enable_timestamped_logging()
 
 EMAIL_SCRIPT = os.path.join(BASE_DIR, "auto_claw.py")
 WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "whatsapp_inbox_watcher.py")
+PURCHASING_WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "purchasing_whatsapp_watcher.py")
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
@@ -85,6 +86,25 @@ _RFQ_OCR_SYSTEM_INSTRUCTION = (
     "Strip leading brand prefixes from part_no when brand is known (SMC-AS2201F-01-04SA → brand=SMC, part_no=AS2201F-01-04SA). "
     "Do not include markdown, backticks, or conversational text."
 )
+
+_RFQ_OCR_QUOTATION_SUFFIX = (
+    "\n\nThe OCR text appears to be from a QUOTATION document photo. "
+    "Extract the product item code from the Description/table area — NOT the Our Ref header "
+    "(e.g. Q001300 is a reference number, not a product code). "
+    "Look for alphanumeric catalog codes such as 89PR10KLF near MOQ/resistor/product lines."
+)
+
+
+def _rfq_ocr_system_instruction(ocr_payload: dict) -> str:
+    try:
+        from quotation_image_extractor import is_quotation_document
+    except ImportError:
+        return _RFQ_OCR_SYSTEM_INSTRUCTION
+
+    text = str((ocr_payload or {}).get("full_text") or "")
+    if is_quotation_document(text):
+        return _RFQ_OCR_SYSTEM_INSTRUCTION + _RFQ_OCR_QUOTATION_SUFFIX
+    return _RFQ_OCR_SYSTEM_INSTRUCTION
 
 
 def _ai_fallback_enabled() -> bool:
@@ -170,12 +190,14 @@ def _postprocess_extracted_items(items: list, caption: str, image_path: str = ""
             normalize_burkert_part_from_ocr,
             normalize_qty_caption_text,
             reconcile_burkert_items_from_ocr,
+            reconcile_items_from_ocr,
         )
     except ImportError:
         return items
 
     caption = normalize_qty_caption_text(caption)
     items = filter_copilot_rfq_items(items)
+    items = reconcile_items_from_ocr(items, image_path=image_path, caption=caption)
     items = reconcile_burkert_items_from_ocr(items, image_path=image_path, caption=caption)
     items = apply_caption_qty_to_items(items, caption)
     for item in items:
@@ -447,7 +469,7 @@ def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = N
             )
             items = _call_copilot_rfq(
                 client,
-                _RFQ_OCR_SYSTEM_INSTRUCTION,
+                _rfq_ocr_system_instruction(ocr_payload),
                 _build_ocr_copilot_user_content(raw_email_body, ocr_payload),
                 parse_image_path=None,
             )
@@ -490,7 +512,7 @@ def _extract_rfq_with_openai_from_ocr(raw_email_body: str, ocr_payload: dict) ->
     response = client.chat.completions.create(
         model=OPENAI_TEXT_MODEL,
         messages=[
-            {"role": "system", "content": _RFQ_OCR_SYSTEM_INSTRUCTION},
+            {"role": "system", "content": _rfq_ocr_system_instruction(ocr_payload)},
             {
                 "role": "user",
                 "content": _build_ocr_copilot_user_content(raw_email_body, ocr_payload),
@@ -732,13 +754,18 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
     )
     prompt = (
         f"Research the industrial automation part {part_no}"
-        f"{f' by {brand}' if brand and brand != 'UNKNOWN' else ''}.\n"
+        f"{f' by {brand}' if brand and brand != 'UNKNOWN' else ''}.\n\n"
+        "IS THIS ITEM OBSOLETE? Search current catalogs, EOL notices, and distributor "
+        "cross-reference data.\n"
+        "If obsolete or discontinued, state the official manufacturer replacement "
+        "article number(s) (e.g. Bürkert 00221858 replacing 00134328).\n\n"
         "Write a concise technical summary suitable for a sales quotation reply.\n"
         "Include:\n"
+        "- Obsolete status (yes/no) and recommended replacement part number if obsolete\n"
         "- One-sentence product description\n"
         "- Main specifications as short bullet points\n"
         "- Typical applications (one short bullet list)\n"
-        "Keep the answer under 180 words. Plain text only. No markdown code fences."
+        "Keep the answer under 220 words. Plain text only. No markdown code fences."
     )
     try:
         response = client.chat.completions.create(
@@ -779,6 +806,12 @@ def build_ai_research_summary(formatted_rows):
         if not part_no or part_no in seen:
             continue
         seen.add(part_no)
+
+        obsolete_research = str(row.get("obsolete_research") or "").strip()
+        if obsolete_research:
+            sections.append(obsolete_research)
+            continue
+
         brand = str(row.get("brand") or "UNKNOWN").strip().upper()
         notes = research_part_with_copilot(part_no, brand)
         if notes:
@@ -819,6 +852,11 @@ def main():
 
     email_proc = run_process("Email Engine (auto_claw)", EMAIL_SCRIPT)
     wa_proc = run_process("WhatsApp Engine", WHATSAPP_SCRIPT)
+    purchasing_proc = None
+    if os.getenv("OPENCLAW_PURCHASING_WHATSAPP_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    ):
+        purchasing_proc = run_process("Purchasing WhatsApp Watcher", PURCHASING_WHATSAPP_SCRIPT)
 
     try:
         while True:
@@ -832,11 +870,19 @@ def main():
                 print("❌ WhatsApp engine stopped. Restarting...")
                 wa_proc = run_process("WhatsApp Engine", WHATSAPP_SCRIPT)
 
+            if purchasing_proc is not None and purchasing_proc.poll() is not None:
+                print("❌ Purchasing WhatsApp watcher stopped. Restarting...")
+                purchasing_proc = run_process(
+                    "Purchasing WhatsApp Watcher", PURCHASING_WHATSAPP_SCRIPT
+                )
+
     except KeyboardInterrupt:
         print("\n🛑 Stopping all services...")
 
         stop_process(email_proc, "Email Engine")
         stop_process(wa_proc, "WhatsApp Engine")
+        if purchasing_proc is not None:
+            stop_process(purchasing_proc, "Purchasing WhatsApp Watcher")
 
         print("✅ All stopped.")
 

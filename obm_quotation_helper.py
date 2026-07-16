@@ -580,6 +580,18 @@ def notify_manager(mailbox, subject, body):
         print(f"❌ [OBM] Manager notification failed: {e}")
 
 
+def all_items_ready_for_obm(items) -> bool:
+    """True only when every row has real price and lead time (no [TBC])."""
+    if not items:
+        return False
+    for row in items:
+        price = str(row.get("price") or "").strip()
+        lt = str(row.get("lt") or "").strip()
+        if not price or price == "[TBC]" or not lt or lt == "[TBC]":
+            return False
+    return True
+
+
 def create_obm_quotation_from_inquiry(
     email_body,
     items,

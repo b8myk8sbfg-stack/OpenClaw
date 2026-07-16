@@ -12,6 +12,7 @@ WAREHOUSE_CSV = "/Users/evon/OpenClaw/Robomatics_Stock_List.csv"
 KNOWN_BRANDS_RE = (
     r"OMRON|SMC|BURKERT|BÜRKERT|PANASONIC|THK|LOCTITE|KEYENCE|FESTO|SICK|IFM|PARKER|PISCO|ABB|SIEMENS"
     r"|KOGANEI|CKD|AIRTAC|LEGRIS|MITSUBISHI|CPC|YASKAWA|DELTA|FUJI|IDEC"
+    r"|MARKEM[\s\-]?IMAJE|MARKEM|IMAJE|RECTUS|PARFLEX"
 )
 
 KNOWN_BRAND_PREFIXES = tuple(
@@ -20,6 +21,7 @@ KNOWN_BRAND_PREFIXES = tuple(
         "OMRON", "SMC", "BURKERT", "BÜRKERT", "PANASONIC", "THK", "LOCTITE", "KEYENCE", "FESTO",
         "SICK", "IFM", "PARKER", "PISCO", "ABB", "SIEMENS", "KOGANEI", "CKD", "AIRTAC", "LEGRIS",
         "MITSUBISHI", "CPC", "YASKAWA", "DELTA", "FUJI", "IDEC", "SCHNEIDER", "CAMOZZI", "PIAB",
+        "MARKEM-IMAJE", "MARKEM", "IMAJE", "RECTUS", "PARFLEX",
     )
 )
 
@@ -232,7 +234,70 @@ def scan_burkert_article_ids_from_ocr_text(text: str) -> List[str]:
         for match in re.finditer(rf"(\d{{{length}}})", compact):
             add(match.group(1))
 
-    return candidates
+    return rank_burkert_article_ids(candidates, blob)
+
+
+def _is_quotation_ref_mashup(candidate: str, ocr_text: str) -> bool:
+    """Reject IDs stitched from Our Ref Q001300 + date digits on quotation photos."""
+    digits = re.sub(r"[^0-9]", "", str(candidate or ""))
+    text = str(ocr_text or "").upper()
+    if re.search(r"\bQ0*1300\b", text) and digits.startswith("001300"):
+        return True
+    if re.search(r"\bOUR\s*REF\b", text) and digits.startswith("001300"):
+        return True
+    return False
+
+
+def rank_burkert_article_ids(candidates: List[str], ocr_text: str) -> List[str]:
+    """Sort Burkert ID OCR hits — prefer repeated 00-padded label IDs near type numbers."""
+    text = str(ocr_text or "")
+    text_upper = text.upper()
+    compact = re.sub(r"[^0-9A-Z]", "", text_upper)
+    scored: List[tuple[float, str]] = []
+
+    for raw in candidates:
+        normalized = normalize_burkert_part_from_ocr(raw)
+        norm_digits = re.sub(r"[^0-9]", "", normalized)
+        if len(norm_digits) < 6:
+            continue
+        if _is_quotation_ref_mashup(normalized, text):
+            continue
+
+        score = 0.0
+        bare = norm_digits.lstrip("0") or norm_digits
+        score += text_upper.count(normalized) * 120.0
+        score += text_upper.count(bare) * 80.0
+        if re.search(rf"\b{re.escape(normalized)}\b", text):
+            score += 500.0
+        if re.search(rf"\b{re.escape(bare)}\b", text):
+            score += 350.0
+        if normalized.startswith("00") and len(norm_digits) >= 7:
+            score += 250.0
+        if re.search(r"\b5281\b|\b6281\b|\bSOLENOID\b", text_upper):
+            score += 150.0
+            if bare in compact or normalized in compact:
+                score += 300.0
+        if re.search(r"\bG1\b|\b230V\b|\bNBR\b", text_upper):
+            score += 50.0
+
+        scored.append((score, normalized))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    ordered: List[str] = []
+    seen = set()
+    for _, value in scored:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def pick_best_burkert_article_id(ocr_text: str) -> str:
+    ids = scan_burkert_article_ids_from_ocr_text(ocr_text)
+    return ids[0] if ids else ""
 
 
 def is_ocr_junk_part_no(part_no: str) -> bool:
@@ -273,7 +338,101 @@ def is_copilot_prompt_example_hallucination(items: List[dict]) -> bool:
         return True
     if len(items) == 2 and parts == {"E2E-X5E1", "AS2201F-01-04SA"}:
         return True
+    if len(items) == 1 and parts == {"KQ2L06-01A"}:
+        return True
     return False
+
+
+def is_known_prompt_hallucination_part(part_no: str) -> bool:
+    compact = re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
+    known = {
+        "KQ2L0601A",
+        "KQ2L0601AS",
+        "E2EX5E1",
+        "AS2201F0104SA",
+        "E5CCRX2ASM880",
+    }
+    return compact in known
+
+
+def scan_markem_imaje_part_from_ocr_text(text: str) -> str:
+    match = re.search(r"\b(ENM\d{5,})\b", str(text or ""), flags=re.I)
+    return match.group(1).upper() if match else ""
+
+
+def _part_token_in_ocr_blob(part_no: str, ocr_text: str) -> bool:
+    part_key = re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
+    ocr_key = re.sub(r"[^A-Z0-9]", "", str(ocr_text or "").upper())
+    if not part_key or not ocr_key:
+        return False
+    return part_key in ocr_key
+
+
+def reconcile_items_from_ocr(
+    items: List[dict],
+    image_path: str = "",
+    caption: str = "",
+) -> List[dict]:
+    """When OCR clearly shows a different catalog ID than Copilot, prefer OCR."""
+    image_path = str(image_path or "").strip()
+    if not image_path or not os.path.isfile(image_path):
+        return items
+
+    try:
+        from local_ocr import extract_text_from_image, has_usable_ocr_text, ocr_text_for_extraction
+    except ImportError:
+        return items
+
+    payload = extract_text_from_image(image_path)
+    if not has_usable_ocr_text(payload):
+        return items
+
+    ocr_text = ocr_text_for_extraction(payload)
+    qty = extract_qty_from_caption(caption) or 1
+    if len(items) == 1:
+        try:
+            qty = int(items[0].get("qty") or qty)
+        except (TypeError, ValueError):
+            pass
+
+    extracted_part = str(items[0].get("part_no") or "").strip().upper() if len(items) == 1 else ""
+    if extracted_part and _part_token_in_ocr_blob(extracted_part, ocr_text):
+        return items
+
+    burkert_ids = scan_burkert_article_ids_from_ocr_text(ocr_text)
+    preferred_burkert = pick_best_burkert_article_id(ocr_text)
+
+    markem_part = scan_markem_imaje_part_from_ocr_text(ocr_text)
+
+    should_override = (
+        not items
+        or all(is_ocr_junk_part_no(i.get("part_no", "")) for i in items)
+        or (len(items) == 1 and is_known_prompt_hallucination_part(extracted_part))
+        or (
+            len(items) == 1
+            and extracted_part
+            and not _part_token_in_ocr_blob(extracted_part, ocr_text)
+            and (preferred_burkert or markem_part)
+        )
+    )
+    if not should_override:
+        return items
+
+    if preferred_burkert:
+        print(
+            f"[RFQ] OCR catalog recovery: "
+            f"{[i.get('part_no') for i in items] or ['(none)']} → {preferred_burkert} (BURKERT)"
+        )
+        return [{"part_no": preferred_burkert, "qty": qty, "brand": "BURKERT"}]
+
+    if markem_part:
+        print(
+            f"[RFQ] OCR catalog recovery: "
+            f"{[i.get('part_no') for i in items] or ['(none)']} → {markem_part} (MARKEM-IMAJE)"
+        )
+        return [{"part_no": markem_part, "qty": qty, "brand": "MARKEM-IMAJE"}]
+
+    return items
 
 
 def filter_copilot_rfq_items(items: List[dict]) -> List[dict]:
@@ -286,6 +445,9 @@ def filter_copilot_rfq_items(items: List[dict]) -> List[dict]:
         part_no = str(item.get("part_no") or "").strip()
         if is_ocr_junk_part_no(part_no):
             print(f"[RFQ] Dropped junk extracted part {part_no!r}")
+            continue
+        if is_known_prompt_hallucination_part(part_no):
+            print(f"[RFQ] Dropped known prompt-example hallucination {part_no!r}")
             continue
         cleaned.append(item)
     return cleaned
@@ -302,7 +464,7 @@ def reconcile_burkert_items_from_ocr(
         return items
 
     try:
-        from local_ocr import extract_text_from_image, has_usable_ocr_text
+        from local_ocr import extract_text_from_image, has_usable_ocr_text, ocr_text_for_extraction
     except ImportError:
         return items
 
@@ -310,16 +472,10 @@ def reconcile_burkert_items_from_ocr(
     if not has_usable_ocr_text(payload):
         return items
 
-    ocr_text = payload.get("full_text") or ""
-    ids = scan_burkert_article_ids_from_ocr_text(ocr_text)
-    if not ids:
+    ocr_text = ocr_text_for_extraction(payload)
+    preferred = pick_best_burkert_article_id(ocr_text)
+    if not preferred:
         return items
-
-    preferred = ids[0]
-    for candidate in ids:
-        if candidate.startswith("00") and len(re.sub(r"[^0-9]", "", candidate)) >= 7:
-            preferred = candidate
-            break
 
     junk_items = items and all(is_ocr_junk_part_no(i.get("part_no", "")) for i in items)
     if not junk_items and len(items) == 1 and not looks_like_burkert_article_id(items[0].get("part_no", "")):

@@ -17,6 +17,31 @@ class QuotationDetectionTests(unittest.TestCase):
         ocr = "OMRON\nE2E-X5E1\nPROXIMITY SENSOR\nMADE IN JAPAN"
         self.assertFalse(qie.is_quotation_document(ocr))
 
+    def test_rejects_burkert_nameplate_as_quotation(self):
+        ocr = (
+            "5281 A 25.0 NBR MS\n00134328\nG1 PN0.2-16bar\n"
+            "230V 50-60Hz 8W\nUS $255\nCondition:\nQuantity:"
+        )
+        self.assertTrue(qie.is_product_label_photo(ocr))
+        self.assertFalse(qie.is_quotation_document(ocr))
+
+    def test_rejects_known_hallucination_without_ocr_support(self):
+        ocr = "Quotation\nOur Ref : Q001300\nUnit Price\nTotal Price\n2 PCE"
+        ok, reason = qie.validate_vision_against_ocr(
+            {"item_code": "KQ2L06-01A", "qty": 1, "unit_price": 9.8, "total_price": 9.8},
+            ocr,
+        )
+        self.assertFalse(ok)
+        self.assertIn("hallucination", reason.lower())
+
+    def test_accepts_vision_when_ocr_contains_item_code(self):
+        ocr = "Quotation\n89PR10KLF TRIMMER RESISTOR\nUnit Price\n2 PCE"
+        ok, reason = qie.validate_vision_against_ocr(
+            {"item_code": "89PR10KLF", "qty": 2, "unit_price": 60, "total_price": 120},
+            ocr,
+        )
+        self.assertTrue(ok, reason)
+
     def test_our_ref_token(self):
         self.assertTrue(qie.is_our_ref_token("Q001300"))
         self.assertFalse(qie.is_our_ref_token("89PR10KLF"))

@@ -229,6 +229,38 @@ def _score_ocr_candidate(lines: List[Dict[str, Any]], full_text: str) -> float:
     return score
 
 
+def _score_quotation_ocr_candidate(lines: List[Dict[str, Any]], full_text: str) -> float:
+    text = str(full_text or "").upper()
+    score = 0.0
+
+    if re.search(r"\bQUOTATION\b", text):
+        score += 300.0
+    if re.search(r"\bOUR\s*REF\b", text):
+        score += 200.0
+    if re.search(r"\bUNIT\s*PRICE\b", text):
+        score += 150.0
+    if re.search(r"\bTOTAL\s*PRICE\b", text):
+        score += 150.0
+    if re.search(r"\b\d{2,}[A-Z]{1,4}\d+[A-Z0-9-]*\b", text):
+        score += 400.0
+    if "TRIMMER" in text or "RESISTOR" in text:
+        score += 250.0
+    if "MOQ" in text:
+        score += 200.0
+    if re.search(r"\b\d+\s*PCE\b", text):
+        score += 100.0
+
+    confs = [
+        float(line.get("confidence"))
+        for line in (lines or [])
+        if line.get("confidence") is not None and float(line.get("confidence")) >= 0
+    ]
+    if confs:
+        score += sum(confs) / len(confs)
+    score += min(len(lines or []), 40) * 2.5
+    return score
+
+
 def _orientation_candidates(image_path: str) -> List[int]:
     try:
         from PIL import Image
@@ -250,6 +282,7 @@ def _ocr_image_variant(
     thumb_capture: bool,
     rotate_degrees: int,
     psm_modes: List[int],
+    scoring_hint: str = "auto",
 ) -> Dict[str, Any]:
     import pytesseract
 
@@ -275,15 +308,29 @@ def _ocr_image_variant(
     for line in lines:
         line["text"] = _fix_burkert_ocr_in_text(line.get("text") or "")
     full_text = "\n".join(line["text"] for line in lines).strip()
+    if scoring_hint == "quotation":
+        score = _score_quotation_ocr_candidate(lines, full_text)
+    elif scoring_hint == "burkert":
+        score = _score_ocr_candidate(lines, full_text)
+    else:
+        score = max(
+            _score_ocr_candidate(lines, full_text),
+            _score_quotation_ocr_candidate(lines, full_text),
+        )
     return {
         "lines": lines,
         "full_text": full_text,
-        "score": _score_ocr_candidate(lines, full_text),
+        "score": score,
         "rotate_degrees": rotate_degrees,
     }
 
 
-def extract_text_from_image(image_path: str, *, thumb_capture: bool = False) -> Dict[str, Any]:
+def extract_text_from_image(
+    image_path: str,
+    *,
+    thumb_capture: bool = False,
+    scoring_hint: str = "auto",
+) -> Dict[str, Any]:
     """
     Run local OCR on an image file.
 
@@ -335,27 +382,40 @@ def extract_text_from_image(image_path: str, *, thumb_capture: bool = False) -> 
         psm_modes = [int(x) for x in os.getenv("OPENCLAW_OCR_PSM", "6,11,3").split(",") if x.strip()]
 
         best_variant = None
+        all_line_groups: List[List[Dict[str, Any]]] = []
         for rotate_degrees in _orientation_candidates(image_path):
             variant = _ocr_image_variant(
                 image_path,
                 thumb_capture=thumb_capture,
                 rotate_degrees=rotate_degrees,
                 psm_modes=psm_modes,
+                scoring_hint=scoring_hint,
             )
+            all_line_groups.append(variant.get("lines") or [])
             if best_variant is None or variant["score"] > best_variant["score"]:
                 best_variant = variant
 
         if best_variant and int(best_variant.get("rotate_degrees") or 0):
             print(
                 f"[OCR] Best orientation: rotate {best_variant['rotate_degrees']}° "
-                f"(score={best_variant['score']:.1f})"
+                f"counter-clockwise (score={best_variant['score']:.1f})"
             )
+
+        merged_lines = _merge_ocr_lines(all_line_groups)
+        merged_full_text = "\n".join(
+            str(line.get("text") or "").strip() for line in merged_lines if str(line.get("text") or "").strip()
+        ).strip()
 
         lines = (best_variant or {}).get("lines") or []
         payload["lines"] = lines
         payload["full_text"] = (best_variant or {}).get("full_text") or ""
+        payload["merged_full_text"] = merged_full_text or payload["full_text"]
+        payload["rotate_degrees"] = int((best_variant or {}).get("rotate_degrees") or 0)
         if payload["full_text"]:
-            print(f"[OCR] Merged {len(lines)} line(s) from PSM modes {psm_modes}")
+            print(
+                f"[OCR] Merged {len(lines)} line(s) from best orientation; "
+                f"{len(merged_lines)} line(s) across all rotations"
+            )
         if not payload["full_text"]:
             payload["error"] = "no_text_detected"
         return payload
@@ -367,10 +427,13 @@ def extract_text_from_image(image_path: str, *, thumb_capture: bool = False) -> 
 
 def ocr_payload_to_json(ocr_payload: Dict[str, Any]) -> str:
     """Serialize OCR output for Copilot text prompts."""
+    merged = str(ocr_payload.get("merged_full_text") or ocr_payload.get("full_text") or "")
     slim = {
         "engine": ocr_payload.get("engine"),
         "lang": ocr_payload.get("lang"),
         "full_text": ocr_payload.get("full_text") or "",
+        "merged_full_text": merged,
+        "rotate_degrees": ocr_payload.get("rotate_degrees"),
         "lines": [
             {"text": line.get("text"), "confidence": line.get("confidence")}
             for line in (ocr_payload.get("lines") or [])
@@ -378,6 +441,16 @@ def ocr_payload_to_json(ocr_payload: Dict[str, Any]) -> str:
         "error": ocr_payload.get("error"),
     }
     return json.dumps(slim, ensure_ascii=False, indent=2)
+
+
+def ocr_text_for_extraction(ocr_payload: Dict[str, Any]) -> str:
+    """Prefer merged OCR across all rotations (0/90/180/270° CCW) for part-ID scanning."""
+    if not ocr_payload:
+        return ""
+    merged = str(ocr_payload.get("merged_full_text") or "").strip()
+    if merged:
+        return merged
+    return str(ocr_payload.get("full_text") or "").strip()
 
 
 def has_usable_ocr_text(ocr_payload: Dict[str, Any]) -> bool:

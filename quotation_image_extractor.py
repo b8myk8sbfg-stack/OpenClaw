@@ -39,6 +39,32 @@ _QUOTATION_SIGNALS = (
     re.compile(r"\bDELIVERY\b", re.I),
 )
 
+_PRODUCT_LABEL_SIGNALS = (
+    re.compile(r"\b5281\b|\b6281\b|\b6519\b"),
+    re.compile(r"\bBURKERT\b|\bBÜRKERT\b|\bBURK\b", re.I),
+    re.compile(r"\bSOLENOID\b|\bVALVE\b", re.I),
+    re.compile(r"\b00\d{6,7}\b"),
+    re.compile(r"\bENM\d{5,}\b", re.I),
+    re.compile(r"\b(?:CODE\s+ARTICLE|PART\s+NUMBER|NAMEPLATE)\b", re.I),
+    re.compile(r"\bUS\s*\$|\bCONDITION\s*:", re.I),
+    re.compile(r"\b(?:DINGFAN|MARKEM[\s-]?IMAJE)\b", re.I),
+    re.compile(r"\b(?:MOQ|RESISTOR|TRIMMER)\b", re.I),
+)
+
+# Copilot often echoes RFQ prompt examples when vision fails on a quotation photo.
+_KNOWN_VISION_HALLUCINATIONS = frozenset({
+    "KQ2L06-01A",
+    "KQ2L06-01AS",
+    "E2E-X5E1",
+    "AS2201F-01-04SA",
+    "E5CC-RX2ASM-880",
+})
+
+_QUOTATION_ITEM_CODE_RE = re.compile(
+    r"\b(\d{2,}[A-Z]{1,4}\d+[A-Z0-9-]*|[A-Z]{2,}\d{3,}[A-Z0-9-]*)\b",
+    re.I,
+)
+
 _OUR_REF_RE = re.compile(r"^Q\d{3,}$", re.I)
 
 _QUOTATION_SYSTEM = (
@@ -97,13 +123,100 @@ def detect_image_mime(image_path: str) -> str:
     return guessed or "image/jpeg"
 
 
+def is_product_label_photo(ocr_text: str) -> bool:
+    """True when OCR looks like a product label/nameplate/e-commerce listing, not a quotation."""
+    text = str(ocr_text or "").strip()
+    if not text:
+        return False
+    label_hits = sum(1 for pattern in _PRODUCT_LABEL_SIGNALS if pattern.search(text))
+    if label_hits < 2:
+        return False
+    quotation_hits = sum(1 for pattern in _QUOTATION_SIGNALS if pattern.search(text))
+    # Require a real quotation header block — not just stray 'Unit Price' from a listing UI.
+    has_quotation_header = bool(
+        re.search(r"\bQUOTATION\b", text, re.I)
+        and re.search(r"\bOUR\s*REF\b", text, re.I)
+    )
+    return not (has_quotation_header and quotation_hits >= 3)
+
+
 def is_quotation_document(ocr_text: str) -> bool:
     """True when OCR text looks like a quotation table, not a product label."""
     text = str(ocr_text or "").strip()
     if not text:
         return False
+    if is_product_label_photo(text):
+        return False
     hits = sum(1 for pattern in _QUOTATION_SIGNALS if pattern.search(text))
     return hits >= 2
+
+
+def extract_quotation_item_codes_from_ocr(ocr_text: str) -> list[str]:
+    """Pull likely product codes from quotation OCR (description column)."""
+    text = str(ocr_text or "")
+    if not text.strip():
+        return []
+
+    seen: set[str] = set()
+    codes: list[str] = []
+
+    def add(raw: str) -> None:
+        token = str(raw or "").strip().upper()
+        if not token or len(token) < 5:
+            return
+        if is_our_ref_token(token):
+            return
+        if token in {"QUOTATION", "DELIVERY", "DESCRIPTION", "RAMATEX"}:
+            return
+        compact = re.sub(r"[^A-Z0-9]", "", token)
+        if compact in seen:
+            return
+        if not re.search(r"\d", compact) or not re.search(r"[A-Z]", compact):
+            return
+        seen.add(compact)
+        codes.append(token)
+
+    for match in _QUOTATION_ITEM_CODE_RE.finditer(text):
+        add(match.group(1))
+
+    for line in text.splitlines():
+        upper = line.upper()
+        if not any(keyword in upper for keyword in ("MOQ", "RESISTOR", "TRIMMER", "DESCRIPTION")):
+            continue
+        for match in _QUOTATION_ITEM_CODE_RE.finditer(line):
+            add(match.group(1))
+
+    return codes
+
+
+def _part_token_in_ocr(part_no: str, ocr_text: str) -> bool:
+    part_key = re.sub(r"[^A-Z0-9]", "", str(part_no or "").upper())
+    ocr_key = re.sub(r"[^A-Z0-9]", "", str(ocr_text or "").upper())
+    if not part_key or not ocr_key:
+        return False
+    return part_key in ocr_key
+
+
+def validate_vision_against_ocr(parsed: dict, ocr_text: str) -> tuple[bool, str]:
+    """Reject Copilot vision rows that conflict with OCR or echo prompt examples."""
+    item_code = str(parsed.get("item_code") or "").strip().upper()
+    if not item_code:
+        return False, "missing item_code"
+
+    compact = re.sub(r"[^A-Z0-9]", "", item_code)
+    if compact in _KNOWN_VISION_HALLUCINATIONS or item_code in _KNOWN_VISION_HALLUCINATIONS:
+        ocr_codes = extract_quotation_item_codes_from_ocr(ocr_text)
+        if not _part_token_in_ocr(item_code, ocr_text) and not any(
+            _part_token_in_ocr(code, item_code) for code in ocr_codes
+        ):
+            return False, f"known prompt hallucination {item_code} not supported by OCR"
+
+    ocr_codes = extract_quotation_item_codes_from_ocr(ocr_text)
+    if ocr_codes and not _part_token_in_ocr(item_code, ocr_text):
+        if not any(_part_token_in_ocr(code, item_code) or _part_token_in_ocr(item_code, code) for code in ocr_codes):
+            return False, f"vision item_code {item_code} not found in OCR codes {ocr_codes[:3]}"
+
+    return True, ""
 
 
 def is_our_ref_token(token: str) -> bool:
@@ -330,8 +443,11 @@ def try_extract_quotation_image(image_path: str, caption: str = "") -> dict | No
     except ImportError:
         return None
 
-    ocr_payload = extract_text_from_image(image_path)
+    ocr_payload = extract_text_from_image(image_path, scoring_hint="quotation")
     ocr_text = str(ocr_payload.get("full_text") or "")
+    if is_product_label_photo(ocr_text):
+        print("[QUOTATION VISION] Product label/nameplate detected — skipping quotation vision route")
+        return None
     if not is_quotation_document(ocr_text):
         return None
 
@@ -347,14 +463,26 @@ def try_extract_quotation_image(image_path: str, caption: str = "") -> dict | No
             last_reason = "malformed JSON"
             continue
         ok, reason = validate_quotation_fields(parsed)
+        if not ok:
+            print(f"[QUOTATION VISION] Validation failed: {reason}")
+            last_reason = reason
+            continue
+        ok, reason = validate_vision_against_ocr(parsed, ocr_text)
         if ok:
             validated = parsed
             break
-        print(f"[QUOTATION VISION] Validation failed: {reason}")
+        print(f"[QUOTATION VISION] OCR cross-check failed: {reason}")
         last_reason = reason
 
     if not validated:
-        print("[QUOTATION VISION] Extraction failed — falling back to label OCR route")
+        ocr_codes = extract_quotation_item_codes_from_ocr(ocr_text)
+        if ocr_codes:
+            print(
+                f"[QUOTATION VISION] Vision rejected — falling back to label OCR route "
+                f"(OCR item hint: {ocr_codes[0]})"
+            )
+        else:
+            print("[QUOTATION VISION] Extraction failed — falling back to label OCR route")
         return None
 
     items = quotation_to_rfq_items(validated, caption)

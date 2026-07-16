@@ -8,12 +8,19 @@ from O365 import Account
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
+from supplier_whatsapp_config import uses_purchasing_whatsapp
+
 load_dotenv()
 
 SUPPLIER_PENDING_CSV = "/Users/evon/OpenClaw/whatsapp_supplier_pending.csv"
+INTERNAL_PURCHASING_EMAIL = "purchasing@robomatics.sg"
 
+# EMAIL = internal purchasing@robomatics.sg
+# PURCHASING_WHATSAPP = separate Chrome, purchasing line → external supplier WhatsApp
 SUPPLIER_CHANNEL_ROUTING = {
-    "OMRON": "EMAIL",
+    "OMRON": "PURCHASING_WHATSAPP",
+    "FESTO": "EMAIL",
+    "PIAB": "EMAIL",
     "BURKERT": "EMAIL",
     "SMC": "EMAIL",
     "UNKNOWN": "EMAIL",
@@ -24,14 +31,15 @@ SUPPLIER_EMAIL_ROUTING = {
     "OMRON": "purchasing@robomatics.sg",
     "BURKERT": "purchasing@robomatics.sg",
     "SMC": "purchasing@robomatics.sg",
+    "FESTO": "siuw@jsautomation.com.my",
+    "PIAB": "Ang.SengGuan@piabgroup.com",
     "UNKNOWN": "purchasing@robomatics.sg",
     "DEFAULT": "purchasing@robomatics.sg",
 }
 
+# Legacy map — external supplier numbers now live in supplier_whatsapp_config.py
 SUPPLIER_WHATSAPP_ROUTING = {
-    "OMRON": "60167027683",
-    "BURKERT": "60167027683",
-    "DEFAULT": "60167027683",
+    "DEFAULT": "",
 }
 
 
@@ -113,6 +121,8 @@ def log_supplier_pending(
 
 def get_supplier_channel(brand):
     brand = str(brand or "UNKNOWN").upper().strip()
+    if uses_purchasing_whatsapp(brand):
+        return "PURCHASING_WHATSAPP"
     return SUPPLIER_CHANNEL_ROUTING.get(
         brand,
         SUPPLIER_CHANNEL_ROUTING["DEFAULT"]
@@ -135,7 +145,23 @@ def get_supplier_whatsapp(brand):
     )
 
 
-def build_supplier_rfq_text(brand, items, ref, customer_name=None, customer_contact=None):
+def is_external_supplier(brand):
+    """True when RFQ goes to a real external supplier (not internal purchasing only)."""
+    brand = str(brand or "UNKNOWN").upper().strip()
+    if uses_purchasing_whatsapp(brand):
+        return True
+    email = get_supplier_email(brand).lower()
+    return email != INTERNAL_PURCHASING_EMAIL.lower()
+
+
+def build_supplier_rfq_text(
+    brand,
+    items,
+    ref,
+    customer_name=None,
+    customer_contact=None,
+    include_customer_info=True,
+):
     brand = str(brand or "UNKNOWN").upper().strip()
 
     msg = f"""Hi,
@@ -144,10 +170,15 @@ Please quote the following items:
 
 Brand: {brand}
 Ref: {ref}
-Customer: {customer_name or "-"}
-Customer Contact: {customer_contact or "-"}
+"""
 
+    if include_customer_info:
+        msg += f"Customer: {customer_name or '-'}\nCustomer Contact: {customer_contact or '-'}\n"
+
+    msg += f"""
 [REPLY FORMAT - PLEASE COPY & FILL]
+
+Ref: {ref}
 
 """
 
@@ -162,15 +193,22 @@ Lead Time:
 
 """
 
-    msg += """[END]
+    if brand == "PIAB":
+        example_item = "Piab vacuum filter (31.16.671)"
+        example_price = "SGD78.44 net/unit"
+    else:
+        example_item = "[any item request to quote]"
+        example_price = "RM100"
+
+    msg += f"""[END]
 
 ⚠️ Please copy the format above and fill in Price & Lead Time for each item.
 
 Example:
 
-1) SAMPLE ITEM
+1) {example_item}
 Qty: 1
-Price: RM100
+Price: {example_price}
 Lead Time: 2 weeks
 
 Thanks.
@@ -196,22 +234,24 @@ def get_mailbox():
 def send_supplier_email(brand, items, ref, customer_name=None, customer_contact=None):
     brand = str(brand or "UNKNOWN").upper().strip()
     supplier_email = get_supplier_email(brand)
+    external = is_external_supplier(brand)
 
     mailbox = get_mailbox()
 
     if not mailbox:
         return False
 
-    msg_text = build_supplier_rfq_text(
+    supplier_msg = build_supplier_rfq_text(
         brand, items, ref,
         customer_name=customer_name,
         customer_contact=customer_contact,
+        include_customer_info=not external,
     )
 
     sm = mailbox.new_message()
     sm.to.add(supplier_email)
-    sm.subject = f"[PURCHASING RFQ] [{brand}] WhatsApp Inquiry - Ref: {ref}"
-    sm.body = msg_text
+    sm.subject = f"[RFQ] [{brand}] Price Request - Ref: {ref}"
+    sm.body = supplier_msg
     sm.body_type = "text"
     sm.send()
 
@@ -219,12 +259,60 @@ def send_supplier_email(brand, items, ref, customer_name=None, customer_contact=
     print(f"   Brand: {brand}")
     print(f"   To: {supplier_email}")
     print(f"   Ref: {ref}")
+    if external:
+        print("   Customer details: withheld from external supplier")
+
+    if external:
+        internal_msg = build_supplier_rfq_text(
+            brand, items, ref,
+            customer_name=customer_name,
+            customer_contact=customer_contact,
+            include_customer_info=True,
+        )
+        sm_copy = mailbox.new_message()
+        sm_copy.to.add(INTERNAL_PURCHASING_EMAIL)
+        sm_copy.subject = f"[INTERNAL COPY] [RFQ] [{brand}] Ref: {ref}"
+        sm_copy.body = internal_msg
+        sm_copy.body_type = "text"
+        sm_copy.send()
+
+        print("✅ [ROUTER] Internal purchasing copy sent")
+        print(f"   To: {INTERNAL_PURCHASING_EMAIL}")
+        print("   Customer details: included for internal purchaser")
 
     return True
 
 
+def send_purchasing_internal_rfq_copy(
+    brand, items, ref, customer_name=None, customer_contact=None
+):
+    """Email purchasing@ with full customer details after external WhatsApp RFQ."""
+    brand = str(brand or "UNKNOWN").upper().strip()
+    mailbox = get_mailbox()
+    if not mailbox:
+        return False
+
+    internal_msg = build_supplier_rfq_text(
+        brand, items, ref,
+        customer_name=customer_name,
+        customer_contact=customer_contact,
+        include_customer_info=True,
+    )
+    sm = mailbox.new_message()
+    sm.to.add(INTERNAL_PURCHASING_EMAIL)
+    sm.subject = f"[INTERNAL COPY] [RFQ] [{brand}] Ref: {ref}"
+    sm.body = internal_msg
+    sm.body_type = "text"
+    sm.send()
+
+    print("✅ [ROUTER] Internal purchasing copy sent")
+    print(f"   To: {INTERNAL_PURCHASING_EMAIL}")
+    print(f"   Ref: {ref}")
+    return True
+
+
 def open_whatsapp_chat(driver, phone):
-    print(f"🌐 [ROUTER] Opening supplier WhatsApp chat: {phone}")
+    print(f"🌐 [ROUTER] Opening supplier WhatsApp chat: +{phone}")
 
     url = f"https://web.whatsapp.com/send?phone={phone}"
     driver.get(url)
@@ -248,6 +336,103 @@ def open_whatsapp_chat(driver, phone):
         time.sleep(3)
 
     print("❌ [ROUTER] Supplier WhatsApp chat did not open.")
+    return False
+
+
+_SELECT_GROUP_CHAT_JS = """
+const hint = String(arguments[0] || '').trim().toLowerCase();
+if (!hint) return null;
+const side = document.querySelector('#side');
+if (!side) return null;
+
+function matchesHint(title, text) {
+    const blob = ((title || '') + ' ' + (text || '')).toLowerCase();
+    return blob.includes(hint) || hint.includes((title || '').toLowerCase());
+}
+
+const rows = side.querySelectorAll(
+    '[data-testid="cell-frame-container"], [role="listitem"], [role="row"]'
+);
+for (const row of rows) {
+    const titleEl = row.querySelector('span[title]');
+    const title = titleEl ? (titleEl.getAttribute('title') || '').trim() : '';
+    const text = (row.innerText || '').trim();
+    if (!matchesHint(title, text)) continue;
+    const target = row.matches('[data-testid="cell-frame-container"]')
+        ? row
+        : (row.querySelector('[data-testid="cell-frame-container"]') || row);
+    target.scrollIntoView({ block: 'center' });
+    target.click();
+    return title || text.split('\\n')[0] || null;
+}
+return null;
+"""
+
+
+def open_whatsapp_group_chat(driver, group_name: str) -> bool:
+    """Open a WhatsApp group by searching the chat list (purchasing line)."""
+    group_name = str(group_name or "").strip()
+    print(f"🌐 [ROUTER] Opening supplier WhatsApp group: {group_name}")
+
+    driver.get("https://web.whatsapp.com")
+    time.sleep(2)
+
+    search_selectors = [
+        '//div[@id="side"]//div[@contenteditable="true"]',
+        '//div[@aria-label="Search input textbox"]',
+        '//div[@title="Search input textbox"]',
+    ]
+    search_box = None
+    for selector in search_selectors:
+        try:
+            elements = driver.find_elements(By.XPATH, selector)
+            for el in elements:
+                if el.is_displayed():
+                    search_box = el
+                    break
+            if search_box:
+                break
+        except Exception:
+            continue
+
+    if not search_box:
+        print("❌ [ROUTER] WhatsApp search box not found for group open.")
+        return False
+
+    search_box.click()
+    time.sleep(0.4)
+    for key_combo in (Keys.COMMAND, Keys.CONTROL):
+        search_box.send_keys(key_combo, "a")
+    search_box.send_keys(Keys.BACKSPACE)
+    search_box.send_keys(group_name)
+    time.sleep(2.5)
+
+    try:
+        opened = driver.execute_script(_SELECT_GROUP_CHAT_JS, group_name)
+        if opened:
+            time.sleep(2)
+            if driver.find_elements(By.XPATH, '//footer//div[@contenteditable="true"]'):
+                print(f"✅ [ROUTER] Supplier WhatsApp group opened: {opened}")
+                return True
+    except Exception as exc:
+        print(f"⚠️ [ROUTER] Group search JS failed: {exc}")
+
+    # Fallback: click span title in sidebar
+    try:
+        results = driver.find_elements(
+            By.XPATH,
+            f'//div[@id="side"]//span[contains(@title, "{group_name[:20]}")]',
+        )
+        for result in results:
+            driver.execute_script("arguments[0].click();", result)
+            time.sleep(2)
+            if driver.find_elements(By.XPATH, '//footer//div[@contenteditable="true"]'):
+                print(f"✅ [ROUTER] Supplier group opened via title match.")
+                return True
+    except Exception:
+        pass
+
+    print(f"❌ [ROUTER] Could not open WhatsApp group: {group_name}")
     return False
 
 
@@ -314,15 +499,48 @@ def click_send_button(driver, timeout=15):
     return False
 
 
+def send_whatsapp_message(driver, destination, message):
+    """
+    Send a WhatsApp message to a phone number or group.
+    destination: SupplierDestination, phone str, or group name str prefixed with 'group:'.
+    """
+    from supplier_whatsapp_config import SupplierDestination
+
+    dest_label = ""
+    opened = False
+
+    if isinstance(destination, SupplierDestination):
+        dest_label = destination.label
+        if destination.is_group:
+            opened = open_whatsapp_group_chat(driver, destination.value)
+        else:
+            opened = open_whatsapp_chat(driver, destination.value)
+    else:
+        raw = str(destination or "").strip()
+        if raw.lower().startswith("group:"):
+            name = raw.split(":", 1)[1].strip()
+            dest_label = name
+            opened = open_whatsapp_group_chat(driver, name)
+        else:
+            phone = normalize_phone(raw)
+            dest_label = f"+{phone}"
+            opened = open_whatsapp_chat(driver, phone)
+
+    if not opened:
+        print(f"❌ [ROUTER] Could not open WhatsApp destination: {dest_label}")
+        return False
+
+    return _type_and_send_whatsapp_message(driver, message)
+
+
 def send_whatsapp_in_current_driver(driver, phone, message):
     print("📲 [ROUTER] Sending WhatsApp using current browser session...")
     print(f"   To: {phone}")
+    return send_whatsapp_message(driver, phone, message)
 
-    if not open_whatsapp_chat(driver, phone):
-        print("❌ [ROUTER] Could not open WhatsApp supplier chat.")
-        return False
 
-    time.sleep(3)
+def _type_and_send_whatsapp_message(driver, message):
+    time.sleep(2)
 
     box = find_message_box(driver)
 
@@ -385,12 +603,27 @@ def send_supplier_rfq(
     print(f"   Customer Contact: {customer_contact}")
     print("=" * 90)
 
-    if channel == "WHATSAPP":
+    if channel == "PURCHASING_WHATSAPP":
+        from purchasing_whatsapp import send_purchasing_supplier_rfq
+
+        result = send_purchasing_supplier_rfq(
+            brand=brand,
+            items=items,
+            ref=ref,
+            customer_name=customer_name,
+            customer_contact=customer_contact,
+        )
+        if result.get("status") == "SENT":
+            return result
+        print("⚠️ [ROUTER] Purchasing WhatsApp failed. Falling back to Email.")
+
+    elif channel == "WHATSAPP":
         phone = get_supplier_whatsapp(brand)
         msg = build_supplier_rfq_text(
             brand, items, ref,
             customer_name=customer_name,
             customer_contact=customer_contact,
+            include_customer_info=not is_external_supplier(brand),
         )
 
         success = send_whatsapp_in_current_driver(driver, phone, msg)

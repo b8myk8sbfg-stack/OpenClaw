@@ -25,7 +25,9 @@ MARKUP_DIVISOR = float(os.getenv("OPENCLAW_MARKUP_DIVISOR", "0.72"))
 KNOWN_BRANDS = {
     "OMRON", "SMC", "BURKERT", "BÜRKERT", "LEGRIS", "PANASONIC", "PISCO",
     "THK", "LOCTITE", "KEYENCE", "FESTO", "SICK", "IFM", "PARKER", "ABB", "SIEMENS",
-    "ALLEN BRADLEY", "NITTO KOHKI", "CKD", "KOGANEI", "AIRTAC", "YASKAWA"
+    "ALLEN BRADLEY", "NITTO KOHKI", "CKD", "KOGANEI", "AIRTAC", "YASKAWA",
+    "MARKEM-IMAJE", "MARKEM", "IMAJE",
+    "RECTUS", "PARFLEX",
 }
 
 
@@ -228,6 +230,14 @@ def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source="")
 
 def infer_brand_from_part(part_no):
     part_norm = normalize_part(part_no)
+
+    try:
+        from markem_imaje_price_list import looks_like_markem_imaje_material
+
+        if looks_like_markem_imaje_material(part_no):
+            return "MARKEM-IMAJE"
+    except ImportError:
+        pass
 
     try:
         from inquiry_extraction_helper import looks_like_burkert_article_id
@@ -844,6 +854,10 @@ def _try_burkert_price_list_row(
     if brand_u != "BURKERT":
         brand_u = "BURKERT"
 
+    effective_burkert_id = str(burkert_id or "").strip()
+    if not effective_burkert_id and looks_like_burkert_article_id(part_no):
+        effective_burkert_id = str(part_no or "").strip()
+
     try:
         from burkert_price_list import (
             format_burkert_id_display,
@@ -855,20 +869,50 @@ def _try_burkert_price_list_row(
         return None
 
     resolved_id = resolve_burkert_id(
-        burkert_id=burkert_id,
-        technical_specs=technical_specs,
-        search_context=search_context,
+        burkert_id=effective_burkert_id,
+        technical_specs=technical_specs if not effective_burkert_id else None,
+        search_context=search_context if not effective_burkert_id else "",
     )
+
+    customer_part = str(part_no or "").strip().upper()
 
     quote = lookup_burkert_quote(
         part_no,
         qty=qty,
         markup_divisor=MARKUP_DIVISOR,
         search_context=search_context,
-        burkert_id=resolved_id,
+        burkert_id=resolved_id or effective_burkert_id,
         technical_specs=technical_specs,
     )
     if not quote:
+        try:
+            from burkert_obsolete_lookup import try_burkert_replacement_quote
+
+            replacement_row, obsolete_info = try_burkert_replacement_quote(
+                part_no,
+                qty=qty,
+                brand=brand_u,
+                search_context=search_context,
+                technical_specs=technical_specs,
+                markup_divisor=MARKUP_DIVISOR,
+            )
+            if replacement_row:
+                return {
+                    "desc": replacement_row.get("desc"),
+                    "qty": int(replacement_row.get("qty") or qty),
+                    "price": replacement_row.get("price", "[TBC]"),
+                    "lt": replacement_row.get("lt", "[TBC]"),
+                    "pid": replacement_row.get("pid") or customer_part,
+                    "customer_part": replacement_row.get("customer_part") or customer_part,
+                    "replacement_part": replacement_row.get("replacement_part"),
+                    "obsolete_original": replacement_row.get("obsolete_original"),
+                    "brand": "BURKERT",
+                    "source": replacement_row.get("source", "BURKERT_PRICE_LIST_REPLACEMENT"),
+                    "needs_supplier": False,
+                    "obsolete_research": replacement_row.get("obsolete_research", ""),
+                }
+        except ImportError:
+            pass
         return None
 
     label = resolved_id or part_no
@@ -898,6 +942,201 @@ def _try_burkert_price_list_row(
         "customer_part": customer_part,
         "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
     }
+
+
+def _is_markem_imaje_brand(brand):
+    try:
+        from markem_imaje_price_list import is_markem_imaje_brand
+
+        return is_markem_imaje_brand(brand)
+    except ImportError:
+        brand_u = str(brand or "").upper().replace("_", " ").replace("-", " ").strip()
+        return brand_u in {"MARKEM IMAJE", "MARKEM", "IMAJE"}
+
+
+def _try_markem_imaje_price_list_row(
+    part_no,
+    qty,
+    desc=None,
+    brand="",
+    search_context="",
+):
+    brand_u = str(brand or "").upper().strip()
+    try:
+        from markem_imaje_price_list import (
+            is_markem_imaje_brand,
+            looks_like_markem_imaje_material,
+            lookup_markem_imaje_quote,
+        )
+    except ImportError:
+        print("   ⚠️ [ENGINE] markem_imaje_price_list not available — Markem-Imaje skipped.")
+        return None
+
+    if not is_markem_imaje_brand(brand_u) and not looks_like_markem_imaje_material(part_no):
+        return None
+    if brand_u not in ("MARKEM-IMAJE", "MARKEM", "IMAJE", "UNKNOWN"):
+        pass
+    brand_u = "MARKEM-IMAJE"
+
+    quote = lookup_markem_imaje_quote(
+        part_no,
+        qty=qty,
+        search_context=search_context or desc or "",
+    )
+    if not quote:
+        return None
+
+    customer_part = str(part_no or "").strip().upper()
+    print(
+        f"   ✅ [MARKEM-IMAJE] Price list match for {customer_part}: "
+        f"RM {quote.get('price')} (list price, no markup) | LT {quote.get('lt')}"
+    )
+    return {
+        "desc": quote.get("desc") or desc or f"MARKEM-IMAJE {customer_part}",
+        "qty": int(quote.get("qty") or qty),
+        "price": quote.get("price", "[TBC]"),
+        "lt": quote.get("lt", "[TBC]"),
+        "pid": customer_part,
+        "brand": "MARKEM-IMAJE",
+        "source": quote.get("source", "MARKEM_IMAJE_PRICE_LIST"),
+        "customer_part": customer_part,
+        "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+    }
+
+
+def _try_markem_imaje_price_list_after_no_stock(
+    part_no,
+    qty,
+    rows,
+    *,
+    declared_brand="",
+    match=None,
+    item=None,
+    search_context="",
+):
+    brand = str(
+        declared_brand
+        or ((rows[0] if rows else {}).get("brand"))
+        or ((match or {}).get("brand"))
+        or "UNKNOWN"
+    )
+    try:
+        from markem_imaje_price_list import is_markem_imaje_brand, looks_like_markem_imaje_material
+    except ImportError:
+        return None
+
+    if not _is_markem_imaje_brand(brand) and not looks_like_markem_imaje_material(part_no):
+        return None
+    if not rows or not all(str(row.get("price")) == "[TBC]" for row in rows):
+        return None
+
+    item = item or {}
+    desc = (rows[0] if rows else {}).get("desc") or item.get("desc") or part_no
+    return _try_markem_imaje_price_list_row(
+        part_no,
+        qty,
+        desc=desc,
+        brand="MARKEM-IMAJE",
+        search_context=search_context or desc,
+    )
+
+
+def _is_parker_family_brand(brand):
+    try:
+        from parker_price_list import is_parker_family_brand
+
+        return is_parker_family_brand(brand)
+    except ImportError:
+        brand_u = str(brand or "").upper().strip()
+        return brand_u in {"PARKER", "LEGRIS", "RECTUS", "PARFLEX"}
+
+
+def _try_parker_price_list_row(
+    part_no,
+    qty,
+    desc=None,
+    brand="",
+    search_context="",
+):
+    brand_u = str(brand or "UNKNOWN").upper().strip()
+    try:
+        from parker_price_list import (
+            is_parker_family_brand,
+            lookup_parker_entry,
+            lookup_parker_quote,
+        )
+    except ImportError:
+        print("   ⚠️ [ENGINE] parker_price_list not available — Parker price list skipped.")
+        return None
+
+    if not is_parker_family_brand(brand_u):
+        if not lookup_parker_entry(part_no, log_miss=False):
+            return None
+
+    quote = lookup_parker_quote(
+        part_no,
+        qty=qty,
+        brand=brand_u,
+        search_context=search_context or desc or "",
+    )
+    if not quote:
+        return None
+
+    customer_part = str(part_no or "").strip().upper()
+    print(
+        f"   ✅ [PARKER] Price list match for {customer_part}: "
+        f"list RM {quote.get('list_price'):,.2f} - {quote.get('discount_pct')}% "
+        f"→ nett RM {quote.get('nett_price'):,.2f} → sell RM {quote.get('price')} | "
+        f"LT {quote.get('lt')}"
+    )
+    return {
+        "desc": quote.get("desc") or desc or f"PARKER {customer_part}",
+        "qty": int(quote.get("qty") or qty),
+        "price": quote.get("price", "[TBC]"),
+        "lt": quote.get("lt", "[TBC]"),
+        "pid": customer_part,
+        "brand": quote.get("brand") or "PARKER",
+        "source": quote.get("source", "PARKER_PRICE_LIST"),
+        "customer_part": customer_part,
+        "needs_supplier": quote.get("price") == "[TBC]" or quote.get("lt") == "[TBC]",
+    }
+
+
+def _try_parker_price_list_after_no_stock(
+    part_no,
+    qty,
+    rows,
+    *,
+    declared_brand="",
+    match=None,
+    item=None,
+    search_context="",
+):
+    brand = str(
+        declared_brand
+        or ((rows[0] if rows else {}).get("brand"))
+        or ((match or {}).get("brand"))
+        or "UNKNOWN"
+    )
+    try:
+        from parker_price_list import is_parker_family_brand, lookup_parker_entry
+    except ImportError:
+        return None
+
+    if not is_parker_family_brand(brand) and not lookup_parker_entry(part_no, log_miss=False):
+        return None
+    if not rows or not all(str(row.get("price")) == "[TBC]" for row in rows):
+        return None
+
+    item = item or {}
+    desc = (rows[0] if rows else {}).get("desc") or item.get("desc") or part_no
+    return _try_parker_price_list_row(
+        part_no,
+        qty,
+        desc=desc,
+        brand=brand if is_parker_family_brand(brand) else "PARKER",
+        search_context=search_context or desc,
+    )
 
 
 def _try_smc_portal_row(
@@ -1010,6 +1249,48 @@ def process_structured_items(structured_items):
                     print(f"   ✅ [ENGINE] SMC portal quote: {smc_row.get('desc')} | Qty: {qty}")
                 continue
 
+            markem_row = _try_markem_imaje_price_list_after_no_stock(
+                part_no,
+                qty,
+                rows,
+                declared_brand=declared_brand,
+                match=match,
+                item=item,
+                search_context=search_context,
+            )
+            if markem_row and markem_row.get("price") != "[TBC]":
+                formatted_rows.append(markem_row)
+                if markem_row.get("needs_supplier"):
+                    brand = markem_row.get("brand") or declared_brand or "MARKEM-IMAJE"
+                    tbc_by_brand.setdefault(brand, []).append({
+                        "desc": markem_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": brand,
+                    })
+                continue
+
+            parker_row = _try_parker_price_list_after_no_stock(
+                part_no,
+                qty,
+                rows,
+                declared_brand=declared_brand,
+                match=match,
+                item=item,
+                search_context=search_context,
+            )
+            if parker_row and parker_row.get("price") != "[TBC]":
+                formatted_rows.append(parker_row)
+                if parker_row.get("needs_supplier"):
+                    brand = parker_row.get("brand") or declared_brand or "PARKER"
+                    tbc_by_brand.setdefault(brand, []).append({
+                        "desc": parker_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": brand,
+                    })
+                continue
+
             burkert_row = _try_burkert_price_list_after_no_stock(
                 part_no,
                 qty,
@@ -1056,6 +1337,48 @@ def process_structured_items(structured_items):
                     )
                 else:
                     print(f"   ✅ [ENGINE] SMC portal quote: {smc_row.get('desc')} | Qty: {qty}")
+                continue
+
+            markem_row = _try_markem_imaje_price_list_row(
+                part_no,
+                qty,
+                desc=desc,
+                brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
+                search_context=search_context,
+            )
+            if markem_row:
+                formatted_rows.append(markem_row)
+                if markem_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
+                    tbc_by_brand.setdefault(inferred_brand, []).append({
+                        "desc": markem_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": "MARKEM-IMAJE",
+                    })
+                    print(f"   📡 [ENGINE] Markem-Imaje price list partial — supplier RFQ: {desc} | Qty: {qty}")
+                else:
+                    print(f"   ✅ [ENGINE] Markem-Imaje price list quote: {markem_row.get('desc')} | Qty: {qty}")
+                continue
+
+            parker_row = _try_parker_price_list_row(
+                part_no,
+                qty,
+                desc=desc,
+                brand=declared_brand if declared_brand != "UNKNOWN" else inferred_brand,
+                search_context=search_context,
+            )
+            if parker_row:
+                formatted_rows.append(parker_row)
+                if parker_row.get("needs_supplier") and inferred_brand in (WAREHOUSE_BRANDS | KNOWN_BRANDS):
+                    tbc_by_brand.setdefault(inferred_brand, []).append({
+                        "desc": parker_row.get("desc") or desc,
+                        "qty": qty,
+                        "pid": part_no,
+                        "brand": "PARKER",
+                    })
+                    print(f"   📡 [ENGINE] Parker price list partial — supplier RFQ: {desc} | Qty: {qty}")
+                else:
+                    print(f"   ✅ [ENGINE] Parker price list quote: {parker_row.get('desc')} | Qty: {qty}")
                 continue
 
             burkert_row = _try_burkert_price_list_row(
@@ -1190,6 +1513,11 @@ def build_plain_quotation_reply(rows, ai_research=None):
             has_tbc_balance = True
 
         msg += f"- {desc}\n"
+        if row.get("replacement_part") and row.get("obsolete_original"):
+            msg += (
+                f"  (Obsolete {row.get('obsolete_original')} — "
+                f"quoted equivalent {row.get('replacement_part')})\n"
+            )
         msg += f"  Qty: {qty}\n"
         msg += f"  Unit Price: RM {price}\n"
         msg += f"  Lead Time: {lt}\n"

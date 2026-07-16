@@ -100,6 +100,36 @@ class InquiryExtractionTests(unittest.TestCase):
         self.assertTrue(looks_like_burkert_article_id("00137246S"))
         self.assertIn("001372465", burkert_id_ocr_variants("00137246S"))
 
+    def test_reconcile_overrides_prompt_hallucination_with_burkert_ocr(self):
+        from inquiry_extraction_helper import reconcile_items_from_ocr
+
+        items = [{"part_no": "KQ2L06-01A", "qty": 1, "brand": "SMC"}]
+        fixed = reconcile_items_from_ocr(
+            items,
+            image_path="WA_Image/20260716_161748_QUICK_TIME_Mr_Bryan_AC4195A6DB1356FB78581008.png",
+            caption="Pls quote 1pc",
+        )
+        self.assertEqual(len(fixed), 1)
+        self.assertEqual(fixed[0]["part_no"], "00134328")
+        self.assertEqual(fixed[0]["brand"], "BURKERT")
+
+    def test_rejects_quotation_ref_mashup_id(self):
+        from inquiry_extraction_helper import pick_best_burkert_article_id, rank_burkert_article_ids
+
+        ocr = "Quotation\nOur Ref : Q001300\nDate : 26-02-2024\nUnit Price\n2PCE"
+        ranked = rank_burkert_article_ids(["00130026", "00134328"], ocr)
+        self.assertNotIn("00130026", ranked)
+        self.assertNotEqual(pick_best_burkert_article_id(ocr), "00130026")
+
+    def test_prefers_repeated_burkert_label_id(self):
+        from inquiry_extraction_helper import pick_best_burkert_article_id
+
+        ocr = (
+            "5281 A 25.0 NBR MS\n00134328\n230V 50-60Hz\n"
+            "5281 A 25.0 NBR MS\n00134328\nG1 PN0.2-16bar"
+        )
+        self.assertEqual(pick_best_burkert_article_id(ocr), "00134328")
+
 
 if __name__ == "__main__":
     unittest.main()
