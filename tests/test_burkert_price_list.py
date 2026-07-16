@@ -67,6 +67,11 @@ class BurkertLeadTimeMappingTests(unittest.TestCase):
         self.assertEqual(normalize_burkert_id("132465"), "132465")
         self.assertIn("132465", burkert_id_lookup_keys("00132465"))
 
+    def test_burkert_id_ocr_variant_keys(self):
+        keys = burkert_id_lookup_keys("00137246S")
+        self.assertIn("1372465", keys)
+        self.assertIn("001372465", keys)
+
     def test_burkert_id_display(self):
         from burkert_price_list import format_burkert_id_display
 

@@ -270,9 +270,12 @@ def parse_money(text: str) -> float | None:
     if not match:
         return None
     try:
-        return float(match.group(1).replace(",", ""))
+        value = float(match.group(1).replace(",", ""))
     except ValueError:
         return None
+    if value <= 0:
+        return None
+    return value
 
 
 def compute_lead_time_from_rows(rows: list[dict[str, Any]]) -> str:
@@ -694,6 +697,52 @@ def ensure_portal_session(driver, force_reload: bool = False) -> bool:
     return False
 
 
+def _customer_field_value(driver) -> str:
+    field = _input_by_label(driver, "Customer Code/Name")
+    if not field:
+        return ""
+    try:
+        return (field.get_attribute("value") or "").strip()
+    except Exception:
+        return ""
+
+
+def _customer_already_selected(driver, match_code: str | None = None) -> bool:
+    """True when Item Enquiry already has the configured customer (saved session)."""
+    code = (match_code or customer_select_match()).upper()
+    if not code:
+        return False
+
+    val = _customer_field_value(driver).upper()
+    if code in val:
+        return True
+
+    try:
+        found = driver.execute_script(
+            """
+            const code = String(arguments[0] || '').toUpperCase();
+            if (!code) return false;
+            for (const inp of document.querySelectorAll('input')) {
+                const v = String(inp.value || '').toUpperCase();
+                if (v.includes(code)) return true;
+            }
+            for (const lbl of document.querySelectorAll('label')) {
+                if (!/customer\\s*code/i.test(lbl.textContent || '')) continue;
+                let el = lbl.parentElement;
+                for (let i = 0; i < 8 && el; i++) {
+                    if (String(el.textContent || '').toUpperCase().includes(code)) return true;
+                    el = el.parentElement;
+                }
+            }
+            return false;
+            """,
+            code,
+        )
+        return bool(found)
+    except Exception:
+        return False
+
+
 def _select_customer(driver) -> bool:
     hint = customer_search_hint()
     match_code = customer_select_match()
@@ -703,13 +752,27 @@ def _select_customer(driver) -> bool:
         print("⚠️ [SMC] Customer Code/Name field not found.")
         return False
 
+    if _customer_already_selected(driver, match_code):
+        print(f"   ♻️ [SMC] Refreshing customer {match_code} before enquiry (portal pricing requires active pick).")
+
     try:
         field.clear()
         field.send_keys(hint)
-        time.sleep(1.5)
+        time.sleep(2.0)
     except Exception as exc:
         print(f"⚠️ [SMC] Could not type customer hint: {exc}")
-        return False
+        return _customer_already_selected(driver, match_code)
+
+    # Keyboard pick (Kendo combobox often responds to ArrowDown + Enter)
+    try:
+        field.send_keys(Keys.ARROW_DOWN)
+        time.sleep(0.35)
+        field.send_keys(Keys.ENTER)
+        time.sleep(1.0)
+        if _customer_already_selected(driver, match_code):
+            return True
+    except Exception:
+        pass
 
     # Autocomplete dropdown (Kendo / jQuery UI / plain list)
     option_xpaths = [
@@ -724,17 +787,27 @@ def _select_customer(driver) -> bool:
                 if el.is_displayed():
                     el.click()
                     time.sleep(1)
-                    return True
+                    if _customer_already_selected(driver, match_code):
+                        return True
         except Exception:
             continue
 
-    # Already selected from saved session?
     try:
-        val = field.get_attribute("value") or ""
-        if match_code in val.upper():
-            return True
+        for el in driver.find_elements(
+            By.CSS_SELECTOR,
+            ".k-list-ul li, .k-list-item, .k-item, .k-list .k-list-item",
+        ):
+            text = (el.text or "").upper()
+            if match_code.upper() in text and el.is_displayed():
+                el.click()
+                time.sleep(1)
+                if _customer_already_selected(driver, match_code):
+                    return True
     except Exception:
         pass
+
+    if _customer_already_selected(driver, match_code):
+        return True
 
     print(f"⚠️ [SMC] Could not select customer {match_code} from autocomplete.")
     return False
@@ -947,8 +1020,15 @@ def _run_item_enquiry(driver, part_no: str) -> list[dict[str, Any]]:
         print("⚠️ [SMC] Could not open Item Enquiry page.")
         return []
 
-    if not _select_customer(driver):
+    customer_ok = _select_customer(driver)
+    if not customer_ok and not _customer_already_selected(driver):
+        print("⚠️ [SMC] Customer not selected — skipping Item Enquiry search.")
         return []
+    if not customer_ok:
+        print(
+            f"   ⚠️ [SMC] Autocomplete pick failed but {customer_select_match()} "
+            "is present — continuing enquiry"
+        )
 
     part_field = _input_by_label(driver, "Part No.")
     if not part_field:
@@ -1124,11 +1204,15 @@ def lookup_smc_quote(
 
     if allow_cache:
         cached = _cache_get(part_no)
-        if cached and str(cached.get("price") or "") not in ("", "[TBC]"):
-            print(f"   ♻️ [SMC] Cache hit for {part_no!r}")
-            return dict(cached)
-        if cached and str(cached.get("price") or "") == "[TBC]":
-            print(f"   ♻️ [SMC] Ignoring cached TBC quote for {part_no!r} — re-querying portal")
+        if cached and str(cached.get("price") or "") not in ("", "[TBC]", "0.00", "0"):
+            try:
+                if float(cached.get("net_price") or 0) > 0:
+                    print(f"   ♻️ [SMC] Cache hit for {part_no!r}")
+                    return dict(cached)
+            except (TypeError, ValueError):
+                pass
+        if cached:
+            print(f"   ♻️ [SMC] Ignoring cached incomplete quote for {part_no!r} — re-querying portal")
 
     try:
         driver = get_driver()
@@ -1157,7 +1241,7 @@ def lookup_smc_quote(
     price_display = quote["price"]
     matched_part = quote["smc_part"]
 
-    if quote.get("net_price") is not None:
+    if quote.get("net_price") is not None and float(quote.get("net_price") or 0) > 0:
         _cache_put(part_no, quote)
     else:
         print(f"   ⚠️ [SMC] {matched_part}: description found but N/Price empty — not caching")

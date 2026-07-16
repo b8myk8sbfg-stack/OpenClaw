@@ -53,12 +53,12 @@ def normalize_burkert_id(value: str) -> str:
 
 
 def burkert_id_lookup_keys(value: str) -> list[str]:
-    """All ID forms to try: with/without leading zeros."""
-    digits = re.sub(r"[^0-9]", "", str(value or ""))
-    if not digits:
-        return []
+    """All ID forms to try: with/without leading zeros and OCR variants."""
+    try:
+        from inquiry_extraction_helper import burkert_id_ocr_variants
+    except ImportError:
+        burkert_id_ocr_variants = None
 
-    stripped = digits.lstrip("0") or "0"
     keys: list[str] = []
     seen: set[str] = set()
 
@@ -67,14 +67,24 @@ def burkert_id_lookup_keys(value: str) -> list[str]:
             seen.add(key)
             keys.append(key)
 
-    add(stripped)
-    add(digits)
-    if len(digits) < 8:
-        add(digits.zfill(6))
-        add(digits.zfill(8))
-    if stripped != digits:
-        add(stripped.zfill(6))
-        add(stripped.zfill(8))
+    source_values = [value]
+    if burkert_id_ocr_variants:
+        source_values = burkert_id_ocr_variants(value)
+
+    for source in source_values:
+        digits = re.sub(r"[^0-9]", "", str(source or ""))
+        if not digits:
+            continue
+
+        stripped = digits.lstrip("0") or "0"
+        add(stripped)
+        add(digits)
+        if len(digits) < 8:
+            add(digits.zfill(6))
+            add(digits.zfill(8))
+        if stripped != digits:
+            add(stripped.zfill(6))
+            add(stripped.zfill(8))
     return keys
 
 
@@ -86,7 +96,8 @@ def extract_burkert_id_from_text(text: str) -> str:
 
     patterns = (
         r"\b(?:ID|ARTICLE|ART\.?|ARTICLE\s+NO\.?)\s*[:#]?\s*(0*\d{5,9})\b",
-        r"\b(0\d{5,8})\b",
+        r"\b(00\d{6,7})\b",
+        r"\b(0\d{6,8})\b",
     )
     for pattern in patterns:
         match = re.search(pattern, blob, flags=re.I)
@@ -531,6 +542,48 @@ def _lookup_entry_by_id(burkert_id: str) -> dict[str, Any] | None:
         entry = _ID_INDEX.get(key) or _LOOKUP_BY_KEY.get(key)
         if entry:
             return entry
+
+    stripped = normalize_burkert_id(burkert_id)
+    if not stripped or len(stripped) < 5:
+        return None
+
+    fuzzy_hits: list[tuple[str, dict[str, Any]]] = []
+    seen_entries: set[str] = set()
+
+    def add_hit(key: str, entry: dict[str, Any]) -> None:
+        entry_id = str(entry.get("burkert_id") or entry.get("type") or key)
+        if entry_id in seen_entries:
+            return
+        seen_entries.add(entry_id)
+        fuzzy_hits.append((key, entry))
+
+    if 6 <= len(stripped) <= 7:
+        for digit in "0123456789":
+            key = f"{stripped}{digit}"
+            entry = _ID_INDEX.get(key) or _LOOKUP_BY_KEY.get(key)
+            if entry:
+                add_hit(key, entry)
+
+    for key, entry in _ID_INDEX.items():
+        key_s = str(key)
+        if not key_s.startswith(stripped):
+            continue
+        if len(key_s) - len(stripped) > 1:
+            continue
+        add_hit(key_s, entry)
+
+    if len(fuzzy_hits) == 1:
+        key, entry = fuzzy_hits[0]
+        print(f"   ✅ [BURKERT] Fuzzy ID match {burkert_id!r} → {key}")
+        return entry
+
+    if len(fuzzy_hits) > 1:
+        priced = [hit for hit in fuzzy_hits if hit[1].get("net_price") is not None]
+        if len(priced) == 1:
+            key, entry = priced[0]
+            print(f"   ✅ [BURKERT] Fuzzy priced ID match {burkert_id!r} → {key}")
+            return entry
+
     return None
 
 

@@ -58,8 +58,24 @@ run_watchdog() {
         return 0
     fi
 
-    log "Triggering OpenClaw + Copilot recovery..."
     write_fail_count 0
+
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/openclaw_process.sh"
+    local openclaw_count
+    openclaw_count="$(openclaw_count_main)"
+    if [[ "$openclaw_count" -ge 1 ]]; then
+        log "OpenClaw is running ($openclaw_count process(es)) — trying Copilot-only light restart"
+        if copilot_light_restart; then
+            copilot_mark_recovery
+            log "Copilot light restart succeeded; skipped full OpenClaw recovery"
+            return 0
+        fi
+        log "Copilot light restart failed — escalating to full OpenClaw + Copilot recovery"
+    else
+        log "OpenClaw not running — triggering full recovery"
+    fi
+
     bash "$RECOVERY_SCRIPT"
 }
 

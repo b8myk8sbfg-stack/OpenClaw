@@ -7,13 +7,18 @@ import urllib3
 import datetime
 import random
 import string
+from typing import List
 from requests.auth import HTTPBasicAuth
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 from O365 import Account
 
 from obm_quotation_helper import create_obm_quotation_from_inquiry
-from non_standard_inquiry_handler import handle_non_standard_items
+from non_standard_inquiry_handler import (
+    gather_supplier_suggestions,
+    format_suggestions_html,
+    handle_non_standard_items,
+)
 from inquiry_extraction_helper import (
     extract_clean_items_from_text,
     is_plausible_part_no,
@@ -21,14 +26,27 @@ from inquiry_extraction_helper import (
     format_inquiry_description,
 )
 from openclaw_main import unified_analyze
+from openclaw_log import enable_timestamped_logging
 from openclaw_inquiry_engine import (
     resolve_warehouse_match,
     _try_smc_portal_row,
     _try_burkert_price_list_row,
 )
 from email_message_classifier import classify_email, log_email_classification, is_email_rfq_inquiry
-from email_attachment_processor import save_email_attachments, enrich_email_body_from_attachments
-from openclaw_email_config import get_monitored_mailboxes, get_primary_mailbox
+from email_attachment_processor import (
+    collect_email_image_paths,
+    email_body_has_image_markers,
+    enrich_email_body_from_attachments,
+    save_email_attachments,
+)
+from openclaw_email_config import (
+    build_monitor_email_body,
+    customer_email_replies_go_to_monitor,
+    get_email_reply_mode,
+    get_monitored_mailboxes,
+    get_monitor_alert_emails,
+    get_primary_mailbox,
+)
 
 VERSION = "v1.21-EMAIL-PO-SKIP-INQUIRY"
 
@@ -134,6 +152,56 @@ def now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def send_customer_or_monitor_email(
+    mailbox,
+    *,
+    context: str,
+    customer_name: str,
+    customer_email: str,
+    original_subject: str,
+    reply_html: str,
+    reply_subject: str,
+    msg=None,
+    supplier_suggestions_html: str = "",
+):
+    """
+    Send a customer quotation reply, or redirect to monitor inboxes during pre-production.
+    Never sends to the customer when email reply mode is monitor/debug/test.
+    """
+    if customer_email_replies_go_to_monitor():
+        alert = mailbox.new_message()
+        for address in get_monitor_alert_emails():
+            alert.to.add(address)
+        alert.subject = f"[OpenClaw Monitor] {reply_subject}"
+        alert.body = build_monitor_email_body(
+            context=context,
+            customer_name=customer_name,
+            customer_email=customer_email,
+            original_subject=original_subject,
+            generated_reply_html=reply_html,
+            supplier_suggestions_html=supplier_suggestions_html,
+        )
+        alert.body_type = "html"
+        alert.send()
+        print("🧪 Email monitor mode active — customer reply NOT sent.")
+        print(f"   Monitor alert sent to: {', '.join(get_monitor_alert_emails())}")
+        print(f"   Customer would have been: {customer_email}")
+        print(f"   Context: {context}")
+        if msg is not None:
+            msg.mark_as_read()
+        return True
+
+    outbound = mailbox.new_message()
+    outbound.to.add(customer_email)
+    outbound.subject = reply_subject
+    outbound.body = reply_html
+    outbound.body_type = "html"
+    outbound.send()
+    if msg is not None:
+        msg.mark_as_read()
+    return True
+
+
 def gen_unique_id():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
 
@@ -149,14 +217,64 @@ def clean_email_body(raw_body):
     return body_clean.strip()
 
 
-IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+IMAGE_ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
 
 
-def _first_email_image_path(attachment_paths):
-    for path in attachment_paths or []:
-        if str(path or "").lower().endswith(IMAGE_ATTACHMENT_EXTENSIONS):
-            return path
-    return None
+def _is_unknown_part_token(part_no: str) -> bool:
+    token = str(part_no or "").strip().upper()
+    return token in {"", "UNKNOWN", "N/A", "NA", "TBC", "NIL", "NONE"}
+
+
+def _description_from_unified_item(item: dict) -> str:
+    for key in ("product_type", "desc", "description", "search_context"):
+        val = str(item.get(key) or "").strip()
+        if val and val.upper() not in ("UNKNOWN", "N/A", "NONE"):
+            return val
+    return ""
+
+
+def _unified_item_merge_key(item: dict) -> str:
+    part_no = str(item.get("part_no") or "").strip().upper()
+    if _is_unknown_part_token(part_no):
+        desc = _description_from_unified_item(item)
+        return f"DESC|{normalize_part(desc)}|QTY|{item.get('qty')}"
+    return part_no
+
+
+def _run_unified_analyze_for_email(body_clean: str, image_paths: List[str]) -> dict:
+    """Mirror WhatsApp: OCR each saved label image, then Copilot text-only."""
+    image_paths = [path for path in (image_paths or []) if path and os.path.isfile(path)]
+    if not image_paths:
+        return unified_analyze(body_clean, image_path=None)
+
+    merged_items = []
+    last_result = {}
+    for idx, image_path in enumerate(image_paths, start=1):
+        caption = body_clean if idx == 1 else ""
+        print(f"🖼️ [EMAIL] OCR → Copilot for image {idx}/{len(image_paths)}: {image_path}")
+        result = unified_analyze(caption, image_path=image_path)
+        last_result = result
+        for item in result.get("items") or []:
+            merge_key = _unified_item_merge_key(item)
+            if not merge_key or any(
+                _unified_item_merge_key(existing) == merge_key
+                for existing in merged_items
+            ):
+                continue
+            merged_items.append(item)
+
+    if not last_result:
+        return unified_analyze(body_clean, image_path=None)
+
+    route = last_result.get("route") or "ocr_copilot"
+    source = last_result.get("source") or "copilot"
+    return {
+        **last_result,
+        "items": merged_items,
+        "route": route,
+        "source": source,
+        "ocr_used": True,
+    }
 
 
 def _merge_unified_items_into_quote(unified_items, quote_items, missing_layer2_items, detected_parts_norm):
@@ -176,10 +294,30 @@ def _merge_unified_items_into_quote(unified_items, quote_items, missing_layer2_i
         except (TypeError, ValueError):
             qty = 1
         part_norm = normalize_part(part_no)
-        if not part_norm or part_norm in known_norms:
-            continue
+        desc_text = _description_from_unified_item(item)
+
         if not is_plausible_part_no(part_no):
+            if _is_unknown_part_token(part_no) and desc_text:
+                desc_norm = normalize_part(desc_text)
+                if not desc_norm or desc_norm in known_norms:
+                    continue
+                missing_layer2_items.append({
+                    "brand": brand,
+                    "part_no": desc_text[:200],
+                    "qty": qty,
+                    "norm": desc_norm,
+                    "source": "UNIFIED_ANALYZE_DESCRIPTION",
+                    "desc": desc_text,
+                })
+                known_norms.add(desc_norm)
+                print(
+                    f"   🧩 Description-only item | {desc_text[:80]} | Qty: {qty}"
+                )
+                continue
             print(f"   ⚠️ Rejected implausible unified part: {part_no!r}")
+            continue
+
+        if not part_norm or part_norm in known_norms:
             continue
 
         stock_match = resolve_warehouse_match(
@@ -318,6 +456,50 @@ def update_pending_status(ref_code, status, replied_at=None):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def extract_description_only_rfq_items(body_clean: str) -> list:
+    """
+    Custom RFQs described by item text (no catalog part number).
+    Example: Item : STAINLESS STEEL TEFLON HOSE ... Hose length : 3000mm Quantity : 8 Pcs
+    """
+    rfq_items = []
+    seen = set()
+    body = re.sub(r"\s+", " ", body_clean or " ")
+
+    pattern = re.compile(
+        r"ITEM\s*:\s*(.+?)\s+"
+        r"(?:TYPE\s*:\s*([^:]+?)\s+)?"
+        r"(?:HOSE\s+LENGTH\s*:\s*([^:]+?)\s+)?"
+        r"(?:QUANTITY|QTY)\s*:\s*(\d+)\s*(?:PCS|PC|PCE|UNIT|UNITS|NOS)?",
+        re.I | re.S,
+    )
+
+    for item_desc, item_type, hose_len, qty in pattern.findall(body):
+        item_desc = re.sub(r"^ITEM\s*:\s*", "", item_desc, flags=re.I).strip()
+        parts = [item_desc]
+        if item_type and str(item_type).strip():
+            parts.append(f"Type: {str(item_type).strip()}")
+        if hose_len and str(hose_len).strip():
+            parts.append(f"Hose length: {str(hose_len).strip()}")
+        full_desc = " | ".join(parts)
+        norm = normalize_part(full_desc)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        rfq_items.append({
+            "brand": "UNKNOWN",
+            "part_no": full_desc[:200],
+            "qty": int(qty),
+            "norm": norm,
+            "source": "LAYER2_DESCRIPTION_ONLY",
+            "desc": full_desc,
+        })
+        print(
+            f"   🧩 Description-only RFQ | {full_desc[:80]} | Qty: {qty}"
+        )
+
+    return rfq_items
 
 
 def extract_structured_rfq_items(body_upper):
@@ -1050,21 +1232,24 @@ def process_supplier_replies(mailbox):
                     print(f"      ⚠️ No matching supplier row found. Marked as TBC.")
 
             if formatted_rows:
-                update_msg = mailbox.new_message()
-                update_msg.to.add(c_email)
-                update_msg.subject = f"Update: Quotation for Inquiry {ref_code}"
-                update_msg.body = (
+                customer_reply_html = (
                     f"Hi {c_name},<br><br>"
                     f"Please find the updated price and lead time for your inquiry:<br><br>"
                     f"{build_email_table(formatted_rows, True)}<br><br>"
                     f"{SIGNATURE}"
                 )
-                update_msg.body_type = 'html'
-                update_msg.send()
+                send_customer_or_monitor_email(
+                    mailbox,
+                    context=f"SUPPLIER_UPDATE_{ref_code}",
+                    customer_name=c_name,
+                    customer_email=c_email,
+                    original_subject=msg.subject,
+                    reply_html=customer_reply_html,
+                    reply_subject=f"Update: Quotation for Inquiry {ref_code}",
+                    msg=msg,
+                )
 
                 update_pending_status(ref_code, "CUSTOMER_UPDATED", replied_at=now_iso())
-
-                msg.mark_as_read()
 
                 print(f"📧 Final Quotation Sent")
                 print(f"   To: {c_email}")
@@ -1206,7 +1391,13 @@ def process_latest_inquiry():
                 f"(FIFO — one email per cycle)..."
             )
 
-            messages = list(mailbox.get_messages(limit=5, query='isRead eq false'))
+            messages = list(
+                mailbox.get_messages(
+                    limit=5,
+                    query='isRead eq false',
+                    download_attachments=True,
+                )
+            )
 
             for msg in messages:
                 sender_email = msg.sender.address.lower()
@@ -1286,14 +1477,26 @@ def process_latest_inquiry():
                 print(f"   Sender Name: {msg.sender.name}")
                 print(f"   Subject: {msg.subject}")
     
+                ref_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", msg.subject or "email")[:40]
                 attachment_paths = save_email_attachments(
-                    msg, ref_prefix=re.sub(r"[^A-Za-z0-9._-]+", "_", msg.subject or "email")[:40]
+                    msg,
+                    ref_prefix=ref_slug,
+                    raw_body=raw_body,
                 )
                 if attachment_paths:
                     enriched = enrich_email_body_from_attachments(body_clean, attachment_paths)
                     body_clean = enriched.get("body") or body_clean
                     body_upper = body_clean.upper()
                     print(f"📎 Enriched email body from {len(attachment_paths)} attachment(s).")
+
+                email_image_paths = collect_email_image_paths(attachment_paths)
+                if email_image_paths:
+                    print(f"🖼️ [EMAIL] Found {len(email_image_paths)} image(s) for OCR route.")
+                elif email_body_has_image_markers(raw_body):
+                    print(
+                        "⚠️ [EMAIL] HTML contains inline images but none were saved — "
+                        "skipping text-only Copilot to avoid prompt-example hallucinations."
+                    )
     
                 c_name = msg.sender.name if msg.sender.name else "Customer"
                 c_email = msg.sender.address
@@ -1312,8 +1515,12 @@ def process_latest_inquiry():
                 has_partial = False
                 detected_parts_norm = set()
     
-                email_image_path = _first_email_image_path(attachment_paths)
-                unified_result = unified_analyze(body_clean, image_path=email_image_path)
+                if email_image_paths:
+                    unified_result = _run_unified_analyze_for_email(body_clean, email_image_paths)
+                elif email_body_has_image_markers(raw_body):
+                    unified_result = {"items": [], "route": "email_image_missing", "source": "none"}
+                else:
+                    unified_result = unified_analyze(body_clean, image_path=None)
                 unified_items = unified_result.get("items") or []
     
                 if unified_items:
@@ -1322,12 +1529,23 @@ def process_latest_inquiry():
                         f"🤖 unified_analyze primary ({route}): "
                         f"{len(unified_items)} item(s) — skipping regex extraction"
                     )
+                    before_quote = len(quote_items)
+                    before_missing = len(missing_layer2_items)
                     _merge_unified_items_into_quote(
                         unified_items,
                         quote_items,
                         missing_layer2_items,
                         detected_parts_norm,
                     )
+                    if len(quote_items) == before_quote and len(missing_layer2_items) == before_missing:
+                        print(
+                            "ℹ️ unified_analyze items were not usable — "
+                            "trying description-only extraction from email body."
+                        )
+                        for rfq in extract_description_only_rfq_items(body_clean):
+                            if rfq["norm"] not in detected_parts_norm:
+                                missing_layer2_items.append(rfq)
+                                detected_parts_norm.add(rfq["norm"])
                 else:
                     print("ℹ️ unified_analyze found no items — falling back to regex extraction.")
     
@@ -1483,16 +1701,23 @@ def process_latest_inquiry():
                                     f"Qty: {rfq['qty']} | "
                                     f"Source: {rfq['source']}"
                                 )
-    
+
                                 if rfq["brand"] == "UNKNOWN":
                                     print("      ⚠️ Customer did not specify brand. Routing will use DEFAULT.")
-    
+
                                 missing_layer2_items.append(rfq)
-    
+
+                        for rfq in extract_description_only_rfq_items(body_clean):
+                            if rfq["norm"] not in detected_parts_norm:
+                                missing_layer2_items.append(rfq)
+                                detected_parts_norm.add(rfq["norm"])
+
                 if not quote_items and not missing_layer2_items:
-                    print("ℹ️ No parts detected in this email. No reply sent.")
+                    print("ℹ️ No parts detected in this email. Marking as read (no reply sent).")
+                    msg.mark_as_read()
                     log_line()
-                    continue
+                    processed_one = True
+                    break
     
                 formatted_initial_rows = []
                 tbc_by_brand = {}
@@ -1649,7 +1874,7 @@ def process_latest_inquiry():
                     brand, part_no = normalize_inquiry_item(brand, part_no)
                     missing["brand"] = brand
                     missing["part_no"] = part_no
-                    desc = format_inquiry_description(brand, part_no)
+                    desc = missing.get("desc") or format_inquiry_description(brand, part_no)
     
                     smc_row = None
                     if brand == "SMC":
@@ -1710,7 +1935,7 @@ def process_latest_inquiry():
     
                 if formatted_initial_rows:
                     remark = ""
-    
+
                     if has_partial:
                         remark += (
                             "<br><span style='color:red;'>"
@@ -1718,7 +1943,7 @@ def process_latest_inquiry():
                             "Please re-confirm specifications before purchase."
                             "</span>"
                         )
-    
+
                     if missing_layer2_items:
                         remark += (
                             "<br><span style='color:red;'>"
@@ -1726,21 +1951,35 @@ def process_latest_inquiry():
                             "for manual verification."
                             "</span>"
                         )
-    
-                    cr = msg.reply()
-    
-                    cr.body = (
+
+                    customer_reply_html = (
                         f"Hi {c_name},<br><br>"
                         f"Thank you for your inquiry. Here is the initial status of your items:"
                         f"<br><br>{build_email_table(formatted_initial_rows, True)}"
                         f"{remark}<br><br>{SIGNATURE}"
                     )
-    
-                    cr.body_type = 'html'
-                    cr.send()
-    
-                    msg.mark_as_read()
-    
+
+                    supplier_suggestions_html = ""
+                    supplier_suggestions = {}
+                    if non_standard_items:
+                        print("🔎 [EMAIL] Running supplier web search for non-standard items...")
+                        supplier_suggestions = gather_supplier_suggestions(non_standard_items)
+                        supplier_suggestions_html = format_suggestions_html(
+                            supplier_suggestions, non_standard_items
+                        )
+
+                    send_customer_or_monitor_email(
+                        mailbox,
+                        context="INITIAL_QUOTATION_REPLY",
+                        customer_name=c_name,
+                        customer_email=c_email,
+                        original_subject=msg.subject,
+                        reply_html=customer_reply_html,
+                        reply_subject=f"Re: {msg.subject}",
+                        msg=msg,
+                        supplier_suggestions_html=supplier_suggestions_html,
+                    )
+
                     print(f"✅ Initial Reply Sent")
                     print(f"   To: {c_email}")
                     print(f"   Customer: {c_name}")
@@ -1757,7 +1996,8 @@ def process_latest_inquiry():
                                 customer_contact=c_email,
                                 channel="EMAIL",
                                 items=non_standard_items,
-                                source_message=body_clean
+                                source_message=body_clean,
+                                all_suggestions=supplier_suggestions or None,
                             )
     
                             print("✅ Non-standard items routed successfully.")
@@ -1852,6 +2092,51 @@ def process_latest_inquiry():
                     log_line()
                     print("✅ Customer inquiry fully processed — FIFO pause before next email check")
                     processed_one = True
+                elif non_standard_items:
+                    print("🔎 [EMAIL] Running supplier web search for description-only items...")
+                    supplier_suggestions = gather_supplier_suggestions(non_standard_items)
+                    supplier_suggestions_html = format_suggestions_html(
+                        supplier_suggestions, non_standard_items
+                    )
+                    try:
+                        print("🧩 No quotable rows — routing description-only items to technical team...")
+                        handle_non_standard_items(
+                            customer_name=c_name,
+                            customer_contact=c_email,
+                            channel="EMAIL",
+                            items=non_standard_items,
+                            source_message=body_clean,
+                            all_suggestions=supplier_suggestions,
+                        )
+                        print("✅ Non-standard items routed successfully.")
+                    except Exception as e:
+                        print(f"❌ Non-standard routing failed: {e}")
+
+                    ack_html = (
+                        f"Hi {c_name},<br><br>"
+                        "Thank you for your inquiry. We received your custom item request and have "
+                        "forwarded it to our technical team for sourcing and verification. "
+                        "We will update you with pricing and lead time shortly."
+                        f"<br><br>{SIGNATURE}"
+                    )
+                    send_customer_or_monitor_email(
+                        mailbox,
+                        context="TECHNICAL_ROUTING_ACK",
+                        customer_name=c_name,
+                        customer_email=c_email,
+                        original_subject=msg.subject,
+                        reply_html=ack_html,
+                        reply_subject=f"Re: {msg.subject}",
+                        msg=msg,
+                        supplier_suggestions_html=supplier_suggestions_html,
+                    )
+                    log_line()
+                    print("✅ Technical routing ack sent — FIFO pause before next email check")
+                    processed_one = True
+                else:
+                    print("⚠️ Inquiry had items but produced no reply rows — marking as read.")
+                    msg.mark_as_read()
+                    processed_one = True
                 break
 
         except Exception as e:
@@ -1859,12 +2144,14 @@ def process_latest_inquiry():
 
 
 if __name__ == "__main__":
+    enable_timestamped_logging()
     print(f"🚀 AutoClaw {VERSION} Active.")
     print(f"📁 Warehouse CSV: {WAREHOUSE_CSV}")
     print(f"📁 Pending CSV: {PENDING_CSV}")
     print(f"👨‍💼 Manager Email: {MANAGER_EMAIL}")
     print(f"🧪 Testing Routing Email: {TEST_ROUTING_EMAIL}")
     print(f"📬 Monitored mailboxes: {', '.join(get_monitored_mailboxes())}")
+    print(f"🧪 Email reply mode: {get_email_reply_mode()} (alerts → {', '.join(get_monitor_alert_emails())})")
     log_line()
 
     while True:

@@ -1,9 +1,20 @@
 #!/bin/bash
-# Shared helpers to stop and start OpenClaw processes.
+# Stop, start, and restart the OpenClaw unified runner (email + WhatsApp).
+# Copilot is managed separately — restarting OpenClaw does not restart Copilot.
+
+set -uo pipefail
 
 BASE_DIR="${BASE_DIR:-${OPENCLAW_BASE_DIR:-/Users/evon/OpenClaw}}"
 LOG_DIR="${LOG_DIR:-$BASE_DIR/logs}"
 MAIN_LOG="${MAIN_LOG:-$LOG_DIR/openclaw_main.log}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/openclaw_env.sh"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
 
 openclaw_stop_processes() {
     local pattern
@@ -73,6 +84,11 @@ openclaw_start() {
         return 1
     fi
 
+    if [[ "$(openclaw_count_main)" -ge 1 ]]; then
+        log "OpenClaw already running ($(openclaw_count_main) process(es)); skipping start"
+        return 0
+    fi
+
     log "Starting OpenClaw unified runner with: $uv_bin"
     cd "$BASE_DIR"
     nohup "$uv_bin" run python openclaw_main.py >> "$MAIN_LOG" 2>&1 &
@@ -104,3 +120,39 @@ openclaw_start() {
     fi
     return 1
 }
+
+openclaw_status() {
+    local count
+    count="$(openclaw_count_main)"
+    if [[ "$count" -ge 1 ]]; then
+        log "OpenClaw running ($count openclaw_main.py process(es))"
+        pgrep -fl "openclaw_main.py" 2>/dev/null | sed 's/^/  /' || true
+        return 0
+    fi
+    log "OpenClaw is not running"
+    return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+case "${1:-status}" in
+    start)
+        openclaw_start
+        ;;
+    stop)
+        openclaw_stop_all
+        ;;
+    restart)
+        openclaw_stop_all
+        sleep 2
+        openclaw_start
+        ;;
+    status)
+        openclaw_status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        echo "Log: $MAIN_LOG"
+        exit 1
+        ;;
+esac
+fi

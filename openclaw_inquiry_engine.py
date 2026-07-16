@@ -229,6 +229,14 @@ def resolve_warehouse_match(part_no, declared_brand="UNKNOWN", qty=1, source="")
 def infer_brand_from_part(part_no):
     part_norm = normalize_part(part_no)
 
+    try:
+        from inquiry_extraction_helper import looks_like_burkert_article_id
+
+        if looks_like_burkert_article_id(part_no):
+            return "BURKERT"
+    except ImportError:
+        pass
+
     # Safe family inference for common automation brands.
     if part_norm.startswith("E3Z") or part_norm.startswith("E39") or part_norm.startswith("E2E") or part_norm.startswith("MY2") or part_norm.startswith("MY4") or part_norm.startswith("H3Y"):
         return "OMRON"
@@ -738,6 +746,42 @@ def _is_burkert_brand(brand):
     return str(brand or "").upper().replace("BÜRKERT", "BURKERT") == "BURKERT"
 
 
+def _try_smc_portal_after_no_stock(
+    part_no,
+    qty,
+    rows,
+    *,
+    declared_brand="",
+    match=None,
+    item=None,
+    search_context="",
+):
+    """Quote SMC from the distributor portal when OBM/warehouse has no STORE stock."""
+    brand = str(
+        declared_brand
+        or ((rows[0] if rows else {}).get("brand"))
+        or ((match or {}).get("brand"))
+        or "UNKNOWN"
+    ).upper()
+    if brand != "SMC":
+        return None
+    if not rows or not all(str(row.get("price")) == "[TBC]" for row in rows):
+        return None
+
+    item = item or {}
+    match = match or {}
+    desc = (rows[0] if rows else {}).get("desc") or item.get("desc") or part_no
+    print(f"   🔎 [SMC] Portal lookup for {part_no} (qty {qty})...")
+    return _try_smc_portal_row(
+        part_no,
+        qty,
+        desc=desc,
+        brand="SMC",
+        search_context=search_context or desc,
+        warehouse_desc=desc,
+    )
+
+
 def _try_burkert_price_list_after_no_stock(
     part_no,
     qty,
@@ -755,7 +799,12 @@ def _try_burkert_price_list_after_no_stock(
         or ((match or {}).get("brand"))
         or "UNKNOWN"
     )
-    if not _is_burkert_brand(brand):
+    try:
+        from inquiry_extraction_helper import looks_like_burkert_article_id
+    except ImportError:
+        looks_like_burkert_article_id = lambda _: False  # noqa: E731
+
+    if not _is_burkert_brand(brand) and not looks_like_burkert_article_id(part_no):
         return None
     if not rows or not all(str(row.get("price")) == "[TBC]" for row in rows):
         return None
@@ -785,8 +834,15 @@ def _try_burkert_price_list_row(
 ):
     """Fill price and lead time from the Burkert offline price list when available."""
     brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
-    if brand_u != "BURKERT":
+    try:
+        from inquiry_extraction_helper import looks_like_burkert_article_id
+    except ImportError:
+        looks_like_burkert_article_id = lambda _: False  # noqa: E731
+
+    if brand_u != "BURKERT" and not looks_like_burkert_article_id(part_no):
         return None
+    if brand_u != "BURKERT":
+        brand_u = "BURKERT"
 
     try:
         from burkert_price_list import (
@@ -844,7 +900,14 @@ def _try_burkert_price_list_row(
     }
 
 
-def _try_smc_portal_row(part_no, qty, desc=None, brand="", search_context=""):
+def _try_smc_portal_row(
+    part_no,
+    qty,
+    desc=None,
+    brand="",
+    search_context="",
+    warehouse_desc=None,
+):
     """Fill price and lead time from the SMC distributor web portal when available."""
     brand_u = str(brand or "").upper().replace("BÜRKERT", "BURKERT")
     if brand_u != "SMC":
@@ -856,18 +919,25 @@ def _try_smc_portal_row(part_no, qty, desc=None, brand="", search_context=""):
         print("   ⚠️ [ENGINE] smc_portal_lookup not available — SMC portal search skipped.")
         return None
 
+    use_cache = os.getenv("SMC_PORTAL_USE_CACHE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     quote = lookup_smc_quote(
         part_no,
         qty=qty,
         markup_divisor=MARKUP_DIVISOR,
         search_context=search_context,
+        allow_cache=use_cache,
     )
     if not quote:
         return None
 
     customer_part = str(part_no or "").strip().upper()
     portal_desc = str(quote.get("desc") or "").strip()
-    if portal_desc and customer_part and customer_part not in portal_desc.upper():
+    wh_desc = str(warehouse_desc or desc or "").strip()
+    if wh_desc and customer_part and customer_part.upper() in wh_desc.upper():
+        portal_desc = wh_desc
+    elif portal_desc and customer_part and customer_part not in portal_desc.upper():
         portal_desc = f"SMC {customer_part}"
     elif not portal_desc:
         portal_desc = f"SMC {customer_part}"
@@ -919,6 +989,27 @@ def process_structured_items(structured_items):
 
         if match:
             rows, supplier_item = build_rows_from_api(match["api_id"], qty, customer_part=part_no)
+
+            smc_row = _try_smc_portal_after_no_stock(
+                part_no,
+                qty,
+                rows,
+                declared_brand=declared_brand,
+                match=match,
+                item=item,
+                search_context=search_context,
+            )
+            if smc_row:
+                formatted_rows.append(smc_row)
+                if smc_row.get("needs_supplier"):
+                    print(
+                        f"   ⚠️ [ENGINE] SMC portal partial for {smc_row.get('desc')} | Qty: {qty} "
+                        "(no internal manual RFQ — portal is source)"
+                    )
+                else:
+                    print(f"   ✅ [ENGINE] SMC portal quote: {smc_row.get('desc')} | Qty: {qty}")
+                continue
+
             burkert_row = _try_burkert_price_list_after_no_stock(
                 part_no,
                 qty,
@@ -1102,6 +1193,8 @@ def build_plain_quotation_reply(rows, ai_research=None):
         msg += f"  Qty: {qty}\n"
         msg += f"  Unit Price: RM {price}\n"
         msg += f"  Lead Time: {lt}\n"
+        if row.get("smc_portal_hit"):
+            msg += "  Source: SMC Portal (live)\n"
 
         if price != "[TBC]":
             price_val = float(str(price).replace(",", ""))
@@ -1121,5 +1214,6 @@ def build_plain_quotation_reply(rows, ai_research=None):
             "Any remaining quantity is marked [TBC] and will be verified shortly.\n\n"
         )
 
-    msg += "Items marked [TBC] will be verified and updated shortly."
+    if has_tbc_balance or any(str(row.get("price")) == "[TBC]" for row in rows):
+        msg += "Items marked [TBC] will be verified and updated shortly."
     return msg

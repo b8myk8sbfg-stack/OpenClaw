@@ -11,11 +11,45 @@ import re
 import shutil
 from typing import Any, Dict, List, Optional
 
-VERSION = "v1.01-OCR-MULTI-PSM"
+VERSION = "v1.02-OCR-NOISE-FILTER"
 
 DEFAULT_LANG = os.getenv("OPENCLAW_OCR_LANG", "eng+chi_sim")
 MIN_LINE_CONFIDENCE = float(os.getenv("OPENCLAW_OCR_MIN_CONFIDENCE", "25"))
-MIN_UPSCALE_WIDTH = int(os.getenv("OPENCLAW_OCR_MIN_WIDTH", "1400"))
+MIN_UPSCALE_WIDTH = int(os.getenv("OPENCLAW_OCR_MIN_WIDTH", "2000"))
+
+_OCR_LINE_NOISE_PATTERNS = (
+    re.compile(r"^\s*forwarded\s*$", re.I),
+    re.compile(r"^\s*quote\s+me\b", re.I),
+    re.compile(r"^\s*\d{1,2}\s*:\s*\d{2}\s*(?:am|pm)?\s*$", re.I),
+    re.compile(r"^\s*(?:burkert|5urkert|purkert|bürkert)\s*$", re.I),
+    re.compile(r"^\s*made\s*(?:in)?\s*germany\s*$", re.I),
+    re.compile(r"^\s*(?:pas|pcs|pce|pc)\s*$", re.I),
+)
+
+
+def _is_whatsapp_ui_noise_line(text: str) -> bool:
+    line = str(text or "").strip()
+    if not line:
+        return True
+    if len(line) <= 2 and not re.search(r"\d{3,}", line):
+        return True
+    for pattern in _OCR_LINE_NOISE_PATTERNS:
+        if pattern.search(line):
+            return True
+    if re.fullmatch(r"[\W_]+", line):
+        return True
+    return False
+
+
+def filter_whatsapp_ui_noise_from_ocr(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove WhatsApp chat chrome that leaks into thumb/bubble OCR."""
+    kept = []
+    for line in lines or []:
+        text = str(line.get("text") or "").strip()
+        if _is_whatsapp_ui_noise_line(text):
+            continue
+        kept.append(line)
+    return kept
 
 
 def ocr_enabled() -> bool:
@@ -31,11 +65,18 @@ def _resolve_tesseract_cmd() -> Optional[str]:
     return shutil.which("tesseract")
 
 
-def _preprocess_image(image_path: str):
+def _preprocess_image(image_path: str, *, thumb_capture: bool = False, rotate_degrees: int = 0):
     from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-    image = Image.open(image_path)
-    image = ImageOps.exif_transpose(image)
+    image = ImageOps.exif_transpose(Image.open(image_path))
+    if rotate_degrees:
+        image = image.rotate(int(rotate_degrees) % 360, expand=True)
+    if thumb_capture:
+        width, height = image.size
+        top = int(height * 0.14)
+        side = int(width * 0.04)
+        if height - top > 80 and width - (2 * side) > 80:
+            image = image.crop((side, top, width - side, height))
     if image.width < MIN_UPSCALE_WIDTH:
         scale = MIN_UPSCALE_WIDTH / max(image.width, 1)
         new_size = (int(image.width * scale), int(image.height * scale))
@@ -125,7 +166,124 @@ def _lines_from_tesseract_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return lines
 
 
-def extract_text_from_image(image_path: str) -> Dict[str, Any]:
+def _fix_burkert_digit_confusions(compact: str) -> str:
+    """Fix letter/digit swaps inside numeric-only Burkert article IDs."""
+    text = str(compact or "").upper()
+    if not text or not re.fullmatch(r"0*[0-9EIO]{6,12}", text):
+        return text
+    return (
+        text.replace("E", "2")
+        .replace("I", "1")
+        .replace("O", "0")
+    )
+
+
+def _fix_burkert_ocr_token(token: str) -> str:
+    compact = re.sub(r"[^0-9A-Z]", "", str(token or "").upper())
+    compact = _fix_burkert_digit_confusions(compact)
+    if re.fullmatch(r"0*\d{5,8}S", compact):
+        return compact[:-1] + "5"
+    return str(token or "")
+
+
+def _fix_burkert_ocr_in_text(text: str) -> str:
+    blob = str(text or "")
+
+    def _replace_token(match: re.Match) -> str:
+        return _fix_burkert_ocr_token(match.group(0))
+
+    blob = re.sub(r"\b0?\d{3,8}[EIO]\d{3,8}\b", _replace_token, blob, flags=re.I)
+    blob = re.sub(
+        r"\b0?\d{5,8}S\b",
+        _replace_token,
+        blob,
+        flags=re.I,
+    )
+    return blob
+
+
+def _score_ocr_candidate(lines: List[Dict[str, Any]], full_text: str) -> float:
+    text = str(full_text or "").upper()
+    compact = re.sub(r"[^0-9A-Z]", "", text)
+    score = 0.0
+
+    if re.search(r"00\d{6,7}", compact):
+        score += 1000.0
+    elif re.search(r"0\d{6,8}", compact):
+        score += 500.0
+    if "6519" in compact or "6519" in text:
+        score += 200.0
+    if "BURKERT" in text or "BURK" in text:
+        score += 100.0
+    if "MADE IN GERMANY" in text:
+        score += 50.0
+
+    confs = [
+        float(line.get("confidence"))
+        for line in (lines or [])
+        if line.get("confidence") is not None and float(line.get("confidence")) >= 0
+    ]
+    if confs:
+        score += sum(confs) / len(confs)
+    score += min(len(lines or []), 30) * 2.0
+    return score
+
+
+def _orientation_candidates(image_path: str) -> List[int]:
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as probe:
+            width, height = probe.size
+        if height > width * 1.15:
+            return [90, 270, 0, 180]
+        if width > height * 1.15:
+            return [0, 180, 90, 270]
+    except Exception:
+        pass
+    return [0, 90, 180, 270]
+
+
+def _ocr_image_variant(
+    image_path: str,
+    *,
+    thumb_capture: bool,
+    rotate_degrees: int,
+    psm_modes: List[int],
+) -> Dict[str, Any]:
+    import pytesseract
+
+    image = _preprocess_image(
+        image_path,
+        thumb_capture=thumb_capture,
+        rotate_degrees=rotate_degrees,
+    )
+    line_groups = []
+    for psm in psm_modes:
+        try:
+            line_groups.append(_ocr_lines_from_image(image, psm))
+        except Exception as exc:
+            print(f"[OCR] PSM {psm} failed (rotate={rotate_degrees}): {exc}")
+    lines = _merge_ocr_lines(line_groups)
+    before = len(lines)
+    lines = filter_whatsapp_ui_noise_from_ocr(lines)
+    if before != len(lines):
+        print(
+            f"[OCR] Filtered WhatsApp UI noise: {before} → {len(lines)} line(s) "
+            f"(rotate={rotate_degrees})"
+        )
+    for line in lines:
+        line["text"] = _fix_burkert_ocr_in_text(line.get("text") or "")
+    full_text = "\n".join(line["text"] for line in lines).strip()
+    return {
+        "lines": lines,
+        "full_text": full_text,
+        "score": _score_ocr_candidate(lines, full_text),
+        "rotate_degrees": rotate_degrees,
+    }
+
+
+def extract_text_from_image(image_path: str, *, thumb_capture: bool = False) -> Dict[str, Any]:
     """
     Run local OCR on an image file.
 
@@ -152,6 +310,17 @@ def extract_text_from_image(image_path: str) -> Dict[str, Any]:
         payload["error"] = "image_not_found"
         return payload
 
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as probe:
+            width, height = probe.size
+            pixels = width * height
+            if max(width, height) < 400 or pixels < 120_000:
+                thumb_capture = True
+    except Exception:
+        pass
+
     tesseract_cmd = _resolve_tesseract_cmd()
     if not tesseract_cmd:
         payload["error"] = "tesseract_not_installed"
@@ -161,17 +330,30 @@ def extract_text_from_image(image_path: str) -> Dict[str, Any]:
         import pytesseract
 
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-        image = _preprocess_image(image_path)
+        if thumb_capture:
+            print("[OCR] Small capture detected — cropping chat chrome and upscaling for label OCR")
         psm_modes = [int(x) for x in os.getenv("OPENCLAW_OCR_PSM", "6,11,3").split(",") if x.strip()]
-        line_groups = []
-        for psm in psm_modes:
-            try:
-                line_groups.append(_ocr_lines_from_image(image, psm))
-            except Exception as exc:
-                print(f"[OCR] PSM {psm} failed: {exc}")
-        lines = _merge_ocr_lines(line_groups)
+
+        best_variant = None
+        for rotate_degrees in _orientation_candidates(image_path):
+            variant = _ocr_image_variant(
+                image_path,
+                thumb_capture=thumb_capture,
+                rotate_degrees=rotate_degrees,
+                psm_modes=psm_modes,
+            )
+            if best_variant is None or variant["score"] > best_variant["score"]:
+                best_variant = variant
+
+        if best_variant and int(best_variant.get("rotate_degrees") or 0):
+            print(
+                f"[OCR] Best orientation: rotate {best_variant['rotate_degrees']}° "
+                f"(score={best_variant['score']:.1f})"
+            )
+
+        lines = (best_variant or {}).get("lines") or []
         payload["lines"] = lines
-        payload["full_text"] = "\n".join(line["text"] for line in lines).strip()
+        payload["full_text"] = (best_variant or {}).get("full_text") or ""
         if payload["full_text"]:
             print(f"[OCR] Merged {len(lines)} line(s) from PSM modes {psm_modes}")
         if not payload["full_text"]:

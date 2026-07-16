@@ -15,6 +15,11 @@ COPILOT_HEALTH_INTERVAL="${COPILOT_HEALTH_INTERVAL:-5}"
 COPILOT_RECOVERY_COOLDOWN="${COPILOT_RECOVERY_COOLDOWN:-900}"
 COPILOT_LAST_RECOVERY_FILE="${COPILOT_LAST_RECOVERY_FILE:-$LOG_DIR/copilot_last_recovery.ts}"
 
+# macOS ships /usr/bin/log — define our own so sourced calls don't hit the system tool.
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
 resolve_copilot_python() {
     local candidate
     for candidate in \
@@ -230,6 +235,44 @@ copilot_wait_until_healthy() {
     return 1
 }
 
+copilot_wait_until_models() {
+    local attempts="${1:-12}"
+    local interval="${2:-5}"
+    local i
+
+    for ((i = 1; i <= attempts; i++)); do
+        if copilot_models_reachable; then
+            log "Copilot /v1/models reachable after ${i} check(s)"
+            return 0
+        fi
+        if copilot_port_listening || copilot_process_running; then
+            log "Copilot starting... models not ready yet (attempt $i/$attempts)"
+        else
+            log "Copilot process/port not ready (attempt $i/$attempts)"
+        fi
+        sleep "$interval"
+    done
+
+    log "ERROR: Copilot /v1/models did not become reachable within $((attempts * interval))s"
+    return 1
+}
+
+# Restart Copilot only — leaves OpenClaw and WhatsApp Chrome running.
+copilot_light_restart() {
+    if copilot_models_reachable; then
+        log "Copilot models already reachable; skipping light restart"
+        return 0
+    fi
+
+    log "Light Copilot restart (OpenClaw left running)..."
+    copilot_stop_server || true
+    sleep 2
+    if ! copilot_start_server; then
+        return 1
+    fi
+    copilot_wait_until_models 12 5
+}
+
 copilot_restart_and_wait() {
     if copilot_server_reachable; then
         log "Copilot already reachable; skipping restart"
@@ -240,5 +283,9 @@ copilot_restart_and_wait() {
     if ! copilot_start_server; then
         return 1
     fi
-    copilot_wait_until_healthy
+    if [[ "${COPILOT_HEALTH_CHAT_PROBE:-0}" == "1" ]]; then
+        copilot_wait_until_healthy
+    else
+        copilot_wait_until_models "${COPILOT_HEALTH_ATTEMPTS:-12}" "${COPILOT_HEALTH_INTERVAL:-5}"
+    fi
 }

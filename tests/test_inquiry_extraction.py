@@ -74,6 +74,32 @@ class InquiryExtractionTests(unittest.TestCase):
             "SMC AS2201F-01-04SA",
         )
 
+    def test_caption_pas_typo_qty_hint(self):
+        from inquiry_extraction_helper import (
+            apply_caption_qty_to_items,
+            extract_qty_from_caption,
+            normalize_qty_caption_text,
+        )
+
+        self.assertEqual(normalize_qty_caption_text("Quote me 2 PAS"), "Quote me 2 PCS")
+        self.assertEqual(extract_qty_from_caption("Quote me 2 PAS"), 2)
+        items = apply_caption_qty_to_items(
+            [{"part_no": "001372465", "qty": 1, "brand": "UNKNOWN"}],
+            "Quote me 2 PAS",
+        )
+        self.assertEqual(items[0]["qty"], 2)
+
+    def test_burkert_ocr_s_to_5(self):
+        from inquiry_extraction_helper import (
+            burkert_id_ocr_variants,
+            looks_like_burkert_article_id,
+            normalize_burkert_part_from_ocr,
+        )
+
+        self.assertEqual(normalize_burkert_part_from_ocr("00137246S"), "001372465")
+        self.assertTrue(looks_like_burkert_article_id("00137246S"))
+        self.assertIn("001372465", burkert_id_ocr_variants("00137246S"))
+
 
 if __name__ == "__main__":
     unittest.main()

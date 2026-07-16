@@ -26,9 +26,10 @@ KNOWN_BRAND_PREFIXES = tuple(
 INVALID_PART_WORDS = {
     "THANK", "THANKS", "THANKYOU", "PLEASE", "REGARDS", "HELLO", "QUOTE", "PRICE",
     "CYLINDER", "SENSOR", "VALVE", "RELAY", "ITEM", "NEW", "UNIT", "UNITS", "PCS",
-    "PC", "PCE", "YOU", "YOUR", "ENQUIRY", "INQUIRY", "KINDLY", "DEAR", "REGARD",
+    "PC", "PCE", "PAS", "YOU", "YOUR", "ENQUIRY", "INQUIRY", "KINDLY", "DEAR", "REGARD",
     "BEST", "MORNING", "AFTERNOON", "FOLLOWING", "ATTACHED", "BELOW", "ABOVE",
-    "MODEL", "BRAND", "TYPE", "PART", "NUMBER", "QTY", "QUANTITY",
+    "MODEL", "BRAND", "TYPE", "PART", "NUMBER", "QTY", "QUANTITY", "FORWARDED",
+    "VOD", "GERMANY", "MADE", "BURKERT", "BURKERTS",
 }
 
 
@@ -51,6 +52,292 @@ def is_plausible_part_no(part_no: str) -> bool:
 
 def normalize_part(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def normalize_qty_caption_text(text: str) -> str:
+    """Normalize common OCR/typo quantity tokens before extraction."""
+    value = str(text or "")
+    value = re.sub(r"\b(\d+)\s*PAS\b", r"\1 PCS", value, flags=re.I)
+    value = re.sub(r"\bPCE\b", "PCS", value, flags=re.I)
+    value = re.sub(r"\bPIECES?\b", "PCS", value, flags=re.I)
+    return value
+
+
+def extract_qty_from_caption(text: str) -> Optional[int]:
+    """Read a quantity hint from customer caption/text."""
+    caption = normalize_qty_caption_text(text).upper()
+    if not caption.strip():
+        return None
+
+    patterns = (
+        r"\b(?:QUOTE(?:\s+ME)?|QTY|QUANTITY)\s*(?:FOR\s+)?(\d+)\b",
+        r"\b(\d+)\s*(?:PCS?|PIECES?|UNITS?|NOS|SETS?|KE)\b",
+        r"\b(\d+)\s*PAS\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, caption, flags=re.I)
+        if match:
+            qty = int(match.group(1))
+            if qty > 0:
+                return qty
+    return None
+
+
+def apply_caption_qty_to_items(items: List[dict], caption: str) -> List[dict]:
+    """Override qty with caption hint when appropriate."""
+    hint = extract_qty_from_caption(caption)
+    if not hint or not items:
+        return items
+
+    if len(items) == 1:
+        item = items[0]
+        if item.get("quotation_meta"):
+            item["qty"] = hint
+            return items
+        try:
+            current = int(item.get("qty") or 1)
+        except (TypeError, ValueError):
+            current = 1
+        if current == 1 and hint > 1:
+            item["qty"] = hint
+    return items
+
+
+def looks_like_burkert_article_id(part_no: str) -> bool:
+    """True when a token looks like a Burkert numeric article ID."""
+    raw = str(part_no or "").strip().upper()
+    if not raw:
+        return False
+    compact = re.sub(r"[^0-9A-Z]", "", raw)
+    if re.fullmatch(r"0*\d{5,9}", compact):
+        return True
+    if re.fullmatch(r"0*\d{5,8}[S5]", compact):
+        return True
+    return False
+
+
+def burkert_id_ocr_variants(value: str) -> List[str]:
+    """Generate OCR correction variants for Burkert numeric article IDs."""
+    raw = str(value or "").strip().upper()
+    variants: List[str] = []
+    seen = set()
+
+    def add(candidate: str) -> None:
+        candidate = str(candidate or "").strip().upper()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            variants.append(candidate)
+
+    add(raw)
+    compact = re.sub(r"[^0-9A-Z]", "", raw)
+    add(compact)
+    if re.search(r"[EIO]", compact) and re.search(r"\d", compact):
+        corrected = (
+            compact.replace("E", "2")
+            .replace("I", "1")
+            .replace("O", "0")
+        )
+        add(corrected)
+        add(
+            compact.replace("E", "4")
+            .replace("I", "1")
+            .replace("O", "0")
+        )
+    if re.search(r"\dS$", compact):
+        add(compact[:-1] + "5")
+        add(compact[:-1])
+    if re.search(r"\d5$", compact) and len(compact) >= 6:
+        add(compact[:-1] + "S")
+    return variants
+
+
+def normalize_burkert_part_from_ocr(part_no: str) -> str:
+    """Fix common OCR misreads on numeric Burkert article IDs (e.g. e → 2, S → 5)."""
+    raw = str(part_no or "").strip().upper()
+    compact = re.sub(r"[^0-9A-Z]", "", raw)
+    if re.fullmatch(r"0*[0-9EIO]{6,12}", compact):
+        compact = (
+            compact.replace("E", "2")
+            .replace("I", "1")
+            .replace("O", "0")
+        )
+        if raw.startswith("00") and len(compact) <= 8:
+            return compact.zfill(8)
+        return compact
+    if re.fullmatch(r"0*\d{5,8}S", compact):
+        return compact[:-1] + "5"
+    return raw
+
+
+def sanitize_whatsapp_outbound_text(text: str) -> str:
+    """Strip non-BMP characters and normalize punctuation for ChromeDriver send_keys."""
+    out: List[str] = []
+    for ch in str(text or ""):
+        code = ord(ch)
+        if code > 0xFFFF:
+            continue
+        if ch in "\u2022\u2023\u25cf\u25aa":
+            out.append("-")
+        elif ch in "\u2013\u2014":
+            out.append("-")
+        elif ch in "\u2018\u2019\u2032":
+            out.append("'")
+        elif ch in "\u201c\u201d\u2033":
+            out.append('"')
+        elif ch == "\u00a0":
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def scan_burkert_article_ids_from_ocr_text(text: str) -> List[str]:
+    """Find likely Burkert numeric article IDs in noisy OCR output."""
+    blob = str(text or "")
+    if not blob.strip():
+        return []
+
+    candidates: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        digits = re.sub(r"[^0-9]", "", value)
+        if len(digits) < 6:
+            return
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+
+    try:
+        from burkert_price_list import extract_burkert_id_from_text
+
+        found = extract_burkert_id_from_text(blob)
+        if found:
+            add(found)
+    except ImportError:
+        pass
+
+    patterns = (
+        r"\b(00\d{6,7})\b",
+        r"\b(0\d{7,8})\b",
+        r"\b(\d{7,8})\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, blob):
+            add(match.group(1))
+
+    compact = re.sub(r"[^0-9]", "", blob)
+    for length in (8, 7, 6):
+        for match in re.finditer(rf"(\d{{{length}}})", compact):
+            add(match.group(1))
+
+    return candidates
+
+
+def is_ocr_junk_part_no(part_no: str) -> bool:
+    """True when Copilot/OCR likely hallucinated a label fragment instead of a part ID."""
+    raw = str(part_no or "").strip().upper()
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    if not compact or len(compact) < 3:
+        return True
+    if compact in INVALID_PART_WORDS or raw in INVALID_PART_WORDS:
+        return True
+    if looks_like_burkert_article_id(raw):
+        return False
+    if is_plausible_part_no(raw):
+        return False
+    if re.fullmatch(r"[A-Z]{1,4}\d{0,2}", compact):
+        return True
+    if re.fullmatch(r"[A-Z]+\s*\d{1,3}", raw):
+        return True
+    if "VITA" in raw or raw.startswith("JP"):
+        return True
+    if len(compact) <= 5 and not re.search(r"\d{3,}", compact):
+        return True
+    if re.search(r"[|~*]", raw):
+        return True
+    return False
+
+
+def is_copilot_prompt_example_hallucination(items: List[dict]) -> bool:
+    """Detect when Copilot echoes the RFQ system-prompt example instead of real OCR."""
+    if not items:
+        return False
+    parts = {str(item.get("part_no") or "").strip().upper() for item in items}
+    example_pairs = (
+        {"E2E-X5E1", "AS2201F-01-04SA"},
+        {"AS2201F-01-04SA", "E2E-X5E1"},
+    )
+    if parts in example_pairs and len(parts) == 2:
+        return True
+    if len(items) == 2 and parts == {"E2E-X5E1", "AS2201F-01-04SA"}:
+        return True
+    return False
+
+
+def filter_copilot_rfq_items(items: List[dict]) -> List[dict]:
+    """Drop OCR-noise parts (PAS, VOD, caption tokens) before quoting."""
+    if is_copilot_prompt_example_hallucination(items):
+        print("[RFQ] Dropped Copilot prompt-example hallucination (E2E-X5E1 + AS2201F-01-04SA)")
+        return []
+    cleaned = []
+    for item in items or []:
+        part_no = str(item.get("part_no") or "").strip()
+        if is_ocr_junk_part_no(part_no):
+            print(f"[RFQ] Dropped junk extracted part {part_no!r}")
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def reconcile_burkert_items_from_ocr(
+    items: List[dict],
+    image_path: str = "",
+    caption: str = "",
+) -> List[dict]:
+    """Replace junk OCR/Copilot parts with numeric Burkert IDs read from the image."""
+    image_path = str(image_path or "").strip()
+    if not image_path or not os.path.isfile(image_path):
+        return items
+
+    try:
+        from local_ocr import extract_text_from_image, has_usable_ocr_text
+    except ImportError:
+        return items
+
+    payload = extract_text_from_image(image_path)
+    if not has_usable_ocr_text(payload):
+        return items
+
+    ocr_text = payload.get("full_text") or ""
+    ids = scan_burkert_article_ids_from_ocr_text(ocr_text)
+    if not ids:
+        return items
+
+    preferred = ids[0]
+    for candidate in ids:
+        if candidate.startswith("00") and len(re.sub(r"[^0-9]", "", candidate)) >= 7:
+            preferred = candidate
+            break
+
+    junk_items = items and all(is_ocr_junk_part_no(i.get("part_no", "")) for i in items)
+    if not junk_items and len(items) == 1 and not looks_like_burkert_article_id(items[0].get("part_no", "")):
+        junk_items = is_ocr_junk_part_no(items[0].get("part_no", ""))
+
+    if not junk_items:
+        return items
+
+    qty = extract_qty_from_caption(caption) or 1
+    if len(items) == 1:
+        try:
+            qty = int(items[0].get("qty") or qty)
+        except (TypeError, ValueError):
+            pass
+
+    corrected = normalize_burkert_part_from_ocr(preferred)
+    print(f"[RFQ] OCR Burkert ID recovery: {[i.get('part_no') for i in items]} → {corrected}")
+    return [{"part_no": corrected, "qty": qty, "brand": "BURKERT"}]
 
 
 def _canonical_brand(brand: str) -> str:

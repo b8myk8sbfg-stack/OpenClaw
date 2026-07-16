@@ -55,6 +55,16 @@ run_recovery() {
         log "Found $before_count openclaw_main.py process(es) before stop"
     fi
 
+    if [[ "$before_count" -ge 1 ]] && ! copilot_server_reachable; then
+        log "OpenClaw running but Copilot is down — trying Copilot-only light restart first"
+        if copilot_light_restart; then
+            copilot_mark_recovery
+            log "Copilot light restart succeeded; left OpenClaw running"
+            return 0
+        fi
+        log "Copilot light restart failed — continuing with full recovery"
+    fi
+
     openclaw_stop_all
     sleep 3
 

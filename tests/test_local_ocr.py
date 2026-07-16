@@ -37,6 +37,13 @@ class LocalOcrTests(unittest.TestCase):
             result = local_ocr.extract_text_from_image(__file__)
         self.assertEqual(result["error"], "tesseract_not_installed")
 
+    def test_burkert_ocr_fixes_trailing_s(self):
+        self.assertEqual(local_ocr._fix_burkert_ocr_token("00137246S"), "001372465")
+        self.assertEqual(
+            local_ocr._fix_burkert_ocr_in_text("Article 00137246S"),
+            "Article 001372465",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,14 @@
 {
-  "customer_hint": "Robo",
-  "customer_code": "MYC0003071",
-  "item_enquiry_url": "https://my.smccorporation.co:8001/ItemEnquiry",
-  "notes": "Credentials go in .env only — never commit passwords to this file."
+  "search_input": [
+    "#your-search-field"
+  ],
+  "search_button": [
+    "#your-search-button"
+  ],
+  "search_url_templates": [
+    "{base}/Your/SearchPath?model={part}"
+  ],
+  "result_table": [
+    "table.your-results"
+  ]
 }
