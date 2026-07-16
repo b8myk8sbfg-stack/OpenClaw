@@ -8,17 +8,365 @@ import mimetypes
 import signal
 import re
 
-from openai import OpenAI
+from dotenv import load_dotenv
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
-VERSION = "v1.01-UNIFIED-RUNNER"
+from openclaw_log import enable_timestamped_logging
+
+VERSION = "v1.08-PURCHASING-WHATSAPP-MODULE"
 
 BASE_DIR = "/Users/evon/OpenClaw"
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
+enable_timestamped_logging()
 
 EMAIL_SCRIPT = os.path.join(BASE_DIR, "auto_claw.py")
 WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "whatsapp_inbox_watcher.py")
+PURCHASING_WHATSAPP_SCRIPT = os.path.join(BASE_DIR, "purchasing_whatsapp_watcher.py")
 
 COPILOT_BASE_URL = os.getenv("COPILOT_BASE_URL", "http://127.0.0.1:8000/v1")
 COPILOT_MODEL = os.getenv("COPILOT_MODEL", "copilot")
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o")
+
+
+class OcrFallbackRequired(Exception):
+    """Image inquiry cannot use Copilot vision — route to OpenAI instead."""
+
+    def __init__(self, reason: str, ocr_used: bool = False, ocr_payload: dict = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.ocr_used = ocr_used
+        self.ocr_payload = ocr_payload or {}
+
+_RFQ_SYSTEM_INSTRUCTION = (
+    "You are an industrial automation data extraction assistant. "
+    "Visually inspect the provided industrial product photo, label, nameplate, barcode sticker, "
+    "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
+    "Read printed model/order codes exactly as shown on the label/nameplate in THIS photo only. "
+    "Read character-by-character; do not substitute a different catalog number. "
+    "OMRON proximity sensors use E2E- (example E2E-X5E1). OMRON temperature controllers use E5CC-/E5CN-. "
+    "OMRON programmable controllers use CPM1A- (example CPM1A-30CDR-D-V1). "
+    "If the label says PROXIMITY SENSOR or shows E2E-, never return E5CC/E5CN. "
+    "Match the brand field to the visible manufacturer logo (OMRON, SMC, etc.). "
+    "Never reuse a part number from chat history or from a different message. "
+    "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
+    "For relays, solenoids, coils, and power products, voltage and AC/DC are mandatory: "
+    "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC'). "
+    "Never substitute another voltage variant. "
+    "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
+    "a single visible part with '2 pcs' means qty 2. "
+    "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
+    "part_no must be the catalog part number ONLY — never repeat the brand (e.g. AS2201F-01-04SA, FU-35TZ). "
+    "product_type is the visible product description on the label (example: PROXIMITY SENSOR, LIMIT SWITCH). "
+    "Quantity must be a positive integer. Do not guess missing part numbers. "
+    "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
+    "Brand-prefixed lines: SMC-AS2201F-01-04SA → brand=SMC, part_no=AS2201F-01-04SA; "
+    "KEYENCE-FU-35TZ → brand=KEYENCE, part_no=FU-35TZ; CPC-MR12WNSS → brand=CPC, part_no=MR12WNSS. "
+    "Never return part_no with a duplicated brand prefix when brand is already set. "
+    "Do not include markdown, backticks, or conversational text. "
+    'Example: [{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}, '
+    '{"part_no": "AS2201F-01-04SA", "qty": 2, "brand": "SMC", "product_type": "SPEED CONTROLLER"}]'
+)
+
+_RFQ_OCR_SYSTEM_INSTRUCTION = (
+    "You are an industrial automation data extraction assistant. "
+    "The customer sent a product nameplate photo. You receive ONLY local OCR text (JSON) plus the caption — "
+    "not the image itself. "
+    "IGNORE WhatsApp/chat overlay text such as Forwarded, timestamps (11:37 AM), and customer captions "
+    "(Quote me 2 PAS). PAS/PCS/PCE are quantity units, never part numbers. "
+    "Focus on engraved/printed catalog codes on the physical label (article ID, type number, order code). "
+    "Burkert nameplates often show an 7-8 digit article ID such as 001372465. "
+    "Extract ONLY real manufacturer catalog part numbers from the label OCR — usually ONE primary part per photo. "
+    "Do not invent parts from OCR noise fragments. "
+    "Use the customer caption only for quantity hints. "
+    "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
+    "part_no must be the catalog part number ONLY — never repeat the brand. "
+    "product_type is the product description visible in OCR (example: SOLENOID VALVE). "
+    "Quantity must be a positive integer. Do not guess missing part numbers. "
+    "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
+    "Strip leading brand prefixes from part_no when brand is known (SMC-AS2201F-01-04SA → brand=SMC, part_no=AS2201F-01-04SA). "
+    "Do not include markdown, backticks, or conversational text."
+)
+
+_RFQ_OCR_QUOTATION_SUFFIX = (
+    "\n\nThe OCR text appears to be from a QUOTATION document photo. "
+    "Extract the product item code from the Description/table area — NOT the Our Ref header "
+    "(e.g. Q001300 is a reference number, not a product code). "
+    "Look for alphanumeric catalog codes such as 89PR10KLF near MOQ/resistor/product lines."
+)
+
+
+def _rfq_ocr_system_instruction(ocr_payload: dict) -> str:
+    try:
+        from quotation_image_extractor import is_quotation_document
+    except ImportError:
+        return _RFQ_OCR_SYSTEM_INSTRUCTION
+
+    text = str((ocr_payload or {}).get("full_text") or "")
+    if is_quotation_document(text):
+        return _RFQ_OCR_SYSTEM_INSTRUCTION + _RFQ_OCR_QUOTATION_SUFFIX
+    return _RFQ_OCR_SYSTEM_INSTRUCTION
+
+
+def _ai_fallback_enabled() -> bool:
+    """Return True when OpenAI fallback is configured and allowed."""
+    api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return False
+    if api_key.lower() in ("local-bypass", "local-copilot-proxy", "sk-local", "changeme"):
+        print(
+            "[WARN] OPENAI_API_KEY looks like a Copilot placeholder "
+            f"({api_key!r}) — set a real OpenAI key in .env for fallback."
+        )
+        return False
+    mode = os.getenv("OPENCLAW_AI_FALLBACK", "openai").strip().lower()
+    return mode not in ("0", "false", "no", "off", "none")
+
+
+def _copilot_error_details(exc: Exception) -> dict:
+    """Normalize Copilot proxy failures for logging and monitor alerts."""
+    if isinstance(exc, APIStatusError):
+        body = exc.body if isinstance(getattr(exc, "body", None), dict) else {}
+        err = body.get("error", {}) if isinstance(body, dict) else {}
+        return {
+            "status": exc.status_code,
+            "type": str(err.get("type") or "api_error"),
+            "message": str(err.get("message") or exc),
+        }
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return {
+            "status": 0,
+            "type": "connection_error",
+            "message": str(exc),
+        }
+    return {
+        "status": 0,
+        "type": "unknown_error",
+        "message": str(exc),
+    }
+
+
+def _should_fallback_to_openai(exc: Exception) -> bool:
+    if not _ai_fallback_enabled():
+        return False
+    if isinstance(exc, (json.JSONDecodeError, ValueError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (502, 503, 504, 429) or exc.status_code >= 500
+    return isinstance(exc, (APIConnectionError, APITimeoutError))
+
+
+def _normalize_rfq_extracted_item(part_no: str, brand: str, qty: int) -> dict:
+    """Strip duplicated brand prefixes from Copilot/OpenAI RFQ rows."""
+    try:
+        from inquiry_extraction_helper import (
+            looks_like_burkert_article_id,
+            normalize_burkert_part_from_ocr,
+            normalize_inquiry_item,
+        )
+
+        brand, part_no = normalize_inquiry_item(brand, part_no)
+        if brand in ("UNKNOWN", "BURKERT") or looks_like_burkert_article_id(part_no):
+            corrected = normalize_burkert_part_from_ocr(part_no)
+            if corrected != part_no:
+                print(f"[RFQ] Burkert OCR correction: {part_no} → {corrected}")
+                part_no = corrected
+            if brand == "UNKNOWN" and looks_like_burkert_article_id(part_no):
+                brand = "BURKERT"
+    except Exception:
+        brand = str(brand or "UNKNOWN").strip().upper()
+        part_no = str(part_no or "").strip().upper()
+    return {"part_no": part_no, "qty": int(qty), "brand": brand}
+
+
+def _postprocess_extracted_items(items: list, caption: str, image_path: str = "") -> list:
+    """Apply caption qty hints, Burkert OCR fixes, and junk recovery after AI extraction."""
+    if not items and not image_path:
+        return items
+    try:
+        from inquiry_extraction_helper import (
+            apply_caption_qty_to_items,
+            filter_copilot_rfq_items,
+            looks_like_burkert_article_id,
+            normalize_burkert_part_from_ocr,
+            normalize_qty_caption_text,
+            reconcile_burkert_items_from_ocr,
+            reconcile_items_from_ocr,
+        )
+    except ImportError:
+        return items
+
+    caption = normalize_qty_caption_text(caption)
+    items = filter_copilot_rfq_items(items)
+    items = reconcile_items_from_ocr(items, image_path=image_path, caption=caption)
+    items = reconcile_burkert_items_from_ocr(items, image_path=image_path, caption=caption)
+    items = apply_caption_qty_to_items(items, caption)
+    for item in items:
+        part_no = str(item.get("part_no") or "").strip().upper()
+        brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+        if brand in ("UNKNOWN", "BURKERT") or looks_like_burkert_article_id(part_no):
+            corrected = normalize_burkert_part_from_ocr(part_no)
+            if corrected != part_no:
+                print(f"[RFQ] Burkert OCR correction: {part_no} → {corrected}")
+                item["part_no"] = corrected
+            if brand == "UNKNOWN" and looks_like_burkert_article_id(item["part_no"]):
+                item["brand"] = "BURKERT"
+    return items
+
+
+def _parse_rfq_json_array(raw_content: str, image_path: str = None) -> list:
+    raw_content = str(raw_content or "").strip()
+    if raw_content.startswith("```"):
+        lines = raw_content.splitlines()
+        raw_content = "\n".join(lines[1:-1]).strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", raw_content)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                parsed = None
+        if parsed is None:
+            print("[WARN] Copilot returned non-JSON prose — treating as no parts found")
+            return []
+    if not isinstance(parsed, list):
+        raise ValueError("AI response must be a JSON array")
+
+    extracted_items = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        part_no = str(item.get("part_no") or "").strip().upper()
+        try:
+            qty = int(item.get("qty"))
+        except (TypeError, ValueError):
+            continue
+        if part_no and qty > 0:
+            brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+            product_type = str(item.get("product_type") or "").strip()
+            if image_path and not product_type:
+                print(
+                    f"[WARN] Visual extraction missing product_type for {part_no!r} — rejected"
+                )
+                continue
+            if image_path and not _visual_part_consistent(part_no, brand, product_type):
+                continue
+            extracted_items.append(_normalize_rfq_extracted_item(part_no, brand, qty))
+    return extracted_items
+
+
+def _build_rfq_user_content(raw_email_body: str, image_path: str = None):
+    user_text = (
+        "Identify every industrial part in THIS customer message only. "
+        "Read only the attached photo and caption below — ignore all prior chat context. "
+        f"Customer caption/text:\n{raw_email_body or '(none)'}"
+    )
+    if not image_path:
+        return user_text
+
+    with open(image_path, "rb") as image_file:
+        image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+    mime = mimetypes.guess_type(image_path)[0] or "image/png"
+    return [
+        {"type": "text", "text": user_text},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime};base64,{image_b64}",
+                "detail": "high",
+            },
+        },
+    ]
+
+
+def _build_ocr_copilot_user_content(raw_email_body: str, ocr_payload: dict) -> str:
+    from local_ocr import ocr_payload_to_json
+
+    return (
+        "The customer sent a product label/nameplate photo. "
+        "Local OCR extracted the printed text below as JSON. "
+        "Use ONLY this OCR output and the customer caption — do not invent part numbers.\n\n"
+        f"Customer caption/text:\n{raw_email_body or '(none)'}\n\n"
+        f"OCR result (JSON):\n{ocr_payload_to_json(ocr_payload)}"
+    )
+
+
+def _call_copilot_rfq(
+    client: OpenAI,
+    system_instruction: str,
+    user_content,
+    parse_image_path: str = None,
+) -> list:
+    max_attempts = max(1, int(os.getenv("COPILOT_RFQ_RETRIES", "3")))
+    last_exc = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model=COPILOT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            raw_content = (response.choices[0].message.content or "").strip()
+            print(f"[COPILOT RAW] {raw_content}")
+            if re.search(
+                r"please upload|no product photo|without the actual image|cannot extract manufacturer",
+                raw_content,
+                flags=re.I,
+            ) and parse_image_path is None:
+                print("[WARN] Copilot asked for photos on text-only route — ignoring placeholder reply")
+                items = _parse_rfq_json_array(raw_content, image_path=parse_image_path)
+                try:
+                    from inquiry_extraction_helper import is_copilot_prompt_example_hallucination
+
+                    if is_copilot_prompt_example_hallucination(items):
+                        return []
+                except ImportError:
+                    pass
+                if items and re.search(r"please upload|no product photo", raw_content, flags=re.I):
+                    return []
+                return items
+            return _parse_rfq_json_array(raw_content, image_path=parse_image_path)
+        except APIStatusError as exc:
+            last_exc = exc
+            if exc.status_code in (502, 503, 504, 429) and attempt < max_attempts:
+                wait_s = min(8, 2 * attempt)
+                print(
+                    f"[WARN] Copilot HTTP {exc.status_code} on attempt {attempt}/{max_attempts}; "
+                    f"retrying in {wait_s}s..."
+                )
+                time.sleep(wait_s)
+                continue
+            raise
+        except (APIConnectionError, APITimeoutError) as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                wait_s = min(8, 2 * attempt)
+                print(
+                    f"[WARN] Copilot connection error on attempt {attempt}/{max_attempts}; "
+                    f"retrying in {wait_s}s..."
+                )
+                time.sleep(wait_s)
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    return []
+
+
+def _log_ocr_payload(ocr_payload: dict):
+    full_text = str(ocr_payload.get("full_text") or "").strip()
+    lines = ocr_payload.get("lines") or []
+    print(f"[OCR] Detected {len(lines)} line(s), {len(full_text)} chars")
+    if full_text:
+        preview = full_text if len(full_text) <= 500 else full_text[:500] + "..."
+        print(f"[OCR] full_text:\n{preview}")
 
 
 def _normalize_part_key(part_no: str) -> str:
@@ -69,107 +417,322 @@ def _visual_part_consistent(part_no: str, brand: str, product_type: str) -> bool
 
 def extract_rfq_with_copilot(raw_email_body: str = "", image_path: str = None) -> list:
     """Extract RFQ items from text and/or an image through the local Copilot proxy."""
-    if not str(raw_email_body or "").strip() and not image_path:
-        return []
+    result = unified_analyze(raw_email_body, image_path=image_path)
+    return result.get("items") or []
 
-    print("[API READ] Sending raw data payload to local Copilot server...")
+
+def _extract_rfq_with_copilot_only(raw_email_body: str = "", image_path: str = None) -> dict:
+    """
+    Copilot text-only extraction. Images never go to Copilot vision — only
+    local OCR text is sent. If OCR fails, raises OcrFallbackRequired.
+
+    Exception: quotation document photos route to Copilot vision first.
+    """
+    if not str(raw_email_body or "").strip() and not image_path:
+        return {"items": [], "route": "none", "ocr_used": False}
+
+    if image_path:
+        try:
+            from quotation_image_extractor import try_extract_quotation_image
+
+            quotation_result = try_extract_quotation_image(image_path, raw_email_body)
+            if quotation_result and quotation_result.get("items"):
+                return quotation_result
+        except Exception as exc:
+            print(f"[QUOTATION VISION] Route error (continuing to label OCR): {exc}")
+
+    from local_ocr import extract_text_from_image, has_usable_ocr_text, ocr_enabled
+
+    print("[API READ] Sending text payload to local Copilot server...")
     client = OpenAI(
         base_url=COPILOT_BASE_URL,
         api_key=os.getenv("COPILOT_API_KEY", "local-copilot-proxy"),
         timeout=30.0,
         max_retries=1,
     )
-    system_instruction = (
-        "You are an industrial automation data extraction assistant. "
-        "Visually inspect the provided industrial product photo, label, nameplate, barcode sticker, "
-        "and/or customer text. Extract EVERY distinct manufacturer part number visible. "
-        "Read printed model/order codes exactly as shown on the label/nameplate in THIS photo only. "
-        "Read character-by-character; do not substitute a different catalog number. "
-        "OMRON proximity sensors use E2E- (example E2E-X5E1). OMRON temperature controllers use E5CC-/E5CN-. "
-        "If the label says PROXIMITY SENSOR or shows E2E-, never return E5CC/E5CN. "
-        "Match the brand field to the visible manufacturer logo (OMRON, SMC, etc.). "
-        "Never reuse a part number from chat history or from a different message. "
-        "If multiple labelled products appear in one photo, return one JSON object per distinct part number. "
-        "For relays, solenoids, coils, and power products, voltage and AC/DC are mandatory: "
-        "include them in 'part_no' exactly as shown (for example 'MY2N-GS-R 24VDC'). "
-        "Never substitute another voltage variant. "
-        "Use customer caption for quantity hints: 'Quote 2 pcs' with two visible parts often means qty 1 each; "
-        "a single visible part with '2 pcs' means qty 2. "
-        "Return STRICTLY a raw JSON array of objects with keys 'part_no', 'qty', 'brand', and 'product_type'. "
-        "product_type is the visible product description on the label (example: PROXIMITY SENSOR, LIMIT SWITCH). "
-        "Quantity must be a positive integer. Do not guess missing part numbers. "
-        "If quantity is not visible and caption is absent, use 1. If brand is not visible, use 'UNKNOWN'. "
-        "Do not include markdown, backticks, or conversational text. "
-        'Example: [{"part_no": "E2E-X5E1", "qty": 1, "brand": "OMRON", "product_type": "PROXIMITY SENSOR"}, '
-        '{"part_no": "P36203010#1", "qty": 1, "brand": "SMC", "product_type": "CYLINDER"}]'
-    )
 
     try:
-        user_text = (
-            "Identify every industrial part in THIS customer message only. "
-            "Read only the attached photo and caption below — ignore all prior chat context. "
-            f"Customer caption/text:\n{raw_email_body or '(none)'}"
-        )
-        user_content = user_text
-
         if image_path:
-            with open(image_path, "rb") as image_file:
-                image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-            mime = mimetypes.guess_type(image_path)[0] or "image/png"
-            user_content = [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{image_b64}",
-                        "detail": "high",
-                    },
-                },
-            ]
+            if not ocr_enabled():
+                raise OcrFallbackRequired("ocr_disabled")
 
-        response = client.chat.completions.create(
-            model=COPILOT_MODEL,
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
-            ],
+            ocr_payload = extract_text_from_image(image_path)
+            _log_ocr_payload(ocr_payload)
+            if not has_usable_ocr_text(ocr_payload):
+                reason = str(ocr_payload.get("error") or "no_text_detected")
+                print(f"[OCR] Cannot use Copilot for image ({reason}) — will use OpenAI")
+                raise OcrFallbackRequired(reason, ocr_payload=ocr_payload)
+
+            print(
+                f"[OCR] Extracted {len(ocr_payload.get('lines') or [])} line(s) "
+                f"from {image_path} — routing text-only to Copilot"
+            )
+            items = _call_copilot_rfq(
+                client,
+                _rfq_ocr_system_instruction(ocr_payload),
+                _build_ocr_copilot_user_content(raw_email_body, ocr_payload),
+                parse_image_path=None,
+            )
+            if items:
+                return {"items": items, "route": "ocr_copilot", "ocr_used": True}
+
+            print("[OCR] Copilot found no parts from OCR text — will try OpenAI")
+            raise OcrFallbackRequired(
+                "copilot_no_parts_from_ocr",
+                ocr_used=True,
+                ocr_payload=ocr_payload,
+            )
+
+        items = _call_copilot_rfq(
+            client,
+            _RFQ_SYSTEM_INSTRUCTION,
+            _build_rfq_user_content(raw_email_body, image_path=None),
+            parse_image_path=None,
         )
-        raw_content = (response.choices[0].message.content or "").strip()
-        print(f"[COPILOT RAW] {raw_content}")
-        if raw_content.startswith("```"):
-            lines = raw_content.splitlines()
-            raw_content = "\n".join(lines[1:-1]).strip()
-
-        parsed = json.loads(raw_content)
-        if not isinstance(parsed, list):
-            raise ValueError("Copilot response must be a JSON array")
-
-        extracted_items = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            part_no = str(item.get("part_no") or "").strip().upper()
-            try:
-                qty = int(item.get("qty"))
-            except (TypeError, ValueError):
-                continue
-            if part_no and qty > 0:
-                brand = str(item.get("brand") or "UNKNOWN").strip().upper()
-                product_type = str(item.get("product_type") or "").strip()
-                if image_path and not product_type:
-                    print(
-                        f"[WARN] Visual extraction missing product_type for {part_no!r} — rejected"
-                    )
-                    continue
-                if image_path and not _visual_part_consistent(part_no, brand, product_type):
-                    continue
-                extracted_items.append({"part_no": part_no, "qty": qty, "brand": brand})
-        return extracted_items
+        return {"items": items, "route": "copilot_text", "ocr_used": False}
+    except OcrFallbackRequired:
+        raise
     except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[ERROR] Copilot returned invalid JSON data: {exc}")
+        print(f"[WARN] Copilot returned invalid JSON data: {exc}")
+        return {"items": [], "route": "copilot_text", "ocr_used": False}
     except Exception as exc:
         print(f"[ERROR] Failed to communicate with local Copilot server: {exc}")
-    return []
+        raise
+
+
+def _extract_rfq_with_openai_from_ocr(raw_email_body: str, ocr_payload: dict) -> list:
+    """Parse OCR JSON with OpenAI text when Copilot could not."""
+    from local_ocr import has_usable_ocr_text
+
+    if not _ai_fallback_enabled() or not has_usable_ocr_text(ocr_payload):
+        return []
+
+    print("[FALLBACK] Trying OpenAI text on OCR output...")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=45.0, max_retries=1)
+    response = client.chat.completions.create(
+        model=OPENAI_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": _rfq_ocr_system_instruction(ocr_payload)},
+            {
+                "role": "user",
+                "content": _build_ocr_copilot_user_content(raw_email_body, ocr_payload),
+            },
+        ],
+        temperature=0.1,
+    )
+    raw_content = (response.choices[0].message.content or "").strip()
+    print(f"[OPENAI OCR RAW] {raw_content}")
+    return _parse_rfq_json_array(raw_content, image_path=None)
+
+
+def _extract_rfq_with_openai_vision(raw_email_body: str, image_path: str) -> list:
+    from image_inquiry_analyzer import analyze_inquiry_image
+
+    print("[FALLBACK] Trying OpenAI vision on image...")
+    analysis = analyze_inquiry_image(image_path, caption_text=raw_email_body or "")
+    items = []
+    for item in analysis.get("items") or []:
+        part_no = str(item.get("part_no") or "").strip().upper()
+        try:
+            qty = int(item.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        if part_no and qty > 0:
+            brand = str(item.get("brand") or "UNKNOWN").strip().upper()
+            items.append(_normalize_rfq_extracted_item(part_no, brand, qty))
+    return items
+
+
+def _extract_rfq_with_openai(raw_email_body: str = "", image_path: str = None) -> list:
+    """OpenAI fallback when Copilot proxy is unavailable."""
+    if not _ai_fallback_enabled():
+        return []
+
+    if image_path:
+        return _extract_rfq_with_openai_vision(raw_email_body, image_path)
+
+    if not str(raw_email_body or "").strip():
+        return []
+
+    print("[FALLBACK] Copilot unavailable — trying OpenAI text extraction...")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=45.0, max_retries=1)
+    response = client.chat.completions.create(
+        model=OPENAI_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": _RFQ_SYSTEM_INSTRUCTION},
+            {"role": "user", "content": _build_rfq_user_content(raw_email_body, image_path=None)},
+        ],
+        temperature=0.1,
+    )
+    raw_content = (response.choices[0].message.content or "").strip()
+    print(f"[OPENAI RAW] {raw_content}")
+    return _parse_rfq_json_array(raw_content, image_path=None)
+
+
+def unified_analyze(raw_email_body: str = "", image_path: str = None) -> dict:
+    """
+    Unified RFQ extraction:
+      1. Image → local OCR → Copilot text (primary)
+      2. Image OCR fail/empty → OpenAI vision (no Copilot vision)
+      3. Text-only → Copilot text
+      4. Copilot down → OpenAI fallback
+    """
+    try:
+        from inquiry_extraction_helper import normalize_qty_caption_text
+
+        raw_email_body = normalize_qty_caption_text(raw_email_body)
+    except ImportError:
+        pass
+
+    if not str(raw_email_body or "").strip() and not image_path:
+        return {
+            "items": [],
+            "source": "none",
+            "route": "none",
+            "ocr_used": False,
+            "copilot_failed": False,
+            "fallback_used": False,
+            "error": None,
+        }
+
+    copilot_error = None
+    copilot_exc = None
+    copilot_route = "none"
+    ocr_used = False
+    try:
+        copilot_result = _extract_rfq_with_copilot_only(raw_email_body, image_path=image_path)
+        items = copilot_result.get("items") or []
+        copilot_route = copilot_result.get("route") or "copilot"
+        ocr_used = bool(copilot_result.get("ocr_used"))
+        items = _postprocess_extracted_items(items, raw_email_body, image_path=image_path)
+        return {
+            "items": items,
+            "source": "copilot" if items else "none",
+            "route": copilot_route,
+            "ocr_used": ocr_used,
+            "copilot_failed": False,
+            "fallback_used": False,
+            "error": None,
+        }
+    except OcrFallbackRequired as ocr_exc:
+        ocr_used = bool(ocr_exc.ocr_used)
+        ocr_payload = ocr_exc.ocr_payload or {}
+        print(f"[OCR] Routing image inquiry to OpenAI ({ocr_exc.reason})")
+        if not _ai_fallback_enabled():
+            return {
+                "items": [],
+                "source": "none",
+                "route": "ocr_openai_skipped",
+                "ocr_used": ocr_used,
+                "copilot_failed": False,
+                "fallback_used": False,
+                "error": {"type": "ocr_fallback", "message": ocr_exc.reason, "status": 0},
+            }
+        try:
+            from local_ocr import has_usable_ocr_text
+
+            items = []
+            route = "openai_failed"
+            if has_usable_ocr_text(ocr_payload):
+                items = _extract_rfq_with_openai_from_ocr(raw_email_body, ocr_payload)
+                if items:
+                    route = "openai_text_ocr_fallback"
+            if not items and image_path:
+                items = _extract_rfq_with_openai_vision(raw_email_body, image_path)
+                if items:
+                    route = "openai_vision_ocr_fallback"
+            items = _postprocess_extracted_items(items, raw_email_body, image_path=image_path)
+            return {
+                "items": items,
+                "source": "openai" if items else "none",
+                "route": route,
+                "ocr_used": ocr_used,
+                "copilot_failed": False,
+                "fallback_used": True,
+                "error": {"type": "ocr_fallback", "message": ocr_exc.reason, "status": 0},
+            }
+        except Exception as fallback_exc:
+            print(f"[ERROR] OpenAI vision after OCR fallback failed: {fallback_exc}")
+            return {
+                "items": [],
+                "source": "none",
+                "route": "openai_failed",
+                "ocr_used": ocr_used,
+                "copilot_failed": False,
+                "fallback_used": True,
+                "error": {"type": "ocr_fallback", "message": str(fallback_exc), "status": 0},
+            }
+    except Exception as exc:
+        copilot_exc = exc
+        copilot_error = _copilot_error_details(exc)
+        print(
+            f"[WARN] Copilot unified_analyze failed "
+            f"(status={copilot_error['status']}, type={copilot_error['type']})"
+        )
+
+    if not _should_fallback_to_openai(copilot_exc):
+        return {
+            "items": [],
+            "source": "none",
+            "route": copilot_route,
+            "ocr_used": ocr_used,
+            "copilot_failed": True,
+            "fallback_used": False,
+            "error": copilot_error,
+        }
+
+    try:
+        items = _extract_rfq_with_openai(raw_email_body, image_path=image_path)
+        items = _postprocess_extracted_items(items, raw_email_body, image_path=image_path)
+        return {
+            "items": items,
+            "source": "openai" if items else "none",
+            "route": "openai_vision" if image_path else "openai_text",
+            "ocr_used": ocr_used,
+            "copilot_failed": True,
+            "fallback_used": True,
+            "error": copilot_error,
+        }
+    except Exception as fallback_exc:
+        print(f"[ERROR] OpenAI fallback failed: {fallback_exc}")
+        return {
+            "items": [],
+            "source": "none",
+            "route": "openai_failed",
+            "ocr_used": ocr_used,
+            "copilot_failed": True,
+            "fallback_used": True,
+            "error": copilot_error,
+        }
+
+
+def build_copilot_malfunction_alert(
+    operation: str,
+    customer_name: str,
+    error: dict,
+    caption: str = "",
+    original_message: str = "",
+) -> str:
+    """Build a monitor alert when Copilot fails during unified_analyze."""
+    lines = [
+        "[OpenClaw Copilot Malfunction] Please Check",
+        "",
+        f"Operation: {operation}",
+        f"Customer: {customer_name or '-'}",
+    ]
+    if error:
+        status = error.get("status")
+        if status:
+            lines.append(f"HTTP status: {status}")
+        lines.append(f"Error: {error.get('message') or error}")
+    if caption:
+        lines.extend(["", f"Caption: {caption}"])
+    lines.extend([
+        "──────────────────────────────",
+        "Original Message",
+        original_message or "(empty)",
+    ])
+    return "\n".join(lines)
 
 
 def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
@@ -191,13 +754,18 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
     )
     prompt = (
         f"Research the industrial automation part {part_no}"
-        f"{f' by {brand}' if brand and brand != 'UNKNOWN' else ''}.\n"
+        f"{f' by {brand}' if brand and brand != 'UNKNOWN' else ''}.\n\n"
+        "IS THIS ITEM OBSOLETE? Search current catalogs, EOL notices, and distributor "
+        "cross-reference data.\n"
+        "If obsolete or discontinued, state the official manufacturer replacement "
+        "article number(s) (e.g. Bürkert 00221858 replacing 00134328).\n\n"
         "Write a concise technical summary suitable for a sales quotation reply.\n"
         "Include:\n"
+        "- Obsolete status (yes/no) and recommended replacement part number if obsolete\n"
         "- One-sentence product description\n"
         "- Main specifications as short bullet points\n"
         "- Typical applications (one short bullet list)\n"
-        "Keep the answer under 180 words. Plain text only. No markdown code fences."
+        "Keep the answer under 220 words. Plain text only. No markdown code fences."
     )
     try:
         response = client.chat.completions.create(
@@ -226,6 +794,11 @@ def research_part_with_copilot(part_no: str, brand: str = "UNKNOWN") -> str:
 
 def build_ai_research_summary(formatted_rows):
     """Build Copilot research notes for the unique customer parts in a quote."""
+    try:
+        from inquiry_extraction_helper import sanitize_whatsapp_outbound_text
+    except ImportError:
+        sanitize_whatsapp_outbound_text = lambda text: str(text or "")
+
     sections = []
     seen = set()
     for row in formatted_rows or []:
@@ -233,11 +806,17 @@ def build_ai_research_summary(formatted_rows):
         if not part_no or part_no in seen:
             continue
         seen.add(part_no)
+
+        obsolete_research = str(row.get("obsolete_research") or "").strip()
+        if obsolete_research:
+            sections.append(obsolete_research)
+            continue
+
         brand = str(row.get("brand") or "UNKNOWN").strip().upper()
         notes = research_part_with_copilot(part_no, brand)
         if notes:
-            sections.append(f"{part_no}\n{notes}")
-    return "\n\n".join(sections)
+            sections.append(f"{part_no}\n{sanitize_whatsapp_outbound_text(notes)}")
+    return sanitize_whatsapp_outbound_text("\n\n".join(sections))
 
 
 def run_process(name, script):
@@ -273,6 +852,11 @@ def main():
 
     email_proc = run_process("Email Engine (auto_claw)", EMAIL_SCRIPT)
     wa_proc = run_process("WhatsApp Engine", WHATSAPP_SCRIPT)
+    purchasing_proc = None
+    if os.getenv("OPENCLAW_PURCHASING_WHATSAPP_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    ):
+        purchasing_proc = run_process("Purchasing WhatsApp Watcher", PURCHASING_WHATSAPP_SCRIPT)
 
     try:
         while True:
@@ -286,11 +870,19 @@ def main():
                 print("❌ WhatsApp engine stopped. Restarting...")
                 wa_proc = run_process("WhatsApp Engine", WHATSAPP_SCRIPT)
 
+            if purchasing_proc is not None and purchasing_proc.poll() is not None:
+                print("❌ Purchasing WhatsApp watcher stopped. Restarting...")
+                purchasing_proc = run_process(
+                    "Purchasing WhatsApp Watcher", PURCHASING_WHATSAPP_SCRIPT
+                )
+
     except KeyboardInterrupt:
         print("\n🛑 Stopping all services...")
 
         stop_process(email_proc, "Email Engine")
         stop_process(wa_proc, "WhatsApp Engine")
+        if purchasing_proc is not None:
+            stop_process(purchasing_proc, "Purchasing WhatsApp Watcher")
 
         print("✅ All stopped.")
 

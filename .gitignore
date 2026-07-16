@@ -16,6 +16,7 @@ logs/
 # Secrets and credentials
 .env
 o365_token.txt
+supplier_whatsapp_numbers.json
 
 # macOS
 .DS_Store
@@ -23,7 +24,23 @@ o365_token.txt
 # Browser session profiles (WhatsApp Web)
 chrome_whatsapp_profile/
 chrome_whatsapp_profile_backup_*/
+chrome_purchasing_whatsapp_profile/
+chrome_smc_profile/
 wa_profile_019/
+
+# Runtime state and caches
+.openclaw_smc_portal_cache.json
+openclaw_channel_turn.flag
+whatsapp_last_processed.json
+*.openclaw_burkert_cache.pkl
+.openclaw_markem_imaje_cache_*.pkl
+parker_price_list.db
+WA_Image/
+Parker Price List/
+Markem-Imaje Price List*.xlsx
+
+# Local price lists / spreadsheets
+*.xlsm
 
 # Nested git metadata (Windows-Copilot-API tracked as plain files)
 Windows-Copilot-API/.git/
