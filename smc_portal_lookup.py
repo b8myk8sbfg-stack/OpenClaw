@@ -462,8 +462,45 @@ def get_driver(force_new: bool = False) -> webdriver.Chrome:
     return _DRIVER
 
 
-def close_driver() -> None:
+def portal_logout(driver) -> bool:
+    """Click SMC portal 'Log off' when ending a manual session."""
+    if not _page_looks_logged_in(driver):
+        return False
+    try:
+        clicked = driver.execute_script(
+            """
+            const nodes = document.querySelectorAll('a, button, [role=link]');
+            for (const el of nodes) {
+                const label = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+                if (label === 'log off' || label === 'logout' || label === 'log out') {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+            """
+        )
+        if clicked:
+            time.sleep(2)
+            print("🔓 [SMC] Logged off dealer portal.")
+            return True
+    except Exception as exc:
+        print(f"⚠️ [SMC] Log off click failed: {exc}")
+    return False
+
+
+def close_driver(logout: bool | None = None) -> None:
     global _DRIVER, _SESSION_READY
+    should_logout = logout
+    if should_logout is None:
+        should_logout = os.getenv("SMC_PORTAL_LOGOUT_ON_CLOSE", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    if _DRIVER is not None and should_logout:
+        try:
+            portal_logout(_DRIVER)
+        except Exception:
+            pass
     if _DRIVER is not None:
         try:
             _DRIVER.quit()

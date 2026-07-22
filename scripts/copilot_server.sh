@@ -14,6 +14,11 @@ COPILOT_HEALTH_ATTEMPTS="${COPILOT_HEALTH_ATTEMPTS:-24}"
 COPILOT_HEALTH_INTERVAL="${COPILOT_HEALTH_INTERVAL:-5}"
 COPILOT_RECOVERY_COOLDOWN="${COPILOT_RECOVERY_COOLDOWN:-900}"
 COPILOT_LAST_RECOVERY_FILE="${COPILOT_LAST_RECOVERY_FILE:-$LOG_DIR/copilot_last_recovery.ts}"
+COPILOT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COPILOT_LAUNCH_LABEL="${COPILOT_LAUNCH_LABEL:-com.openclaw.copilot-server}"
+COPILOT_PLIST_SRC="${COPILOT_PLIST_SRC:-$COPILOT_SCRIPT_DIR/com.openclaw.copilot-server.plist}"
+COPILOT_PLIST_DST="${COPILOT_PLIST_DST:-$HOME/Library/LaunchAgents/com.openclaw.copilot-server.plist}"
+COPILOT_RUN_SCRIPT="${COPILOT_RUN_SCRIPT:-$COPILOT_SCRIPT_DIR/run_copilot_server.sh}"
 
 # macOS ships /usr/bin/log — define our own so sourced calls don't hit the system tool.
 log() {
@@ -99,8 +104,135 @@ copilot_mark_recovery() {
     date +%s > "$COPILOT_LAST_RECOVERY_FILE"
 }
 
+copilot_launchd_domain() {
+    echo "gui/$(id -u)"
+}
+
+copilot_launchd_target() {
+    echo "$(copilot_launchd_domain)/$COPILOT_LAUNCH_LABEL"
+}
+
+copilot_launchd_loaded() {
+    launchctl print "$(copilot_launchd_target)" >/dev/null 2>&1
+}
+
+copilot_record_pid_from_port() {
+    local pid
+    pid="$(lsof -tiTCP:"$COPILOT_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+    if [[ -n "$pid" ]]; then
+        echo "$pid" > "$COPILOT_PID_FILE"
+    fi
+}
+
+copilot_install_launch_agent() {
+    if [[ ! -f "$COPILOT_PLIST_SRC" ]]; then
+        log "WARN: missing LaunchAgent plist: $COPILOT_PLIST_SRC"
+        return 1
+    fi
+
+    mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+    chmod +x "$COPILOT_RUN_SCRIPT" 2>/dev/null || true
+    cp "$COPILOT_PLIST_SRC" "$COPILOT_PLIST_DST"
+
+    if copilot_launchd_loaded; then
+        return 0
+    fi
+
+    launchctl bootstrap "$(copilot_launchd_domain)" "$COPILOT_PLIST_DST" 2>/dev/null || \
+        launchctl load "$COPILOT_PLIST_DST"
+}
+
+copilot_unload_launch_agent() {
+    if [[ ! -f "$COPILOT_PLIST_DST" ]] && ! copilot_launchd_loaded; then
+        return 0
+    fi
+
+    launchctl bootout "$(copilot_launchd_target)" 2>/dev/null || \
+        launchctl unload "$COPILOT_PLIST_DST" 2>/dev/null || true
+}
+
+copilot_start_launch_agent() {
+    if ! copilot_install_launch_agent; then
+        return 1
+    fi
+
+    launchctl kickstart -k "$(copilot_launchd_target)" 2>/dev/null || true
+    return 0
+}
+
+copilot_session_present() {
+    [[ -f "$COPILOT_DIR/session/token.json" && -d "$COPILOT_DIR/session/profile" ]]
+}
+
+copilot_needs_clearance_refresh() {
+    copilot_models_reachable && ! copilot_chat_ok
+}
+
+# Re-earn Cloudflare clearance using the saved browser profile (no session wipe).
+copilot_refresh_clearance() {
+    local python_bin refresh_log
+    python_bin="$(resolve_copilot_python || true)"
+    refresh_log="${COPILOT_CLEARANCE_LOG:-$LOG_DIR/copilot_clearance_refresh.log}"
+
+    if [[ -z "$python_bin" ]]; then
+        log "ERROR: no Python with fastapi found for Copilot clearance refresh"
+        return 1
+    fi
+
+    if ! copilot_session_present; then
+        log "ERROR: no saved Copilot session at ${COPILOT_DIR}/session/"
+        log "ERROR: run once manually: cd ${COPILOT_DIR} && ./venv/bin/python -m copilot login"
+        return 1
+    fi
+
+    mkdir -p "$LOG_DIR"
+    log "Refreshing Cloudflare clearance (keeping saved login session)..."
+
+    copilot_stop_server || true
+    sleep 1
+
+    log "Step 1/3: copilot login (cached sign-in + warm-up)..."
+    if ! (
+        cd "$COPILOT_DIR"
+        "$python_bin" -m copilot login
+    ) >> "$refresh_log" 2>&1; then
+        log "ERROR: copilot login failed — see $refresh_log"
+        tail -5 "$refresh_log" | while IFS= read -r line; do log "  $line"; done
+        return 1
+    fi
+
+    log "Step 2/3: copilot ask verification probe..."
+    if ! (
+        cd "$COPILOT_DIR"
+        "$python_bin" -m copilot ask "Reply: ok"
+    ) >> "$refresh_log" 2>&1; then
+        log "ERROR: copilot ask failed after login — see $refresh_log"
+        tail -8 "$refresh_log" | while IFS= read -r line; do log "  $line"; done
+        return 1
+    fi
+
+    log "Step 3/3: restarting Copilot server..."
+    if ! copilot_start_server; then
+        return 1
+    fi
+
+    sleep 2
+    if copilot_chat_ok; then
+        log "Cloudflare clearance refresh succeeded — chat probe OK"
+        copilot_mark_recovery
+        return 0
+    fi
+
+    local chat_status
+    chat_status="$(copilot_chat_status)"
+    log "WARN: clearance refresh finished but chat probe returned HTTP $chat_status"
+    return 1
+}
+
 copilot_stop_server() {
     log "Stopping Copilot server..."
+
+    copilot_unload_launch_agent
 
     if [[ -f "$COPILOT_PID_FILE" ]]; then
         local pid
@@ -142,6 +274,26 @@ copilot_stop_server() {
     return 0
 }
 
+# Start Copilot in a new session so it survives LaunchAgent watchdog/recovery exit.
+# Plain `nohup ... &` from a short-lived launchd job is killed when the job finishes.
+copilot_launch_detached() {
+    local python_bin="$1"
+    local pid
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$python_bin" main.py >> "$COPILOT_LOG" 2>&1 </dev/null &
+        pid=$!
+    else
+        # bash -c + exec keeps one PID (stored in copilot_server.pid).
+        nohup bash -c "cd \"$COPILOT_DIR\" && exec \"$python_bin\" main.py" \
+            >> "$COPILOT_LOG" 2>&1 </dev/null &
+        pid=$!
+    fi
+
+    disown -h "$pid" 2>/dev/null || disown "$pid" 2>/dev/null || true
+    echo "$pid"
+}
+
 copilot_start_server() {
     local python_bin
     python_bin="$(resolve_copilot_python || true)"
@@ -162,12 +314,30 @@ copilot_start_server() {
     fi
 
     mkdir -p "$LOG_DIR"
-    log "Starting Copilot server with: $python_bin"
-    cd "$COPILOT_DIR"
-    nohup "$python_bin" main.py >> "$COPILOT_LOG" 2>&1 &
-    local pid=$!
+
+    if [[ -f "$COPILOT_PLIST_SRC" ]]; then
+        log "Starting Copilot server via LaunchAgent (KeepAlive)..."
+        if ! copilot_start_launch_agent; then
+            log "WARN: LaunchAgent start failed — falling back to detached process"
+        else
+            local i
+            for ((i = 1; i <= 20; i++)); do
+                sleep 1
+                if copilot_port_listening; then
+                    copilot_record_pid_from_port
+                    log "Copilot LaunchAgent listening on ${COPILOT_BASE_URL}"
+                    return 0
+                fi
+            done
+            log "WARN: LaunchAgent started but port $COPILOT_PORT not ready within 20s"
+        fi
+    fi
+
+    log "Starting Copilot server (detached fallback) with: $python_bin"
+    local pid
+    pid="$(copilot_launch_detached "$python_bin")"
     echo "$pid" > "$COPILOT_PID_FILE"
-    log "Copilot launcher PID $pid (log: $COPILOT_LOG)"
+    log "Copilot detached PID $pid (log: $COPILOT_LOG)"
 
     local i
     for ((i = 1; i <= 6; i++)); do
@@ -259,7 +429,18 @@ copilot_wait_until_models() {
 
 # Restart Copilot only — leaves OpenClaw and WhatsApp Chrome running.
 copilot_light_restart() {
-    if copilot_models_reachable; then
+    if copilot_models_reachable && copilot_chat_ok; then
+        log "Copilot already healthy; skipping light restart"
+        return 0
+    fi
+
+    if copilot_needs_clearance_refresh; then
+        log "Copilot /v1/models OK but chat failing — trying clearance refresh first"
+        if copilot_refresh_clearance; then
+            return 0
+        fi
+        log "Clearance refresh failed — falling back to process restart"
+    elif copilot_models_reachable; then
         log "Copilot models already reachable; skipping light restart"
         return 0
     fi
@@ -274,10 +455,22 @@ copilot_light_restart() {
 }
 
 copilot_restart_and_wait() {
-    if copilot_server_reachable; then
+    if copilot_server_reachable && copilot_chat_ok; then
+        log "Copilot already healthy; skipping restart"
+        return 0
+    fi
+
+    if copilot_needs_clearance_refresh; then
+        log "Copilot reachable but chat unhealthy — trying clearance refresh"
+        if copilot_refresh_clearance; then
+            return 0
+        fi
+        log "Clearance refresh failed — restarting Copilot process"
+    elif copilot_server_reachable; then
         log "Copilot already reachable; skipping restart"
         return 0
     fi
+
     copilot_stop_server || true
     sleep 2
     if ! copilot_start_server; then

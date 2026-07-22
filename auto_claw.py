@@ -17,7 +17,7 @@ from obm_quotation_helper import (
     all_items_ready_for_obm,
     create_obm_quotation_from_inquiry,
 )
-from channel_router import is_external_supplier, send_supplier_email
+from channel_router import is_external_supplier, send_supplier_rfq
 from supplier_rfq_pricing import (
     calc_customer_unit_price,
     parse_supplier_reply_items,
@@ -38,6 +38,7 @@ from openclaw_main import unified_analyze
 from openclaw_log import enable_timestamped_logging
 from openclaw_inquiry_engine import (
     resolve_warehouse_match,
+    infer_brand_from_part,
     _try_smc_portal_row,
     _try_burkert_price_list_row,
     _try_markem_imaje_price_list_row,
@@ -2056,6 +2057,10 @@ def process_latest_inquiry():
                     brand = str(missing.get("brand") or "UNKNOWN").strip().upper()
                     part_no = missing["part_no"]
                     brand, part_no = normalize_inquiry_item(brand, part_no)
+                    if brand == "UNKNOWN":
+                        inferred = infer_brand_from_part(part_no)
+                        if inferred != "UNKNOWN":
+                            brand = inferred
                     missing["brand"] = brand
                     missing["part_no"] = part_no
                     desc = missing.get("desc") or format_inquiry_description(brand, part_no)
@@ -2274,19 +2279,24 @@ def process_latest_inquiry():
                         supplier_email = get_routing_email(brd)
 
                         if is_external_supplier(brd):
-                            send_supplier_email(
+                            result = send_supplier_rfq(
+                                None,
                                 brd,
                                 items,
                                 ref,
                                 customer_name=c_name,
                                 customer_contact=c_email or c_name,
                             )
-                            print(f"📧 External Supplier RFQ Sent")
+                            channel = result.get("channel", "EMAIL")
+                            status = result.get("status", "UNKNOWN")
+                            destination = result.get("to", "")
+                            print(f"📡 External Supplier RFQ — {status}")
                             print(f"   Brand: {brd}")
+                            print(f"   Channel: {channel}")
+                            print(f"   To: {destination or get_routing_email(brd)}")
                             print(f"   Ref: {ref}")
                             print(f"   Customer: {c_name}")
                             print(f"   Customer Email: {c_email}")
-                            print(f"   Internal copy: purchasing@robomatics.sg")
                             for i in items:
                                 print(f"      - {i['desc']} | Qty: {i['qty']}")
                             continue

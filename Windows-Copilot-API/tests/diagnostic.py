@@ -191,7 +191,14 @@ def _snapshot_auth(ctx, page) -> bool:
         raw = ctx.cookies()
     except Exception:  # noqa: BLE001
         return False
-    cookies = {c["name"]: c["value"] for c in raw if "microsoft.com" in c.get("domain", "")}
+    cookies = {}
+    for c in raw:
+        domain = c.get("domain", "")
+        name = c.get("name", "")
+        if not name:
+            continue
+        if "microsoft.com" in domain or name in ("cf_clearance", "__cf_bm", "__cflb"):
+            cookies[name] = c["value"]
     TOKEN_FILE.write_text(
         json.dumps({"cookies": cookies, "access_token": token, "saved_at": time.time()}, indent=2),
         encoding="utf-8",

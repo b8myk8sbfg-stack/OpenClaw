@@ -51,7 +51,8 @@ def main() -> int:
     print(f"User:     {user or '(set SMC_PORTAL_USERNAME or USER_ID in .env)'}")
     print()
     print("Automated flow: Account/Index → SMC Dealer Login → Item Enquiry")
-    print("Press Ctrl+C when done to save session.")
+    print("Press Ctrl+C when done — session saved; portal log off by default on exit.")
+    print("Set SMC_PORTAL_LOGOUT_ON_CLOSE=0 to keep portal logged in.")
     print("=" * 72)
 
     driver = get_driver()
@@ -70,7 +71,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n🛑 Session saved.")
     finally:
-        close_driver()
+        close_driver(logout=True)
     return 0
 
 

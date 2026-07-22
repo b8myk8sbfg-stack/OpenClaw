@@ -28,14 +28,14 @@ class SupplierWhatsappConfigTests(unittest.TestCase):
             self.assertEqual(dest.value, "60111222333")
 
     def test_omron_group_from_env(self):
-        with patch.dict(os.environ, {"OPENCLAW_OMRON_SUPPLIER_WHATSAPP_GROUP": "RoboJ + SKU"}, clear=False):
+        with patch.dict(os.environ, {"OPENCLAW_OMRON_SUPPLIER_WHATSAPP_GROUP": "Robo J + SKU"}, clear=False):
             for key in list(os.environ):
                 if key == "OPENCLAW_OMRON_SUPPLIER_WHATSAPP":
                     del os.environ[key]
             dest = cfg.get_supplier_destination("OMRON")
             self.assertIsNotNone(dest)
             self.assertEqual(dest.kind, "group")
-            self.assertEqual(dest.value, "RoboJ + SKU")
+            self.assertEqual(dest.value, "Robo J + SKU")
 
     def test_festo_phone_from_json(self):
         with patch.object(cfg, "CONFIG_PATH", "/Users/evon/OpenClaw/supplier_whatsapp_numbers.json"):

@@ -1,17 +1,34 @@
-{
-  "purchasing_sender_phone": "60167027683",
-  "purchasing_whatsapp_brands": ["OMRON"],
-  "external_suppliers": {
-    "OMRON": {
-      "type": "group",
-      "name": "RoboJ + SKU"
-    }
-  },
-  "_notes": {
-    "purchasing_sender_phone": "Your purchasing WhatsApp (+60167027683) — log in on chrome_purchasing_whatsapp_profile",
-    "OMRON": "WhatsApp group name — must match exactly as shown in purchasing WhatsApp",
-    "FESTO": "Email via channel_router → siuw@jsautomation.com.my",
-    "PIAB": "Email via channel_router → Ang.SengGuan@piabgroup.com",
-    "add_brands": "WhatsApp brands: add to purchasing_whatsapp_brands and external_suppliers. Email brands: channel_router SUPPLIER_EMAIL_ROUTING"
-  }
-}
+{
+
+  "purchasing_sender_phone": "60167027683",
+
+  "purchasing_whatsapp_brands": ["OMRON"],
+
+  "external_suppliers": {
+
+    "OMRON": {
+
+      "type": "group",
+
+      "name": "Robo J + SKU"
+
+    }
+
+  },
+
+  "_notes": {
+
+    "purchasing_sender_phone": "Your purchasing WhatsApp (+60167027683) — log in on chrome_purchasing_whatsapp_profile",
+
+    "OMRON": "WhatsApp group name — must match exactly as shown in purchasing WhatsApp",
+
+    "FESTO": "Email via channel_router → siuw@jsautomation.com.my",
+
+    "PIAB": "Email via channel_router → Ang.SengGuan@piabgroup.com",
+
+    "add_brands": "WhatsApp brands: add to purchasing_whatsapp_brands and external_suppliers. Email brands: channel_router SUPPLIER_EMAIL_ROUTING"
+
+  }
+
+}
+

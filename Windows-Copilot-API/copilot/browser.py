@@ -757,13 +757,21 @@ class BrowserCopilot:
         return earned
 
     def cookies(self) -> Dict[str, str]:
-        """Return the signed-in Microsoft cookies as a name->value dict."""
+        """Return auth + Cloudflare cookies the HTTP driver must replay."""
         self._ensure_started()
         try:
             raw = self._context.cookies()
         except PlaywrightError:
             return {}
-        return {c["name"]: c["value"] for c in raw if "microsoft.com" in c.get("domain", "")}
+        out: Dict[str, str] = {}
+        for c in raw:
+            domain = c.get("domain", "")
+            name = c.get("name", "")
+            if not name:
+                continue
+            if "microsoft.com" in domain or name in ("cf_clearance", "__cf_bm", "__cflb"):
+                out[name] = c["value"]
+        return out
 
     def export_auth(self, path: str = DEFAULT_AUTH_FILE, stamp: Optional[float] = None) -> dict:
         """Snapshot the signed-in cookies + access token to ``path`` as JSON.

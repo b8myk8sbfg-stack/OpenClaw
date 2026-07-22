@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.copilot-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/evon/OpenClaw/scripts/run_copilot_server.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/evon</string>
+        <key>OPENCLAW_BASE_DIR</key>
+        <string>/Users/evon/OpenClaw</string>
+        <key>PATH</key>
+        <string>/Users/evon/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/Users/evon/OpenClaw/Windows-Copilot-API</string>
+    <key>StandardOutPath</key>
+    <string>/Users/evon/OpenClaw/logs/copilot_server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evon/OpenClaw/logs/copilot_server_stderr.log</string>
+</dict>
+</plist>
