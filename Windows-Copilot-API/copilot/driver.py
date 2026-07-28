@@ -137,7 +137,11 @@ class Copilot(AbstractProvider):
             elif conversation_id is not None:
                 pass  # resume an existing conversation by id; skip create
             else:
-                response = session.post(self.conversation_url)
+                response = session.post(
+                    self.conversation_url,
+                    json={},
+                    headers={"Content-Type": "application/json"},
+                )
                 raise_for_status(response)
                 conversation_id = response.json().get("id")
                 if return_conversation:

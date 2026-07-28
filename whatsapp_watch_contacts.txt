@@ -1,4 +1,4 @@
-# Checked every scan cycle even when the chat is already read.
-# Use 1:1 contact names — not group names (PSHI consignment is a group, not Stephen).
+# Optional: re-check these 1:1 contacts when there are no unread chats (testing/monitor mode).
+# Use ONE canonical name per customer — aliases are resolved via whatsapp_customer_registry.json.
+# Disable entirely with: OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS=0
 Robomatics Stephen
-Stephen

@@ -128,6 +128,40 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def is_whatsapp_business_hours_message(text: str) -> bool:
+    """WhatsApp Business greeting/away/hours cards — not a customer RFQ."""
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return False
+
+    markers = (
+        "we're currently open",
+        "we are currently open",
+        "our business hours are",
+        "business hours are:",
+        "currently closed",
+        "we'll reply as soon as possible",
+        "we will reply as soon as possible",
+    )
+    if any(marker in normalized for marker in markers):
+        return True
+
+    weekday_hits = sum(
+        1
+        for day in (
+            "monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday",
+        )
+        if day in normalized and ("closed" in normalized or "am" in normalized or "pm" in normalized)
+    )
+    return weekday_hits >= 3
+
+
+def is_whatsapp_system_autoreply(text: str) -> bool:
+    """Non-customer WhatsApp system/business auto messages that must never be quoted."""
+    return is_whatsapp_business_hours_message(text)
+
+
 def _guess_media_from_filename(filename: str) -> str:
     name = str(filename or "").strip().lower()
     if not name:
@@ -404,6 +438,16 @@ def _few_shot_examples(limit: int = 8) -> List[Dict[str, str]]:
 
 def _heuristic_intent(message_text: str, media_info: MediaInfo) -> Optional[ClassificationResult]:
     text = f"{message_text or ''} {media_info.filename or ''}".upper()
+
+    if is_whatsapp_system_autoreply(message_text):
+        return ClassificationResult(
+            media_type=media_info.media_type,
+            intent="junk_ad",
+            confidence=0.98,
+            reasoning="WhatsApp Business hours/greeting auto-reply — not a customer inquiry.",
+            media_filename=media_info.filename,
+            handler="skip",
+        )
 
     junk_markers = (
         "UNSUBSCRIBE", "SPECIAL OFFER", "LIMITED TIME", "PROMOTION",

@@ -27,9 +27,17 @@ DEFAULT_TAX_RATE = 0
 DEFAULT_CURRENCY = "RM"
 DEFAULT_STATUS = "W"
 DEFAULT_VALID_DAYS = 30
+DEFAULT_QUOTATION_COUNTER = os.getenv("OBM_QUOTATION_COUNTER", "2").strip() or "2"
 
 SKIP_MISSING_ITEMS = True
+NEW_STOCK_PID = "NEW"
 MANAGER_EMAIL = "stephen@robomatics.sg"
+
+KNOWN_BRANDS_FOR_NEW_PID = {
+    "OMRON", "SMC", "BURKERT", "BÜRKERT", "LEGRIS", "PANASONIC", "PISCO",
+    "THK", "LOCTITE", "KEYENCE", "FESTO", "SICK", "IFM", "PARKER", "ABB", "SIEMENS",
+    "ALLEN BRADLEY", "NITTO KOHKI", "CKD", "KOGANEI", "AIRTAC", "YASKAWA",
+}
 
 
 def now_iso():
@@ -267,6 +275,44 @@ def find_pid(part):
     return None
 
 
+def extract_brand_from_item(item, customer_part=None):
+    brand = str(item.get("brand") or "").strip().upper().replace("BÜRKERT", "BURKERT")
+    if brand and brand != "UNKNOWN":
+        return brand
+
+    desc = str(item.get("desc") or item.get("description") or "").strip().upper()
+    for known in KNOWN_BRANDS_FOR_NEW_PID:
+        known_norm = known.replace("BÜRKERT", "BURKERT")
+        if desc.startswith(f"{known_norm} "):
+            return known_norm
+
+    return ""
+
+
+def should_use_new_stock_pid(item, customer_part=None):
+    """Use OBM placeholder stock NEW for valid known-brand parts not in warehouse."""
+    brand = extract_brand_from_item(item, customer_part)
+    return brand in {b.replace("BÜRKERT", "BURKERT") for b in KNOWN_BRANDS_FOR_NEW_PID}
+
+
+def new_stock_pid_available():
+    return any(row.get("n_pid") == "NEW" or row.get("pid") == NEW_STOCK_PID for row in STOCK)
+
+
+def resolve_stock_pid(part, item=None):
+    pid = find_pid(part)
+    if pid:
+        return pid
+
+    if item and should_use_new_stock_pid(item, part) and new_stock_pid_available():
+        print(
+            f"   ✅ Using {NEW_STOCK_PID} stock code for known-brand part not in warehouse: {part}"
+        )
+        return NEW_STOCK_PID
+
+    return None
+
+
 def parse_price(value):
     if value in [None, "", "[TBC]"]:
         return 0.0
@@ -275,6 +321,42 @@ def parse_price(value):
         return float(str(value).replace(",", "").replace("RM", "").strip())
     except Exception:
         return 0.0
+
+
+def enrich_smc_item_from_portal(clean_item: dict) -> dict:
+    """Fill SMC sell price from dealer portal when email path left price at zero."""
+    brand = str(clean_item.get("brand") or "").upper().replace("BÜRKERT", "BURKERT")
+    if brand != "SMC":
+        return clean_item
+
+    if float(clean_item.get("price") or 0) > 0:
+        return clean_item
+
+    part_no = str(clean_item.get("customer_part") or "").strip()
+    if not part_no:
+        return clean_item
+
+    try:
+        from smc_portal_lookup import lookup_smc_quote
+    except ImportError:
+        print("   ⚠️ [OBM] smc_portal_lookup unavailable — SMC portal enrich skipped.")
+        return clean_item
+
+    print(f"   🔎 [OBM] SMC portal enrich for {part_no} (qty {clean_item.get('qty', 1)})...")
+    quote = lookup_smc_quote(part_no, qty=int(clean_item.get("qty") or 1))
+    if not quote:
+        return clean_item
+
+    portal_price = parse_price(quote.get("price"))
+    if portal_price > 0:
+        clean_item["price"] = portal_price
+        if quote.get("desc"):
+            clean_item["desc"] = quote["desc"]
+        print(f"   ✅ [OBM] SMC portal enrich: {part_no} → RM {portal_price:,.2f}")
+    else:
+        print(f"   ⚠️ [OBM] SMC portal enrich: {part_no} still has no price")
+
+    return clean_item
 
 
 def clean_item_for_obm(item):
@@ -290,11 +372,16 @@ def clean_item_for_obm(item):
 
     price = parse_price(item.get("price"))
 
+    brand = str(item.get("brand") or "").strip().upper().replace("BÜRKERT", "BURKERT")
+    if not brand or brand == "UNKNOWN":
+        brand = extract_brand_from_item(item, customer_part)
+
     return {
         "desc": desc,
         "qty": qty,
         "customer_part": str(customer_part).strip(),
         "price": price,
+        "brand": brand,
         "raw": item
     }
 
@@ -307,13 +394,14 @@ def build_payload(cust_no, items):
 
     for item in items:
         clean = clean_item_for_obm(item)
+        clean = enrich_smc_item_from_portal(clean)
 
         desc = clean["desc"]
         qty = clean["qty"]
         customer_part = clean["customer_part"]
         price = clean["price"]
 
-        pid = find_pid(customer_part)
+        pid = resolve_stock_pid(customer_part, item)
 
         if not pid:
             skipped_items.append({
@@ -355,11 +443,16 @@ def build_payload(cust_no, items):
 
     payload = {
         "s_custno": cust_no,
+        "s_counter": DEFAULT_QUOTATION_COUNTER,
         "s_date": today(),
         "valid_date": valid_date(),
         "currency_code": DEFAULT_CURRENCY,
         "status": DEFAULT_STATUS,
-        "remarks": "Created by AutoClaw automation. Unresolved stock ID items were skipped.",
+        "remarks": (
+            "Created by AutoClaw automation. "
+            "Known-brand parts not in warehouse use stock code NEW; "
+            "other unresolved stock IDs were skipped."
+        ),
         "items": lines
     }
 
@@ -485,6 +578,18 @@ def notify_manager(mailbox, subject, body):
 
     except Exception as e:
         print(f"❌ [OBM] Manager notification failed: {e}")
+
+
+def all_items_ready_for_obm(items) -> bool:
+    """True only when every row has real price and lead time (no [TBC])."""
+    if not items:
+        return False
+    for row in items:
+        price = str(row.get("price") or "").strip()
+        lt = str(row.get("lt") or "").strip()
+        if not price or price == "[TBC]" or not lt or lt == "[TBC]":
+            return False
+    return True
 
 
 def create_obm_quotation_from_inquiry(

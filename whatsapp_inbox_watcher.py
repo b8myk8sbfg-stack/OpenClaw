@@ -40,7 +40,7 @@ from whatsapp_attachment_processor import (
 )
 from message_learning_store import apply_feedback_command
 
-VERSION = "v3.37-VOICE-DOWNLOAD-FIX"
+VERSION = "v3.39-FIX-READ-REPLY-LOOP"
 
 CHROME_BINARY_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -55,7 +55,7 @@ PROCESS_CONTACT_FLAG = "/Users/evon/OpenClaw/whatsapp_process_contact.flag"
 WHATSAPP_WATCH_CONTACTS_FILE = "/Users/evon/OpenClaw/whatsapp_watch_contacts.txt"
 WHATSAPP_LAST_PROCESSED_FILE = "/Users/evon/OpenClaw/whatsapp_last_processed.json"
 WHATSAPP_CUSTOMER_REGISTRY_FILE = "/Users/evon/OpenClaw/whatsapp_customer_registry.json"
-IMAGE_CAPTURE_DIR = "/Users/evon/OpenClaw/logs/wa_image_capture"
+IMAGE_CAPTURE_DIR = os.getenv("OPENCLAW_WA_IMAGE_DIR", "/Users/evon/OpenClaw/WA_Image")
 CUSTOMER_REPLY_MODE_FILE = "/Users/evon/OpenClaw/openclaw_whatsapp_reply_mode.txt"
 
 MAX_UNREAD_CHATS_PER_RUN = 1
@@ -63,6 +63,42 @@ CHECK_INTERVAL_SECONDS = int(os.getenv("OPENCLAW_WHATSAPP_POLL_SECONDS", "45"))
 INCOMING_LOOKBACK = 6
 MARKUP_DIVISOR = 0.8
 MONITOR_WHATSAPP_PHONE = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONE", "+60167222208")
+
+
+def get_monitor_whatsapp_phones():
+    """Pre-production monitor WhatsApp numbers (Stephen, Annie, etc.)."""
+    raw = os.getenv("OPENCLAW_MONITOR_WHATSAPP_PHONES", "").strip()
+    if raw:
+        phones = []
+        seen = set()
+        for entry in raw.split(","):
+            phone = str(entry or "").strip()
+            if not phone:
+                continue
+            key = normalize_phone(phone)
+            if key and key not in seen:
+                seen.add(key)
+                phones.append(phone)
+        if phones:
+            return phones
+
+    phones = []
+    seen = set()
+    for env_key in (
+        "OPENCLAW_MONITOR_WHATSAPP_PHONE",
+        "OPENCLAW_MONITOR_WHATSAPP_PHONE_2",
+    ):
+        phone = os.getenv(env_key, "").strip()
+        if not phone and env_key == "OPENCLAW_MONITOR_WHATSAPP_PHONE":
+            phone = "+60167222208"
+        if env_key == "OPENCLAW_MONITOR_WHATSAPP_PHONE_2" and not phone:
+            phone = "+60167108883"
+        key = normalize_phone(phone)
+        if key and key not in seen:
+            seen.add(key)
+            phones.append(phone)
+    return phones or ["+60167222208"]
+
 
 WHATSAPP_SESSION_READY = False
 CHAT_PROCESSING_LOCK = False
@@ -519,6 +555,26 @@ def registry_entry_for_hint(contact_hint):
     return None
 
 
+def contact_store_key(contact_name: str = "", contact_hint: str = "") -> str:
+    """Stable key for whatsapp_last_processed.json across aliases."""
+    for hint in (contact_name, contact_hint):
+        entry = registry_entry_for_hint(hint)
+        if entry:
+            canonical = str(entry.get("canonical_name") or "").strip()
+            if canonical:
+                return canonical.lower()
+    return str(contact_name or contact_hint or "").strip().lower()
+
+
+def watch_read_contacts_enabled() -> bool:
+    return os.getenv("OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def resolve_search_hint(contact_hint):
     """Map group aliases like 'PSHI' to the preferred 1:1 contact for WhatsApp search."""
     entry = registry_entry_for_hint(contact_hint)
@@ -536,7 +592,16 @@ def looks_like_group_chat_name(name):
 
 
 def is_monitor_phone(phone):
-    return normalize_phone(phone) == normalize_phone(MONITOR_WHATSAPP_PHONE)
+    digits = normalize_phone(phone)
+    if not digits:
+        return False
+    for monitor_phone in get_monitor_whatsapp_phones():
+        monitor_digits = normalize_phone(monitor_phone)
+        if not monitor_digits:
+            continue
+        if digits == monitor_digits or digits.endswith(monitor_digits[-9:]):
+            return True
+    return False
 
 
 def format_customer_phone_display(phone, allow_monitor_match: bool = False):
@@ -1685,25 +1750,17 @@ def is_monitor_noise_unit(unit) -> bool:
     return False
 
 
-def is_monitor_phone(phone: str) -> bool:
-    digits = re.sub(r"\D", "", str(phone or ""))
-    monitor = re.sub(r"\D", "", MONITOR_WHATSAPP_PHONE)
-    if not digits or not monitor:
-        return False
-    return digits == monitor or digits.endswith(monitor[-9:])
-
-
-def get_processed_data_ids(contact_name: str) -> set:
+def get_processed_data_ids(contact_name: str = "", contact_hint: str = "") -> set:
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
+    key = contact_store_key(contact_name, contact_hint)
     entry = store.get(key) or {}
     ids = entry.get("processed_data_ids") or []
     return set(str(x) for x in ids if x)
 
 
-def filter_processable_units(units, contact_name: str = ""):
+def filter_processable_units(units, contact_name: str = "", contact_hint: str = ""):
     """Keep only new, non-bot incoming customer messages."""
-    processed_ids = get_processed_data_ids(contact_name)
+    processed_ids = get_processed_data_ids(contact_name, contact_hint)
     kept = []
     for unit in units or []:
         kind = unit.get("kind") or "empty"
@@ -2846,13 +2903,13 @@ def find_image_unit(units):
     return None
 
 
-def plan_sequential_units(units, contact_name: str = ""):
+def plan_sequential_units(units, contact_name: str = "", contact_hint: str = ""):
     """
     When customer sends photo then 'Quote 2 pcs' as separate messages,
     process image bubble first, then text bubble — one at a time.
     Only returns NEW unprocessed units (never the whole lookback window).
     """
-    units = filter_processable_units(units, contact_name)
+    units = filter_processable_units(units, contact_name, contact_hint)
     if not units:
         return []
 
@@ -3449,6 +3506,116 @@ def click_send_button(driver, timeout=15):
     return False
 
 
+def send_image_in_current_chat(driver, image_path):
+    """Attach and send a local image file in the open WhatsApp chat."""
+    abs_path = os.path.abspath(str(image_path or ""))
+    if not abs_path or not os.path.isfile(abs_path):
+        print(f"⚠️ [MONITOR-IMAGE] File missing: {image_path!r}")
+        return False
+
+    print(f"📷 [MONITOR-IMAGE] Sending inquiry photo: {abs_path}")
+    try:
+        attach_selectors = [
+            '//footer//div[@title="Attach"]',
+            '//footer//span[@data-icon="plus"]/ancestor::div[@role="button"]',
+            '//footer//span[@data-icon="clip"]/ancestor::div[@role="button"]',
+            '//div[@title="Attach"]',
+            '//span[@data-icon="plus"]/ancestor::div[@role="button"]',
+            '//button[@aria-label="Attach"]',
+        ]
+        clicked_attach = False
+        for selector in attach_selectors:
+            try:
+                for element in driver.find_elements(By.XPATH, selector):
+                    if element.is_displayed():
+                        driver.execute_script("arguments[0].click();", element)
+                        clicked_attach = True
+                        break
+                if clicked_attach:
+                    break
+            except Exception:
+                continue
+
+        if clicked_attach:
+            time.sleep(0.8)
+            photo_menu_selectors = [
+                '//input[@accept="image/*,video/mp4,video/3gpp,video/quicktime"]',
+                '//span[@data-icon="attach-image"]/ancestor::li//input[@type="file"]',
+                '//*[@aria-label="Photos & Videos"]//input[@type="file"]',
+            ]
+            for selector in photo_menu_selectors:
+                try:
+                    for element in driver.find_elements(By.XPATH, selector):
+                        if element.get_attribute("type") == "file":
+                            element.send_keys(abs_path)
+                            time.sleep(2.5)
+                            if click_send_button(driver, timeout=20):
+                                print("✅ [MONITOR-IMAGE] Photo sent.")
+                                return True
+                except Exception:
+                    continue
+
+        file_input_selectors = [
+            '//footer//input[@type="file"][contains(@accept,"image")]',
+            '//input[@type="file"][contains(@accept,"image")]',
+            '//input[@type="file"]',
+        ]
+        for selector in file_input_selectors:
+            try:
+                for element in driver.find_elements(By.XPATH, selector):
+                    accept = (element.get_attribute("accept") or "").lower()
+                    if accept and "image" not in accept and "*" not in accept:
+                        continue
+                    element.send_keys(abs_path)
+                    time.sleep(2.5)
+                    if click_send_button(driver, timeout=20):
+                        print("✅ [MONITOR-IMAGE] Photo sent.")
+                        return True
+            except Exception:
+                continue
+
+        print("❌ [MONITOR-IMAGE] Could not attach image in current chat.")
+        return False
+    except Exception as exc:
+        print(f"❌ [MONITOR-IMAGE] Failed: {exc}")
+        return False
+
+
+def send_inquiry_image_to_monitors(driver, image_path):
+    """Forward the captured customer inquiry photo to every monitor WhatsApp number."""
+    abs_path = os.path.abspath(str(image_path or ""))
+    if not abs_path or not os.path.isfile(abs_path):
+        return False
+
+    phones = get_monitor_whatsapp_phones()
+    print(f"📷 [MONITOR-IMAGE] Forwarding inquiry photo to: {', '.join(phones)}")
+    any_sent = False
+    for idx, phone in enumerate(phones, start=1):
+        if not open_whatsapp_chat_by_phone(driver, phone, chat_label=f"monitor-image-{idx}"):
+            print(f"❌ [MONITOR-IMAGE] Could not open monitor chat: {phone}")
+            continue
+        if send_image_in_current_chat(driver, abs_path):
+            any_sent = True
+        time.sleep(1)
+    return any_sent
+
+
+def cleanup_inquiry_image(image_path, sent=True):
+    """Remove temporary inquiry image after it has been forwarded to monitors."""
+    abs_path = os.path.abspath(str(image_path or ""))
+    if not abs_path:
+        return
+    if not sent:
+        print(f"⚠️ [MONITOR-IMAGE] Keeping inquiry photo (monitor send failed): {abs_path}")
+        return
+    try:
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+            print(f"🧹 [MONITOR-IMAGE] Deleted inquiry photo: {abs_path}")
+    except OSError as exc:
+        print(f"⚠️ [MONITOR-IMAGE] Could not delete inquiry photo: {exc}")
+
+
 def send_reply_in_current_chat(driver, message):
     print("📲 Sending WhatsApp reply using current chat...")
 
@@ -3554,19 +3721,24 @@ def build_monitor_reply(context, customer_name, customer_contact, original_messa
     return "\n".join(lines)
 
 
+def send_alert_to_monitor_whatsapp(driver, message):
+    """Deliver a monitor alert to every configured pre-production WhatsApp number."""
+    phones = get_monitor_whatsapp_phones()
+    print("🧪 Monitor mode active. Redirecting alert to: " + ", ".join(phones))
+    any_sent = False
+    for idx, phone in enumerate(phones, start=1):
+        if not open_whatsapp_chat_by_phone(driver, phone, chat_label=f"monitor-{idx}"):
+            print(f"❌ Monitor WhatsApp chat did not open: {phone}")
+            continue
+        if send_reply_in_current_chat(driver, message):
+            any_sent = True
+    return any_sent
+
+
 def send_customer_reply(driver, reply_message, customer_name=None, customer_contact=None,
                         original_message=None, context="CUSTOMER_REPLY",
                         customer_chat_is_open=True, classification_summary=None):
     if customer_replies_go_to_monitor():
-        print(
-            "🧪 Monitor mode active. Redirecting alert to your monitor number "
-            f"{MONITOR_WHATSAPP_PHONE} (OPENCLAW_MONITOR_WHATSAPP_PHONE)."
-        )
-
-        if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
-            print("❌ Monitor WhatsApp chat did not open.")
-            return False
-
         monitor_message = build_monitor_reply(
             context=context,
             customer_name=customer_name,
@@ -3575,7 +3747,7 @@ def send_customer_reply(driver, reply_message, customer_name=None, customer_cont
             reply_message=reply_message,
             classification_summary=classification_summary,
         )
-        return send_reply_in_current_chat(driver, monitor_message)
+        return send_alert_to_monitor_whatsapp(driver, monitor_message)
 
     if not customer_chat_is_open:
         if not open_whatsapp_chat_by_phone(driver, customer_contact, chat_label="customer"):
@@ -3595,16 +3767,13 @@ def send_classification_alert(driver, contact_name, customer_contact, message_te
     print(classification.summary())
     print("=" * 90)
 
-    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
-        print("❌ Could not open monitor chat for classification alert.")
-        return False
-
-    return send_reply_in_current_chat(driver, alert)
+    return send_alert_to_monitor_whatsapp(driver, alert)
 
 
 def process_monitor_feedback(driver):
     """Check monitor chat for teaching commands like: correct: purchase_order"""
-    if not open_whatsapp_chat_by_phone(driver, MONITOR_WHATSAPP_PHONE, chat_label="monitor"):
+    monitor_phone = get_monitor_whatsapp_phones()[0]
+    if not open_whatsapp_chat_by_phone(driver, monitor_phone, chat_label="monitor"):
         return False
 
     feedback_text = get_latest_incoming_message(driver)
@@ -4126,6 +4295,7 @@ def _process_open_chat_body(driver, raw_contact_name):
     plan = []
     contact_name = raw_contact_name or "WhatsApp Customer"
     voice_ok = True
+    inquiry_image_path = None
     try:
         if not wait_for_open_chat_panel(driver, timeout=25):
             print("❌ Cannot process chat — conversation panel is not open (still on Business Web landing?).")
@@ -4137,7 +4307,8 @@ def _process_open_chat_body(driver, raw_contact_name):
                 "ℹ️ No incoming customer messages in this chat lookback window. "
                 "OpenClaw ignores outgoing bubbles (messages sent FROM this WhatsApp account)."
             )
-        plan = plan_sequential_units(units, raw_contact_name)
+        store_key = contact_store_key(raw_contact_name)
+        plan = plan_sequential_units(units, store_key, raw_contact_name)
         bubble = plan[-1]["container"] if plan else None
 
         if not plan:
@@ -4166,6 +4337,8 @@ def _process_open_chat_body(driver, raw_contact_name):
         document_items = payload["document_items"]
         copilot_items = payload["copilot_items"]
         enrichment = payload.get("enrichment") or {}
+        if image_path and os.path.isfile(image_path):
+            inquiry_image_path = image_path
 
         if media_info.media_type == "voice" and not voice_ok and not enrichment.get("transcript"):
             print(
@@ -4323,7 +4496,15 @@ def _process_open_chat_body(driver, raw_contact_name):
             document_items=document_items,
         )
     finally:
-        finalize_chat_processing(contact_name, plan, voice_ok=voice_ok)
+        if inquiry_image_path:
+            image_sent = send_inquiry_image_to_monitors(driver, inquiry_image_path)
+            cleanup_inquiry_image(inquiry_image_path, sent=image_sent)
+        finalize_chat_processing(
+            contact_name,
+            plan,
+            voice_ok=voice_ok,
+            contact_hint=raw_contact_name,
+        )
 
 
 def _process_open_chat_legacy_removed(driver):
@@ -4611,19 +4792,23 @@ def save_last_processed_store(store):
 def build_plan_fingerprint(plan):
     parts = []
     for unit in plan or []:
+        data_id = str(unit.get("data_id") or "").strip()
+        if data_id:
+            parts.append(f"id:{data_id}")
+            continue
         parts.append(
-            f"{unit.get('data_id') or ''}|{unit.get('kind') or ''}|"
+            f"{unit.get('incoming_index') or ''}|{unit.get('kind') or ''}|"
             f"{(unit.get('text') or '')[:80]}"
         )
     return "||".join(parts)
 
 
-def build_process_fingerprint(units, contact_name: str = ""):
-    plan = plan_sequential_units(units, contact_name)
+def build_process_fingerprint(units, contact_name: str = "", contact_hint: str = ""):
+    plan = plan_sequential_units(units, contact_name, contact_hint)
     return build_plan_fingerprint(plan)
 
 
-def finalize_chat_processing(contact_name, plan, voice_ok: bool = True):
+def finalize_chat_processing(contact_name, plan, voice_ok: bool = True, contact_hint: str = ""):
     if not plan:
         return
     if not voice_ok:
@@ -4635,37 +4820,50 @@ def finalize_chat_processing(contact_name, plan, voice_ok: bool = True):
         return
     fingerprint = build_plan_fingerprint(plan)
     data_ids = [str(u.get("data_id") or "").strip() for u in plan if u.get("data_id")]
-    mark_watch_contact_processed(contact_name, fingerprint, data_ids)
+    store_key = contact_store_key(contact_name, contact_hint)
+    mark_watch_contact_processed(store_key, fingerprint, data_ids)
     clear_wa_audio_workspace()
 
 
-def should_process_watch_contact(contact_name, fingerprint):
+def should_process_watch_contact(contact_name, fingerprint, plan=None, contact_hint: str = ""):
     if not fingerprint:
         return False
+    store_key = contact_store_key(contact_name, contact_hint)
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
-    prev = store.get(key)
-    if not prev:
-        return True
-    return prev.get("fingerprint") != fingerprint
+    prev = store.get(store_key)
+    if prev and prev.get("fingerprint") == fingerprint:
+        return False
+
+    processed_ids = get_processed_data_ids(store_key)
+    if plan and processed_ids:
+        units_with_ids = [
+            u for u in plan
+            if str(u.get("data_id") or "").strip()
+        ]
+        if units_with_ids and all(
+            str(u.get("data_id") or "").strip() in processed_ids for u in units_with_ids
+        ):
+            return False
+
+    return True
 
 
 def mark_watch_contact_processed(contact_name, fingerprint, data_ids=None):
     if not fingerprint and not data_ids:
         return
+    store_key = contact_store_key(contact_name)
     store = load_last_processed_store()
-    key = str(contact_name or "").strip().lower()
-    prev = store.get(key) or {}
+    prev = store.get(store_key) or {}
     prev_ids = list(prev.get("processed_data_ids") or [])
     merged_ids = list(dict.fromkeys([*(data_ids or []), *prev_ids]))[:80]
-    store[key] = {
+    store[store_key] = {
         "fingerprint": fingerprint or prev.get("fingerprint") or "",
         "processed_at": now_iso(),
         "processed_data_ids": merged_ids,
     }
     save_last_processed_store(store)
     if data_ids:
-        print(f"✅ Marked {len(data_ids)} WhatsApp message(s) processed for {contact_name!r}")
+        print(f"✅ Marked {len(data_ids)} WhatsApp message(s) processed for {store_key!r}")
 
 
 def process_watched_contacts(driver, max_contacts: int = 1):
@@ -4699,20 +4897,20 @@ def process_watched_contacts(driver, max_contacts: int = 1):
         raw_contact_name = get_contact_name_from_open_chat(driver)
         units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
         contact_name = raw_contact_name or contact_hint
-        plan = plan_sequential_units(units, contact_name)
+        store_key = contact_store_key(contact_name, contact_hint)
+        plan = plan_sequential_units(units, contact_name, contact_hint)
         if not plan:
             print(f"   ℹ️ {contact_name}: no new unprocessed incoming messages")
             continue
 
         fingerprint = build_plan_fingerprint(plan)
 
-        if not should_process_watch_contact(contact_name, fingerprint):
+        if not should_process_watch_contact(contact_name, fingerprint, plan=plan, contact_hint=contact_hint):
             print(f"   ℹ️ {contact_name}: already processed latest incoming cluster")
             continue
 
         print(f"   🆕 {contact_name}: new incoming detected — processing now")
         process_open_chat(driver)
-        mark_watch_contact_processed(contact_name, fingerprint)
         processed_any = True
         print("↩️ Returning to WhatsApp chat list after watch contact...")
         ensure_on_chat_list(driver)
@@ -4820,9 +5018,12 @@ def watch_unread_with_existing_driver(driver):
 
     if not unread_rows:
         print("✅ No unread WhatsApp chats found.")
-        if process_watched_contacts(driver, max_contacts=1):
+        if watch_read_contacts_enabled() and process_watched_contacts(driver, max_contacts=1):
             return
-        print('ℹ️ To force-process a read chat: uv run python whatsapp_inbox_watcher.py process "Stephen"')
+        print(
+            'ℹ️ To force-process a read chat: uv run python whatsapp_inbox_watcher.py process "Stephen"\n'
+            'ℹ️ To disable read-chat polling: set OPENCLAW_WHATSAPP_WATCH_READ_CONTACTS=0'
+        )
         return
 
     row = unread_rows[0]
@@ -4835,13 +5036,6 @@ def watch_unread_with_existing_driver(driver):
 
     process_open_chat(driver)
 
-    try:
-        contact_name = get_contact_name_from_open_chat(driver)
-        units = collect_incoming_units(driver, lookback=INCOMING_LOOKBACK)
-        mark_watch_contact_processed(contact_name, build_process_fingerprint(units, contact_name))
-    except Exception:
-        pass
-
     print("↩️ Returning to WhatsApp chat list after completed chat...")
     ensure_on_chat_list(driver)
     time.sleep(1)
@@ -4851,6 +5045,7 @@ def run_persistent_watcher():
     print(f"🚀 WhatsApp Watcher Persistent Mode ({VERSION})")
     print(f"⏱️ Check interval: {CHECK_INTERVAL_SECONDS} seconds")
     print(f"📁 Chrome Profile: {OPENCLAW_CHROME_PROFILE}")
+    print(f"🧪 Monitor WhatsApp alerts → {', '.join(get_monitor_whatsapp_phones())}")
 
     driver = None
 

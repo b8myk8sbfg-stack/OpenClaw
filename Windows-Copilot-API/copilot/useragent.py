@@ -29,10 +29,10 @@ spoofed UA and Turnstile sees the mismatch. One line, one place.
 """
 
 # Real desktop Windows Chrome. Must match Playwright's bundled Chromium major
-# version (currently 148) so the UA override introduces no client-hint conflict.
+# version (currently 149) so the UA override introduces no client-hint conflict.
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
 
 # Client hints that must accompany CHROME_UA so the platform/version a server
@@ -40,7 +40,7 @@ CHROME_UA = (
 # which otherwise emits the impersonation profile's native (macOS) hints.
 CHROME_CLIENT_HINTS = {
     "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua": '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="24"',
+    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not_A Brand";v="24"',
 }
 
 # Pinned curl_cffi impersonation profile (TLS/HTTP2 fingerprint). Closest stable

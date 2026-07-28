@@ -1,0 +1,16 @@
+# OpenClaw runtime dependencies (also declared in pyproject.toml).
+# Install: pip install -r requirements.txt
+langchain-openai>=0.3.35
+openai>=1.0.0
+o365>=2.1.5
+openpyxl>=3.1.5
+pandas>=2.3.3
+pillow>=11.0.0
+pypdf>=5.0.0
+pytesseract>=0.3.13
+python-docx>=1.1.2
+python-dotenv>=1.2.1
+rapidfuzz>=3.13.0
+requests>=2.32.5
+selenium>=4.36.0
+tavily-python>=0.7.23

@@ -42,6 +42,17 @@ def convert_audio_to_wav(src_path: str) -> Tuple[str, bool]:
     return wav_path, True
 
 
+def _whisper_backends_available() -> bool:
+    try:
+        import whisper  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    if OPENCLAW_DIR and os.path.isdir(OPENCLAW_DIR):
+        return True
+    return bool(shutil.which("whisper"))
+
+
 def transcribe_audio_bytes(data: bytes, suffix: str = ".opus", model: Optional[str] = None) -> str:
     if not data or len(data) < 64:
         raise RuntimeError("audio too small or empty")
@@ -56,7 +67,13 @@ def transcribe_audio_bytes(data: bytes, suffix: str = ".opus", model: Optional[s
     delete_wav = False
     try:
         wav_path, delete_wav = convert_audio_to_wav(tmp_path)
-        return _transcribe_with_whisper_python(wav_path, model_name) or _transcribe_with_openclaw_uv(wav_path, model_name) or _transcribe_with_whisper_cli(wav_path, model_name)
+        for fn in (_transcribe_with_whisper_python, _transcribe_with_openclaw_uv, _transcribe_with_whisper_cli):
+            text = fn(wav_path, model_name)
+            if text:
+                return text
+        if not _whisper_backends_available():
+            raise RuntimeError("whisper not installed")
+        return ""
     finally:
         for path, drop in ((tmp_path, True), (wav_path, delete_wav)):
             if drop and path and os.path.exists(path):
@@ -85,7 +102,7 @@ def _transcribe_with_whisper_python(audio_path: str, model_name: str) -> str:
 
 def _transcribe_with_whisper_cli(audio_path: str, model_name: str) -> str:
     if not shutil.which("whisper"):
-        raise RuntimeError("whisper not installed")
+        return ""
     subprocess.run(["whisper", audio_path, "--model", model_name, "--output_format", "txt"], check=True, capture_output=True, text=True, timeout=180)
     txt_path = os.path.splitext(audio_path)[0] + ".txt"
     if os.path.exists(txt_path):

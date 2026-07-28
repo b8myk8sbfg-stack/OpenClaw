@@ -8,6 +8,8 @@ BASE_DIR="/Users/evon/OpenClaw"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/openclaw_env.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/copilot_server.sh"
 
 LOG_DIR="$BASE_DIR/logs"
 MAIN_LOG="$LOG_DIR/openclaw_main.log"
@@ -104,7 +106,7 @@ start_openclaw() {
     fi
 
     log "Stopping OpenClaw processes..."
-    stop_openclaw_processes
+    bash "$SCRIPT_DIR/kill_all_openclaw.sh" || stop_openclaw_processes
     sleep 2
 
     if ! wait_for_processes_to_exit "openclaw_main.py" 10; then
@@ -123,11 +125,20 @@ start_openclaw() {
     log "Stopping WhatsApp Chrome / chromedriver..."
     pkill -f "chrome_whatsapp_profile" 2>/dev/null || true
     pkill -f "chromedriver" 2>/dev/null || true
+    pkill -9 -f "chromedriver" 2>/dev/null || true
 
     sleep 5
 
     if ! start_openclaw; then
         exit 1
+    fi
+
+    log "Ensuring Copilot server is running..."
+    if ! copilot_restart_and_wait; then
+        log "WARN: Copilot did not become healthy after daily restart (OpenClaw is up)."
+        log "WARN: Run: bash $SCRIPT_DIR/copilot_refresh_clearance.sh"
+    else
+        log "Copilot server healthy after daily restart."
     fi
 
     log "Daily restart complete."
