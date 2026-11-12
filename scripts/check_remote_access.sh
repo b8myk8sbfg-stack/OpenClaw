@@ -104,6 +104,19 @@ else
     warn "openclaw_main.py is not running"
 fi
 
+echo ""
+echo "== Staff Dashboard (QR URL) =="
+DASH_PORT="${OPENCLAW_DASHBOARD_PORT:-8787}"
+if curl -fsS "http://127.0.0.1:${DASH_PORT}/health" >/dev/null 2>&1; then
+    pass "Dashboard listening on 127.0.0.1:${DASH_PORT}"
+    DASH_URL="$(curl -fsS "http://127.0.0.1:${DASH_PORT}/api/info" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('url',''))" 2>/dev/null || true)"
+    if [[ -n "$DASH_URL" ]]; then
+        pass "Staff scan URL: $DASH_URL"
+    fi
+else
+    warn "Dashboard not running — install with: bash scripts/install_openclaw_dashboard.sh"
+fi
+
 if [[ -x "$BASE_DIR/scripts/openclaw_daily_restart.sh" ]]; then
     pass "restart script is executable"
 else
